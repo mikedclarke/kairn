@@ -1,0 +1,2 @@
+Vendored from https://github.com/zortax/gpui-terminal at rev 51f0292938876c8da3de03f0139088591e3be518 (MIT OR Apache-2.0).
+README.md is the upstream widget doc; example-main.rs is the upstream reference app.
