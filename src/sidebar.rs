@@ -7,22 +7,17 @@ use gpui::{
 
 use crate::session::SessionKind;
 use crate::theme::{self, KairnTheme};
-use crate::workspace::{PaneView, TaskQuery, Workspace, mod_symbol};
+use crate::workspace::{PaneView, TaskQuery, Workspace, kbd, mod_symbol};
 
 impl Workspace {
     pub fn render_sidebar(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {
         let session_count = self.sessions.len();
 
         let mut side = div()
-            .id("sidebar")
-            .w(px(272.))
-            .flex_none()
-            .h_full()
-            .bg(t.panel)
-            .border_r_1()
-            .border_color(t.border)
+            .id("sidebar-scroll")
+            .flex_1()
+            .min_h(px(0.))
             .overflow_y_scroll()
-            .text_size(px(12.5))
             .child(self.render_calendar(t, cx));
 
         let today = Local::now().date_naive();
@@ -211,7 +206,43 @@ impl Workspace {
                     ),
             );
         }
-        side.child(feed_box)
+        side = side.child(feed_box);
+
+        // Pinned footer: the always-visible way into Settings.
+        let hover_bg = t.hover;
+        let hover_text = t.text;
+        let settings_row = div()
+            .id("sidebar-settings")
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .px(px(14.))
+            .py(px(9.))
+            .border_t_1()
+            .border_color(t.border)
+            .text_color(t.dim)
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover_bg).text_color(hover_text))
+            .child(div().text_size(px(13.)).child("⚙"))
+            .child(div().flex_1().child("Settings"))
+            .child(kbd(t, format!("{},", mod_symbol())))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_settings(window, cx);
+            }));
+
+        div()
+            .w(px(272.))
+            .flex_none()
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(t.panel)
+            .border_r_1()
+            .border_color(t.border)
+            .text_size(px(12.5))
+            .child(side)
+            .child(settings_row)
     }
 
     fn render_calendar(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {

@@ -125,6 +125,18 @@ pub enum TaskQuery {
     Overdue,
 }
 
+/// An in-place edit of one rendered line: the raw markdown in a single-line
+/// input sitting where the styled line was.
+pub struct LineEdit {
+    pub line_idx: usize,
+    /// The line as last saved, for safe relocation if the file shifts.
+    expected: String,
+    /// This edit appends a line the file doesn't have yet.
+    appending: bool,
+    pub input: gpui::Entity<InputState>,
+    path: PathBuf,
+}
+
 impl TaskQuery {
     pub fn matches(self, date: NaiveDate, today: NaiveDate) -> bool {
         match self {
@@ -164,6 +176,10 @@ pub struct Workspace {
     editor_stale: bool,
     _editor_sub: Option<gpui::Subscription>,
     _autosave: Option<Task<()>>,
+    /// In-place edit of one line of the pane document (the NotePlan-style
+    /// live editing path; the Writing layout's full editor is separate).
+    pub line_edit: Option<LineEdit>,
+    _line_edit_sub: Option<gpui::Subscription>,
     picker_open: bool,
     picker_pos: Point<Pixels>,
     pub sessions: Vec<Session>,
@@ -231,6 +247,8 @@ impl Workspace {
             editor_stale: false,
             _editor_sub: None,
             _autosave: None,
+            line_edit: None,
+            _line_edit_sub: None,
             picker_open: false,
             picker_pos: point(px(0.), px(0.)),
             sessions: Vec::new(),
@@ -260,6 +278,7 @@ impl Workspace {
     // ----- notes -----
 
     pub fn select_day(&mut self, day: NaiveDate, cx: &mut Context<Self>) {
+        self.commit_line_edit(true, cx);
         self.selected_day = day;
         self.view = PaneView::Day;
         self.reload_notes();
@@ -267,12 +286,14 @@ impl Workspace {
     }
 
     pub fn open_note(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.commit_line_edit(true, cx);
         self.view = PaneView::Note(path);
         self.reload_notes();
         cx.notify();
     }
 
     pub fn open_task_view(&mut self, query: TaskQuery, cx: &mut Context<Self>) {
+        self.commit_line_edit(true, cx);
         self.view = PaneView::Tasks(query);
         self.reload_notes();
         cx.notify();
@@ -321,6 +342,7 @@ impl Workspace {
     /// Toggle the task on line `line_idx` of the pane's document between open
     /// and done, writing the change back to the file.
     pub fn toggle_task(&mut self, line_idx: usize, cx: &mut Context<Self>) {
+        self.commit_line_edit(true, cx);
         let (Some(path), Some(text)) = (&self.doc_path, &self.doc_text) else {
             return;
         };
@@ -341,6 +363,7 @@ impl Workspace {
     /// Toggle a task from a task view, addressed at whichever daily note it
     /// was scanned from.
     pub fn toggle_task_ref(&mut self, task: &notes::TaskRef, cx: &mut Context<Self>) {
+        self.commit_line_edit(true, cx);
         match notes::toggle_task_on_disk(&task.path, task.line_idx, &task.line) {
             Ok(_) => {}
             Err(e) => eprintln!("kairn: could not update {}: {e}", task.path.display()),
@@ -489,12 +512,160 @@ impl Workspace {
 
     // ----- editing -----
 
+    /// Start editing a line of the pane document in place. `line_idx` at or
+    /// past the end starts a new line appended to the file.
+    pub fn edit_line(&mut self, line_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.view, PaneView::Tasks(_)) || self.layout == LayoutMode::Writing {
+            return;
+        }
+        self.commit_line_edit(true, cx);
+        let path = match &self.doc_path {
+            Some(p) => p.clone(),
+            None => match &self.view {
+                PaneView::Day => notes::daily_path(&self.notes_root, self.selected_day),
+                _ => return,
+            },
+        };
+        // A file that exists but couldn't be read must not be edited.
+        if self.doc_text.is_none() && path.exists() {
+            return;
+        }
+        let line_count = self.doc_text.as_deref().map(|t| t.lines().count()).unwrap_or(0);
+        let (line_idx, expected, appending) = if line_idx < line_count {
+            let line = self
+                .doc_text
+                .as_deref()
+                .and_then(|t| t.lines().nth(line_idx))
+                .unwrap_or_default()
+                .to_string();
+            (line_idx, line, false)
+        } else {
+            (line_count, String::new(), true)
+        };
+
+        let input = cx.new(|cx| InputState::new(window, cx));
+        input.update(cx, |s, cx| {
+            // set_value puts the cursor at the end on single-line inputs.
+            s.set_value(expected.clone(), window, cx);
+            s.focus(window, cx);
+        });
+        self._line_edit_sub = Some(cx.subscribe_in(
+            &input,
+            window,
+            |this, state, ev: &InputEvent, window, cx| {
+                // Events from an input this edit no longer owns are stale.
+                let current = this.line_edit.as_ref().map(|le| le.input.entity_id());
+                if current != Some(state.entity_id()) {
+                    return;
+                }
+                match ev {
+                    InputEvent::Change => {
+                        this._autosave = Some(cx.spawn(async move |this, cx| {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(800))
+                                .await;
+                            let _ = this.update(cx, |ws, cx| ws.commit_line_edit(false, cx));
+                        }));
+                    }
+                    InputEvent::PressEnter { .. } => this.on_line_edit_enter(window, cx),
+                    InputEvent::Blur => this.commit_line_edit(true, cx),
+                    _ => {}
+                }
+            },
+        ));
+        self.line_edit = Some(LineEdit { line_idx, expected, appending, input, path });
+        cx.notify();
+    }
+
+    /// Save the in-place line edit if its text changed; optionally keep the
+    /// editor open (autosave keeps it open, blur and navigation close it).
+    pub fn commit_line_edit(&mut self, close: bool, cx: &mut Context<Self>) {
+        let Some(mut le) = self.line_edit.take() else { return };
+        self._autosave = None;
+        let value = le.input.read(cx).value().to_string();
+        if value != le.expected {
+            let written = if le.appending {
+                let mut text = self.doc_text.clone().unwrap_or_default();
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(&value);
+                notes::write_note(&le.path, &text).map(|_| true)
+            } else {
+                notes::replace_line_on_disk(&le.path, le.line_idx, &le.expected, &value)
+            };
+            match written {
+                Ok(true) => {
+                    le.expected = value;
+                    le.appending = false;
+                }
+                Ok(false) => {
+                    // The line vanished under us; drop the edit, show reality.
+                    self.reload_notes();
+                    cx.notify();
+                    return;
+                }
+                Err(e) => eprintln!("kairn: could not save {}: {e}", le.path.display()),
+            }
+            self.reload_notes();
+        }
+        if !close {
+            self.line_edit = Some(le);
+        }
+        cx.notify();
+    }
+
+    /// Enter inside a line edit: NotePlan behaviour. A line with content
+    /// commits and continues the list on a new line below; a bare list marker
+    /// clears itself instead.
+    fn on_line_edit_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(le) = self.line_edit.take() else { return };
+        self._autosave = None;
+        let value = le.input.read(cx).value().to_string();
+        let prefix = notes::continuation_prefix(&value);
+        if !value.is_empty() && prefix == value {
+            le.input.update(cx, |s, cx| s.set_value("", window, cx));
+            self.line_edit = Some(le);
+            self.commit_line_edit(false, cx);
+            return;
+        }
+        let combined = format!("{value}\n{prefix}");
+        let written = if le.appending {
+            let mut text = self.doc_text.clone().unwrap_or_default();
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&combined);
+            notes::write_note(&le.path, &text).map(|_| true)
+        } else {
+            notes::replace_line_on_disk(&le.path, le.line_idx, &le.expected, &combined)
+        };
+        let next = le.line_idx + 1;
+        match written {
+            Ok(true) => {
+                self.reload_notes();
+                self.edit_line(next, window, cx);
+            }
+            Ok(false) => {
+                self.reload_notes();
+                cx.notify();
+            }
+            Err(e) => {
+                eprintln!("kairn: could not save {}: {e}", le.path.display());
+                cx.notify();
+            }
+        }
+    }
+
     /// Keep the writing-mode editor in step with the layout and the pane
     /// document. Runs at the top of every render (the one place a `Window` is
     /// reliably in hand for `InputState::set_value`): creates the editor on
     /// entering Writing, flushes and drops it on leaving, swaps content when
     /// the document changes, and re-syncs after external file changes.
     fn sync_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.layout == LayoutMode::Writing && self.line_edit.is_some() {
+            self.commit_line_edit(true, cx);
+        }
         if self.layout != LayoutMode::Writing {
             if self.editor.is_some() {
                 if self.editor_dirty {
@@ -779,6 +950,10 @@ impl Workspace {
     }
 
     fn on_open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings(window, cx);
+    }
+
+    pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.picker_open = false;
         crate::settings_dialog::open(self, window, cx);
     }

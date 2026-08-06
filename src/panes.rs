@@ -226,30 +226,72 @@ impl Workspace {
         };
 
         let mut note = note_frame(t, writing, masthead, subline);
+        let editing_idx = self.line_edit.as_ref().map(|le| le.line_idx);
 
         match &self.doc_lines {
             None => {
-                note = note.child(div().mt(px(10.)).text_color(t.faint).child(empty_text));
+                if editing_idx == Some(0) {
+                    note = note.child(self.render_line_editor());
+                } else {
+                    note = note.child(
+                        div()
+                            .id("empty-note")
+                            .mt(px(10.))
+                            .text_color(t.faint)
+                            .cursor_text()
+                            .child(empty_text)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.edit_line(0, window, cx);
+                            })),
+                    );
+                }
             }
             Some(lines) => {
                 for (idx, line) in lines.iter().enumerate() {
-                    note = note.child(render_line(t, idx, line, cx));
+                    if editing_idx == Some(idx) {
+                        note = note.child(self.render_line_editor());
+                    } else {
+                        note = note.child(clickable_line(idx, render_line(t, idx, line, cx), cx));
+                    }
+                }
+                if editing_idx == Some(lines.len()) {
+                    note = note.child(self.render_line_editor());
                 }
             }
         }
 
+        // Clicking the space under the note starts a new line at the end.
+        note = note.child(div().id("note-append").h(px(140.)).on_click(cx.listener(
+            |this, _, window, cx| {
+                cx.stop_propagation();
+                this.edit_line(usize::MAX, window, cx);
+            },
+        )));
+
         note.child(
             div()
-                .mt(px(22.))
+                .mt(px(4.))
                 .flex()
                 .gap(px(6.))
                 .items_center()
                 .text_size(px(11.5))
                 .text_color(t.faint)
                 .child(kbd(t, format!("⌥{}⏎", mod_symbol())))
-                .child("writing mode · edits autosave to the file"),
+                .child("writing mode · click any line to edit in place"),
         )
         .into_any_element()
+    }
+
+    /// The single-line input standing in for the line being edited.
+    fn render_line_editor(&self) -> AnyElement {
+        let Some(le) = &self.line_edit else {
+            return div().into_any_element();
+        };
+        div()
+            .py(px(1.))
+            .child(Input::new(&le.input).appearance(false).w_full())
+            .into_any_element()
     }
 
     fn render_task_view(
@@ -364,6 +406,19 @@ fn week_nav(t: &KairnTheme, id: &'static str, glyph: &'static str) -> gpui::Stat
         .child(glyph)
 }
 
+/// Wrap a rendered line so clicking it starts editing it in place.
+fn clickable_line(idx: usize, inner: AnyElement, cx: &mut Context<Workspace>) -> AnyElement {
+    div()
+        .id(("line", idx))
+        .cursor_text()
+        .child(inner)
+        .on_click(cx.listener(move |this, _, window, cx| {
+            cx.stop_propagation();
+            this.edit_line(idx, window, cx);
+        }))
+        .into_any_element()
+}
+
 fn render_line(
     t: &KairnTheme,
     idx: usize,
@@ -432,7 +487,10 @@ fn task_row(
     let box_base = if matches!(state, TaskState::Open | TaskState::Done) {
         box_base
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| this.toggle_task(idx, cx)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.toggle_task(idx, cx);
+            }))
     } else {
         box_base
     };

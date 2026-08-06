@@ -302,15 +302,16 @@ fn strip_done_stamps(s: &str) -> String {
     out
 }
 
-/// Toggle the task at `line_idx` in a note's full text. `expected` is the line
-/// as it read when rendered: if the text has changed underneath us and the
-/// line has moved, it is found again by content; if it's gone, `None` (the
-/// caller reloads rather than guessing). Line endings are preserved.
-pub fn toggle_task_in_text(
+/// Rewrite one line of a note's full text. `expected` is the line as it read
+/// when rendered: if the text has changed underneath us and the line has
+/// moved, it is found again by content; if it's gone, `None` (the caller
+/// reloads rather than guessing). `edit` maps the current line to its
+/// replacement (which may span multiple lines); line endings are preserved.
+fn edit_line_in_text(
     text: &str,
     line_idx: usize,
     expected: &str,
-    now: &str,
+    edit: impl FnOnce(&str) -> Option<String>,
 ) -> Option<String> {
     fn content(seg: &str) -> &str {
         let s = seg.strip_suffix('\n').unwrap_or(seg);
@@ -324,7 +325,7 @@ pub fn toggle_task_in_text(
     };
     let line = content(segs[idx]);
     let ending = &segs[idx][line.len()..];
-    let new_line = toggle_task_line(line, now)?;
+    let new_line = edit(line)?;
     let mut out = String::with_capacity(text.len() + 32);
     for (i, seg) in segs.iter().enumerate() {
         if i == idx {
@@ -335,6 +336,56 @@ pub fn toggle_task_in_text(
         }
     }
     Some(out)
+}
+
+/// Toggle the task at `line_idx` between open and done. See
+/// [`edit_line_in_text`] for the relocation contract.
+pub fn toggle_task_in_text(
+    text: &str,
+    line_idx: usize,
+    expected: &str,
+    now: &str,
+) -> Option<String> {
+    edit_line_in_text(text, line_idx, expected, |line| toggle_task_line(line, now))
+}
+
+/// Replace the line at `line_idx` with `new_line` (which may contain
+/// newlines, splitting the line). Relocates by content like toggling; `None`
+/// when the line is gone. Writes atomically. Returns whether a change landed.
+pub fn replace_line_on_disk(
+    path: &Path,
+    line_idx: usize,
+    expected: &str,
+    new_line: &str,
+) -> io::Result<bool> {
+    let text = fs::read_to_string(path)?;
+    let Some(new_text) =
+        edit_line_in_text(&text, line_idx, expected, |_| Some(new_line.to_string()))
+    else {
+        return Ok(false);
+    };
+    atomic_write(path, &new_text)?;
+    Ok(true)
+}
+
+/// The list prefix a new line under `line` should start with, NotePlan-style:
+/// tasks and checklists continue with an open marker, bullets with a bullet,
+/// anything else with nothing. Indentation is preserved.
+pub fn continuation_prefix(line: &str) -> String {
+    let indent_len = line.len() - line.trim_start().len();
+    let (indent, rest) = line.split_at(indent_len);
+    for marker in ["* ", "+ ", "- "] {
+        let Some(body) = rest.strip_prefix(marker) else {
+            continue;
+        };
+        let body = body.trim_start();
+        return if bracket_state(body).is_some() {
+            format!("{indent}{marker}[ ] ")
+        } else {
+            format!("{indent}{marker}")
+        };
+    }
+    String::new()
 }
 
 /// Toggle a task in a note on disk. The file is re-read fresh so a change made
@@ -616,6 +667,33 @@ mod tests {
             toggle_task_in_text("* one", 0, "* one", now).as_deref(),
             Some("* [x] one @done(2026-08-06 21:30)")
         );
+    }
+
+    #[test]
+    fn continuation_prefixes() {
+        assert_eq!(continuation_prefix("* buy milk"), "* ");
+        assert_eq!(continuation_prefix("  * [x] done thing"), "  * [ ] ");
+        assert_eq!(continuation_prefix("- [ ] task"), "- [ ] ");
+        assert_eq!(continuation_prefix("- plain bullet"), "- ");
+        assert_eq!(continuation_prefix("+ item"), "+ ");
+        assert_eq!(continuation_prefix("## Heading"), "");
+        assert_eq!(continuation_prefix("prose"), "");
+    }
+
+    #[test]
+    fn edit_line_replaces_and_splits() {
+        let text = "# Day\n* one\n* two\n";
+        assert_eq!(
+            edit_line_in_text(text, 1, "* one", |_| Some("* one edited".into())).as_deref(),
+            Some("# Day\n* one edited\n* two\n")
+        );
+        // A replacement containing a newline splits the line in place.
+        assert_eq!(
+            edit_line_in_text(text, 1, "* one", |_| Some("* one\n* [ ] ".into())).as_deref(),
+            Some("# Day\n* one\n* [ ] \n* two\n")
+        );
+        // Vanished line: no edit.
+        assert_eq!(edit_line_in_text(text, 1, "* gone", |_| Some("x".into())), None);
     }
 
     #[test]
