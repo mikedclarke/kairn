@@ -1,4 +1,5 @@
 mod hosts_dialog;
+mod notes;
 mod panes;
 mod session;
 mod settings;

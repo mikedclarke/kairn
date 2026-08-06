@@ -1,11 +1,12 @@
-use chrono::{Datelike, Days, Local, NaiveDate};
+use chrono::{Datelike, Days, Local};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Context, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled,
-    Window, div, px, relative,
+    AnyElement, Context, HighlightStyle, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled, StyledText, Window, div, px, relative,
 };
 use gpui_component::resizable::{h_resizable, resizable_panel};
 
+use crate::notes::{Line, Span, SpanKind, TaskState};
 use crate::theme::{self, KairnTheme};
 use crate::workspace::{LayoutMode, Workspace, chord, kbd, mod_symbol};
 
@@ -74,15 +75,14 @@ impl Workspace {
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_y_scroll()
-                    .child(render_note(t, writing)),
+                    .child(self.render_note(t, writing)),
             )
     }
 
-    fn render_week_strip(&self, t: &KairnTheme, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_week_strip(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {
         let today = Local::now().date_naive();
-        let monday = today - Days::new(today.weekday().num_days_from_monday() as u64);
-        // Per-day task dots are stubbed until notes land (Phase C).
-        let stub_dots: [usize; 7] = [2, 1, 3, 3, 1, 0, 0];
+        let selected = self.selected_day;
+        let monday = selected - Days::new(selected.weekday().num_days_from_monday() as u64);
 
         let mut strip = div()
             .h(px(62.))
@@ -94,12 +94,17 @@ impl Workspace {
             .bg(t.panel)
             .border_b_1()
             .border_color(t.border)
-            .child(div().px(px(3.)).text_size(px(13.)).text_color(t.faint).child("‹"));
+            .child(
+                week_nav(t, "week-prev", "‹").on_click(cx.listener(move |this, _, _, cx| {
+                    this.select_day(this.selected_day - Days::new(7), cx);
+                })),
+            );
 
         for i in 0..7u64 {
             let day = monday + Days::new(i);
             let is_today = day == today;
-            let dots = stub_dots[i as usize];
+            let is_selected = day == selected;
+            let dots = self.week_open_counts[i as usize].min(4);
 
             let mut dots_row = div().h(px(5.)).mt(px(1.)).flex().gap(px(2.)).justify_center();
             for _ in 0..dots {
@@ -108,257 +113,112 @@ impl Workspace {
                         .w(px(3.5))
                         .h(px(3.5))
                         .rounded_full()
-                        .bg(if is_today { t.on_amber.opacity(0.6) } else { t.faint }),
+                        .bg(if is_selected { t.on_amber.opacity(0.6) } else { t.faint }),
                 );
             }
 
+            let hover_bg = t.hover;
             strip = strip.child(
                 div()
+                    .id(("week-day", i as usize))
                     .flex_1()
                     .py(px(5.))
                     .rounded(px(9.))
                     .flex()
                     .flex_col()
                     .items_center()
+                    .cursor_pointer()
                     .when_else(
-                        is_today,
+                        is_selected,
                         |d| d.bg(t.amber).text_color(t.on_amber),
-                        |d| d.text_color(t.dim),
+                        |d| d.text_color(t.dim).hover(move |s| s.bg(hover_bg)),
                     )
                     .child(
                         div()
                             .text_size(px(9.))
-                            .text_color(if is_today { t.on_amber } else { t.faint })
+                            .text_color(if is_selected { t.on_amber } else { t.faint })
                             .child(day.format("%a").to_string().to_uppercase()),
                     )
                     .child(
                         div()
                             .text_size(px(13.5))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .when(is_today && !is_selected, |d| d.text_color(t.amber))
                             .child(day.format("%-d").to_string()),
                     )
-                    .child(dots_row),
+                    .child(dots_row)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_day(day, cx);
+                    })),
             );
         }
 
-        strip.child(div().px(px(3.)).text_size(px(13.)).text_color(t.faint).child("›"))
+        strip.child(
+            week_nav(t, "week-next", "›").on_click(cx.listener(move |this, _, _, cx| {
+                this.select_day(this.selected_day + Days::new(7), cx);
+            })),
+        )
     }
-}
 
-fn section_heading(t: &KairnTheme, label: &str) -> impl IntoElement {
-    div()
-        .mt(px(18.))
-        .mb(px(8.))
-        .text_size(px(11.))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(t.faint)
-        .child(label.to_uppercase())
-}
+    fn render_note(&self, t: &KairnTheme, writing: bool) -> impl IntoElement {
+        let date = self.selected_day;
+        let today = Local::now().date_naive();
+        let masthead = format!(
+            "{}, {} {}",
+            date.format("%A"),
+            date.format("%-d"),
+            date.format("%B")
+        );
+        let relative_label = match (date - today).num_days() {
+            0 => Some("today"),
+            1 => Some("tomorrow"),
+            -1 => Some("yesterday"),
+            _ => None,
+        };
+        let subline = match relative_label {
+            Some(label) => format!("Week {} · {}", date.iso_week().week(), label),
+            None => format!("Week {}", date.iso_week().week()),
+        };
 
-fn task_row(t: &KairnTheme, done: bool, label: &'static str) -> gpui::Div {
-    let box_el = if done {
-        div()
-            .w(px(13.))
-            .h(px(13.))
-            .flex_none()
-            .rounded(px(4.))
-            .bg(t.accent)
-            .flex()
-            .items_center()
-            .justify_center()
+        let mut note = div()
+            .px(px(38.))
+            .py(px(26.))
+            .line_height(relative(1.58))
+            .when(writing, |d| d.max_w(px(720.)).mx_auto().pt(px(44.)))
             .child(
                 div()
-                    .text_size(px(9.))
+                    .font_family(theme::serif_font())
+                    .text_size(px(27.))
                     .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(t.bg)
-                    .child("✓"),
+                    .mb(px(3.))
+                    .child(masthead),
             )
-    } else {
-        div()
-            .w(px(13.))
-            .h(px(13.))
-            .flex_none()
-            .rounded(px(4.))
-            .border_1()
-            .border_color(t.faint)
-    };
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(t.faint)
+                    .mb(px(12.))
+                    .child(subline),
+            )
+            .child(div().my(px(14.)).h(px(1.)).bg(t.border));
 
-    let text = div()
-        .when_else(
-            done,
-            |d| d.text_color(t.faint).line_through(),
-            |d| d.text_color(t.text),
-        )
-        .child(label);
-
-    div()
-        .flex()
-        .items_center()
-        .gap(px(9.))
-        .py(px(2.5))
-        .rounded(px(6.))
-        .hover(|s| s.bg(t.sel))
-        .child(box_el)
-        .child(text)
-}
-
-fn task_row_tagged(
-    t: &KairnTheme,
-    label: &'static str,
-    tag: &'static str,
-    tag_color: gpui::Hsla,
-) -> gpui::Div {
-    div()
-        .flex()
-        .items_center()
-        .gap(px(9.))
-        .py(px(2.5))
-        .rounded(px(6.))
-        .hover(|s| s.bg(t.sel))
-        .child(
-            div()
-                .w(px(13.))
-                .h(px(13.))
-                .flex_none()
-                .rounded(px(4.))
-                .border_1()
-                .border_color(t.faint),
-        )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .child(div().text_color(t.text).child(label))
-                .child(div().text_size(px(12.)).text_color(tag_color).child(tag)),
-        )
-}
-
-fn bullet_row(t: &KairnTheme, children: Vec<gpui::AnyElement>) -> impl IntoElement {
-    let mut content = div().flex().items_center().gap(px(6.)).text_color(t.dim);
-    for child in children {
-        content = content.child(child);
-    }
-    div()
-        .flex()
-        .gap(px(9.))
-        .py(px(2.5))
-        .child(div().text_color(t.faint).child("–"))
-        .child(content)
-}
-
-fn render_note(t: &KairnTheme, writing: bool) -> impl IntoElement {
-    let today = Local::now();
-    let date: NaiveDate = today.date_naive();
-    let masthead = format!(
-        "{}, {} {}",
-        date.format("%A"),
-        date.format("%-d"),
-        date.format("%B")
-    );
-    let subline = format!("Week {} · daily notes land in the next phase", date.iso_week().week());
-
-    let timeline: [(&str, &str, bool); 4] = [
-        ("09:00", "mail sweep", false),
-        ("10:30", "deep work", true),
-        ("14:00", "review", false),
-        ("16:00", "walk", false),
-    ];
-    let mut pills = div().flex().flex_wrap().gap(px(5.)).mb(px(6.));
-    for (time, label, now) in timeline {
-        pills = pills.child(
-            div()
-                .flex()
-                .gap(px(5.))
-                .items_center()
-                .px(px(10.))
-                .py(px(2.))
-                .rounded(px(20.))
-                .border_1()
-                .bg(t.panel)
-                .font_family(theme::mono_font())
-                .text_size(px(10.5))
-                .when_else(
-                    now,
-                    |d| d.border_color(t.accent).text_color(t.text),
-                    |d| d.border_color(t.border).text_color(t.dim),
-                )
-                .child(
+        match &self.day_note {
+            None => {
+                note = note.child(
                     div()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(t.accent)
-                        .child(time),
-                )
-                .child(label),
-        );
-    }
+                        .mt(px(10.))
+                        .text_color(t.faint)
+                        .child("No note for this day yet."),
+                );
+            }
+            Some(lines) => {
+                for line in lines {
+                    note = note.child(render_line(t, line));
+                }
+            }
+        }
 
-    div()
-        .px(px(38.))
-        .py(px(26.))
-        .line_height(relative(1.58))
-        .when(writing, |d| d.max_w(px(720.)).mx_auto().pt(px(44.)))
-        .child(
-            div()
-                .font_family(theme::serif_font())
-                .text_size(px(27.))
-                .font_weight(gpui::FontWeight::BOLD)
-                .mb(px(3.))
-                .child(masthead),
-        )
-        .child(
-            div()
-                .text_size(px(12.))
-                .text_color(t.faint)
-                .mb(px(12.))
-                .child(subline),
-        )
-        .child(pills)
-        .child(div().my(px(14.)).h(px(1.)).bg(t.border))
-        .child(section_heading(t, "Routines"))
-        .child(task_row(t, true, "Morning review"))
-        .child(task_row(t, false, "Weekly plan"))
-        .child(section_heading(t, "Today"))
-        .child(task_row_tagged(
-            t,
-            "Run the app shell against the mockup",
-            "#kairn",
-            t.amber,
-        ))
-        .child(task_row(t, false, "Wire the week strip to real dates"))
-        .child(task_row_tagged(t, "Book the dentist", "›2026-08-12", t.amber))
-        .child(section_heading(t, "Notes"))
-        .child(bullet_row(
-            t,
-            vec![
-                div()
-                    .child("three layout states: split, terminal full, writing")
-                    .into_any_element(),
-            ],
-        ))
-        .child(bullet_row(
-            t,
-            vec![
-                div().child("shell phase merges into").into_any_element(),
-                div()
-                    .text_color(t.accent)
-                    .child("[[kairn-prd]]")
-                    .into_any_element(),
-                div().child("once it matches the mockup").into_any_element(),
-            ],
-        ))
-        .child(bullet_row(
-            t,
-            vec![
-                div()
-                    .child(format!(
-                        "TUIs get the full pane: ⇧{}⏎ toggles terminal full",
-                        mod_symbol()
-                    ))
-                    .into_any_element(),
-            ],
-        ))
-        .child(
+        note.child(
             div()
                 .mt(px(22.))
                 .flex()
@@ -369,4 +229,159 @@ fn render_note(t: &KairnTheme, writing: bool) -> impl IntoElement {
                 .child(kbd(t, format!("⌥{}⏎", mod_symbol())))
                 .child("writing mode · markdown editing lands in the notes phase"),
         )
+    }
 }
+
+fn section_heading(t: &KairnTheme, label: String) -> impl IntoElement {
+    div()
+        .mt(px(18.))
+        .mb(px(8.))
+        .text_size(px(11.))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(t.faint)
+        .child(label.to_uppercase())
+}
+
+fn week_nav(t: &KairnTheme, id: &'static str, glyph: &'static str) -> gpui::Stateful<gpui::Div> {
+    let hover_text = t.text;
+    div()
+        .id(id)
+        .px(px(3.))
+        .text_size(px(13.))
+        .text_color(t.faint)
+        .cursor_pointer()
+        .hover(move |s| s.text_color(hover_text))
+        .child(glyph)
+}
+
+fn render_line(t: &KairnTheme, line: &Line) -> AnyElement {
+    match line {
+        Line::Heading { level, spans } => {
+            if *level == 1 {
+                div()
+                    .mt(px(18.))
+                    .mb(px(6.))
+                    .font_family(theme::serif_font())
+                    .text_size(px(19.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .child(spans_el(t, spans, t.text))
+                    .into_any_element()
+            } else {
+                section_heading_spans(t, spans).into_any_element()
+            }
+        }
+        Line::Task { state, spans } => task_row(t, *state, spans).into_any_element(),
+        Line::Bullet { spans } => div()
+            .flex()
+            .gap(px(9.))
+            .py(px(2.5))
+            .child(div().text_color(t.faint).child("–"))
+            .child(div().flex_1().min_w(px(0.)).child(spans_el(t, spans, t.dim)))
+            .into_any_element(),
+        Line::Quote { spans } => div()
+            .my(px(4.))
+            .pl(px(12.))
+            .border_l_2()
+            .border_color(t.border)
+            .child(spans_el(t, spans, t.dim))
+            .into_any_element(),
+        Line::Rule => div().my(px(14.)).h(px(1.)).bg(t.border).into_any_element(),
+        Line::Blank => div().h(px(8.)).into_any_element(),
+        Line::Text { spans } => div()
+            .py(px(1.))
+            .child(spans_el(t, spans, t.dim))
+            .into_any_element(),
+    }
+}
+
+fn section_heading_spans(t: &KairnTheme, spans: &[Span]) -> impl IntoElement {
+    let label: String = spans.iter().map(|(_, s)| s.as_str()).collect();
+    section_heading(t, label)
+}
+
+fn task_row(t: &KairnTheme, state: TaskState, spans: &[Span]) -> gpui::Div {
+    let box_base = div().w(px(13.)).h(px(13.)).flex_none().rounded(px(4.));
+    let box_el = match state {
+        TaskState::Done => box_base.bg(t.accent).flex().items_center().justify_center().child(
+            div()
+                .text_size(px(9.))
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(t.bg)
+                .child("✓"),
+        ),
+        TaskState::Cancelled => box_base
+            .border_1()
+            .border_color(t.faint)
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(div().text_size(px(8.)).text_color(t.faint).child("✕")),
+        TaskState::Scheduled => box_base
+            .border_1()
+            .border_color(t.faint)
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(div().text_size(px(8.)).text_color(t.faint).child("›")),
+        TaskState::Open => box_base.border_1().border_color(t.faint),
+    };
+
+    let struck = matches!(state, TaskState::Done | TaskState::Cancelled);
+    let base_color = match state {
+        TaskState::Open => t.text,
+        TaskState::Scheduled => t.dim,
+        TaskState::Done | TaskState::Cancelled => t.faint,
+    };
+    let text = div()
+        .flex_1()
+        .min_w(px(0.))
+        .when(struck, |d| d.line_through())
+        .child(spans_el(t, spans, base_color));
+
+    div()
+        .flex()
+        .items_start()
+        .gap(px(9.))
+        .py(px(2.5))
+        .rounded(px(6.))
+        .hover(|s| s.bg(t.sel))
+        .child(box_el.mt(px(4.)))
+        .child(text)
+}
+
+/// Inline fragments as one wrapping text element, tinted per span kind.
+fn spans_el(t: &KairnTheme, spans: &[Span], base_color: gpui::Hsla) -> gpui::Div {
+    let mut text = String::new();
+    let mut highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = Vec::new();
+    for (kind, s) in spans {
+        let start = text.len();
+        text.push_str(s);
+        let style = match kind {
+            SpanKind::Text => None,
+            SpanKind::WikiLink => Some(HighlightStyle {
+                color: Some(t.accent),
+                ..Default::default()
+            }),
+            SpanKind::Tag | SpanKind::DateRef => Some(HighlightStyle {
+                color: Some(t.amber),
+                ..Default::default()
+            }),
+            SpanKind::Mention => Some(HighlightStyle {
+                color: Some(t.faint),
+                ..Default::default()
+            }),
+            SpanKind::Highlight => Some(HighlightStyle {
+                color: Some(t.text),
+                background_color: Some(t.amber.opacity(0.28)),
+                ..Default::default()
+            }),
+        };
+        if let Some(style) = style {
+            highlights.push((start..text.len(), style));
+        }
+    }
+    div()
+        .text_color(base_color)
+        .child(StyledText::new(text).with_highlights(highlights))
+}
+

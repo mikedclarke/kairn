@@ -1,5 +1,8 @@
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::time::Duration;
 
+use chrono::{Datelike, Days, Local, NaiveDate};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, Context, FocusHandle, InteractiveElement, IntoElement, KeyBinding,
@@ -8,6 +11,7 @@ use gpui::{
 };
 use gpui_component::{Root, TitleBar, WindowExt, h_flex};
 
+use crate::notes;
 use crate::session::{Session, SessionKind, spawn};
 use crate::settings::Settings;
 use crate::theme::{self, KairnTheme, KairnThemeExt, Mode};
@@ -109,6 +113,14 @@ pub struct Workspace {
     pub active_session: usize,
     next_session_id: u64,
     pub cal_offset: i32,
+    pub notes_root: PathBuf,
+    pub selected_day: NaiveDate,
+    /// Parsed note for the selected day; `None` when no file exists.
+    pub day_note: Option<Vec<notes::Line>>,
+    /// Days that have a daily note, for calendar indicators.
+    pub note_days: HashSet<NaiveDate>,
+    /// Open-task counts for Monday..Sunday of the selected day's week.
+    pub week_open_counts: [usize; 7],
     _activity_timer: Task<()>,
 }
 
@@ -125,6 +137,9 @@ impl Workspace {
             }
         });
 
+        let notes_root = settings.notes_root();
+        notes::ensure_layout(&notes_root);
+
         let mut this = Self {
             settings,
             focus_handle: cx.focus_handle(),
@@ -138,10 +153,38 @@ impl Workspace {
             active_session: 0,
             next_session_id: 1,
             cal_offset: 0,
+            notes_root,
+            selected_day: Local::now().date_naive(),
+            day_note: None,
+            note_days: HashSet::new(),
+            week_open_counts: [0; 7],
             _activity_timer: activity_timer,
         };
+        this.reload_notes();
         this.spawn_session(SessionKind::Local, window, cx);
         this
+    }
+
+    // ----- notes -----
+
+    pub fn select_day(&mut self, day: NaiveDate, cx: &mut Context<Self>) {
+        self.selected_day = day;
+        self.reload_notes();
+        cx.notify();
+    }
+
+    /// Re-read the selected day's note and the calendar/week indicators.
+    pub fn reload_notes(&mut self) {
+        self.day_note =
+            notes::load_day(&self.notes_root, self.selected_day).map(|t| notes::parse(&t));
+        self.note_days = notes::days_with_notes(&self.notes_root);
+        let monday = self.selected_day
+            - Days::new(self.selected_day.weekday().num_days_from_monday() as u64);
+        for (i, count) in self.week_open_counts.iter_mut().enumerate() {
+            *count = notes::load_day(&self.notes_root, monday + Days::new(i as u64))
+                .map(|t| notes::open_task_count(&t))
+                .unwrap_or(0);
+        }
     }
 
     pub fn mode(&self) -> Mode {

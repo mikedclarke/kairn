@@ -29,6 +29,10 @@ impl SshHost {
 pub struct Settings {
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Folder all notes load from (NotePlan-compatible layout). Unset means
+    /// the default `~/kairn`. A leading `~` is expanded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes_root: Option<String>,
     #[serde(default)]
     pub ssh_hosts: Vec<SshHost>,
 }
@@ -41,18 +45,36 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: default_theme(),
+            notes_root: None,
             ssh_hosts: Vec::new(),
         }
     }
 }
 
-pub fn config_path() -> PathBuf {
+fn home_dir() -> PathBuf {
     #[allow(deprecated)]
-    let home = std::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".config").join("kairn").join("settings.json")
+    std::env::home_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+pub fn config_path() -> PathBuf {
+    home_dir().join(".config").join("kairn").join("settings.json")
 }
 
 impl Settings {
+    /// Resolved notes root: the configured folder, or `~/kairn`.
+    pub fn notes_root(&self) -> PathBuf {
+        match self.notes_root.as_deref() {
+            None | Some("") => home_dir().join("kairn"),
+            Some(raw) => {
+                if let Some(rest) = raw.strip_prefix("~/") {
+                    home_dir().join(rest)
+                } else {
+                    PathBuf::from(raw)
+                }
+            }
+        }
+    }
+
     pub fn load() -> Self {
         let path = config_path();
         match fs::read_to_string(&path) {

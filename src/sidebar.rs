@@ -25,26 +25,25 @@ impl Workspace {
             .text_size(px(12.5))
             .child(self.render_calendar(t, cx));
 
-        // Daily: real dates, stub selection (today).
         let today = Local::now().date_naive();
-        side = side
-            .child(sechead(t, "Daily", None))
-            .child(
-                nav_item(t, "daily-0")
-                    .bg(t.sel)
-                    .text_color(t.text)
-                    .child(div().w(px(7.)).h(px(7.)).flex_none().rounded_full().bg(t.amber))
-                    .child(div().flex_1().child(day_label(today)))
-                    .child(count_label(t, "today", false)),
-            )
-            .child(
-                nav_item(t, "daily-1")
-                    .child(div().flex_1().child(day_label(today - Days::new(1)))),
-            )
-            .child(
-                nav_item(t, "daily-2")
-                    .child(div().flex_1().child(day_label(today - Days::new(2)))),
-            );
+        side = side.child(sechead(t, "Daily", None));
+        for i in 0..3u64 {
+            let day = today - Days::new(i);
+            let selected = day == self.selected_day;
+            let has_note = self.note_days.contains(&day);
+            let mut row = nav_item(t, ("daily", i as usize))
+                .when(selected, |d| d.bg(t.sel).text_color(t.text))
+                .when(has_note, |d| {
+                    d.child(div().w(px(7.)).h(px(7.)).flex_none().rounded_full().bg(t.amber))
+                })
+                .child(div().flex_1().child(day_label(day)));
+            if day == today {
+                row = row.child(count_label(t, "today", false));
+            }
+            side = side.child(row.on_click(cx.listener(move |this, _, _, cx| {
+                this.select_day(day, cx);
+            })));
+        }
 
         // Tasks and Inbox: stub counts until the notes subsystem exists.
         side = side
@@ -242,19 +241,25 @@ impl Workspace {
                 let day: NaiveDate = grid_start + Days::new(week * 7 + wd);
                 let in_month = day.month() == shown_first.month();
                 let is_today = day == today;
-                // "Has note" is stubbed as past-days-of-this-month until Phase C.
-                let has_note = in_month && day < today;
+                let is_selected = day == self.selected_day;
+                let has_note = self.note_days.contains(&day);
 
                 let cell = div()
+                    .id(("cal-cell", (week * 7 + wd) as usize))
                     .flex_1()
                     .py(px(3.))
                     .rounded(px(5.))
                     .text_center()
+                    .cursor_pointer()
                     .child(day.format("%-d").to_string());
                 let cell = if is_today {
                     cell.bg(t.amber)
                         .text_color(t.on_amber)
                         .font_weight(gpui::FontWeight::BOLD)
+                } else if is_selected {
+                    cell.bg(t.sel)
+                        .text_color(t.text)
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
                 } else if !in_month {
                     cell.text_color(t.faint.opacity(0.5))
                 } else if has_note {
@@ -262,7 +267,13 @@ impl Workspace {
                 } else {
                     cell.text_color(t.dim)
                 };
-                row = row.child(cell);
+                let hover_bg = t.hover;
+                row = row.child(
+                    cell.when(!is_today && !is_selected, |c| c.hover(move |s| s.bg(hover_bg)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.select_day(day, cx);
+                        })),
+                );
             }
             cal = cal.child(row);
         }
