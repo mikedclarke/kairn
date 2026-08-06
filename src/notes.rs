@@ -239,6 +239,18 @@ pub fn append_to_day(root: &Path, date: NaiveDate, text: &str) -> io::Result<Pat
     Ok(path)
 }
 
+/// Write a whole note, atomically, ensuring a trailing newline.
+pub fn write_note(path: &Path, content: &str) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    if content.is_empty() || content.ends_with('\n') {
+        atomic_write(path, content)
+    } else {
+        atomic_write(path, &format!("{content}\n"))
+    }
+}
+
 fn atomic_write(path: &Path, content: &str) -> io::Result<()> {
     let name = path
         .file_name()

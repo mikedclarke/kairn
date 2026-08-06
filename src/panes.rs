@@ -4,6 +4,7 @@ use gpui::{
     AnyElement, Context, HighlightStyle, InteractiveElement, IntoElement, ParentElement,
     StatefulInteractiveElement, Styled, StyledText, Window, div, px, relative,
 };
+use gpui_component::input::Input;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 
 use crate::notes::{self, Line, Span, SpanKind, TaskState};
@@ -62,21 +63,37 @@ impl Workspace {
         writing: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        div()
+        let pane = div()
             .size_full()
             .min_w(px(0.))
             .flex()
             .flex_col()
             .bg(t.bg)
-            .child(self.render_week_strip(t, cx))
-            .child(
+            .child(self.render_week_strip(t, cx));
+
+        // Writing mode with a live editor: the raw markdown, autosaved.
+        if writing && let Some(editor) = self.editor.clone() {
+            return pane.child(
                 div()
-                    .id("note-scroll")
                     .flex_1()
                     .min_h(px(0.))
-                    .overflow_y_scroll()
-                    .child(self.render_note(t, writing, cx)),
-            )
+                    .w_full()
+                    .max_w(px(760.))
+                    .mx_auto()
+                    .px(px(24.))
+                    .py(px(20.))
+                    .child(Input::new(&editor).h_full().appearance(false)),
+            );
+        }
+
+        pane.child(
+            div()
+                .id("note-scroll")
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .child(self.render_note(t, writing, cx)),
+        )
     }
 
     fn render_week_strip(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -230,7 +247,7 @@ impl Workspace {
                 .text_size(px(11.5))
                 .text_color(t.faint)
                 .child(kbd(t, format!("⌥{}⏎", mod_symbol())))
-                .child("writing mode · markdown editing lands in the notes phase"),
+                .child("writing mode · edits autosave to the file"),
         )
         .into_any_element()
     }

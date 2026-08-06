@@ -30,6 +30,7 @@ actions!(
         ToggleThemeMode,
         OpenSettings,
         Capture,
+        SaveNote,
         NewLocalSession,
         Quit,
         Session1,
@@ -69,6 +70,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(&p("j"), ToggleSwitcher, None),
         KeyBinding::new(&p(","), OpenSettings, None),
         KeyBinding::new(&p("shift-k"), Capture, None),
+        KeyBinding::new(&p("s"), SaveNote, None),
         KeyBinding::new(&p("n"), NewLocalSession, None),
         KeyBinding::new(&p("q"), Quit, None),
         KeyBinding::new(&p("1"), Session1, None),
@@ -151,6 +153,17 @@ pub struct Workspace {
     capture_open: bool,
     capture_input: Option<gpui::Entity<InputState>>,
     _capture_sub: Option<gpui::Subscription>,
+    /// Writing-mode editor over the pane document's raw markdown. Exists only
+    /// while the Writing layout is active.
+    pub editor: Option<gpui::Entity<InputState>>,
+    /// File the editor writes to; concrete even when the day has no file yet.
+    editor_doc: Option<PathBuf>,
+    /// The editor holds changes not yet on disk.
+    editor_dirty: bool,
+    /// Disk changed under a clean editor; the next render re-syncs it.
+    editor_stale: bool,
+    _editor_sub: Option<gpui::Subscription>,
+    _autosave: Option<Task<()>>,
     picker_open: bool,
     picker_pos: Point<Pixels>,
     pub sessions: Vec<Session>,
@@ -212,6 +225,12 @@ impl Workspace {
             capture_open: false,
             capture_input: None,
             _capture_sub: None,
+            editor: None,
+            editor_doc: None,
+            editor_dirty: false,
+            editor_stale: false,
+            _editor_sub: None,
+            _autosave: None,
             picker_open: false,
             picker_pos: point(px(0.), px(0.)),
             sessions: Vec::new(),
@@ -374,6 +393,9 @@ impl Workspace {
                 while rx.try_recv().is_ok() {}
                 let ok = this.update(cx, |ws, cx| {
                     ws.reload_notes();
+                    if ws.editor.is_some() && !ws.editor_dirty {
+                        ws.editor_stale = true;
+                    }
                     cx.notify();
                 });
                 if ok.is_err() {
@@ -462,6 +484,119 @@ impl Workspace {
             self.capture_open = false;
             self.focus_active_terminal(window, cx);
             cx.notify();
+        }
+    }
+
+    // ----- editing -----
+
+    /// Keep the writing-mode editor in step with the layout and the pane
+    /// document. Runs at the top of every render (the one place a `Window` is
+    /// reliably in hand for `InputState::set_value`): creates the editor on
+    /// entering Writing, flushes and drops it on leaving, swaps content when
+    /// the document changes, and re-syncs after external file changes.
+    fn sync_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.layout != LayoutMode::Writing {
+            if self.editor.is_some() {
+                if self.editor_dirty {
+                    self.save_editor(cx);
+                }
+                self.editor = None;
+                self.editor_doc = None;
+                self._editor_sub = None;
+                self._autosave = None;
+                self.editor_dirty = false;
+                self.editor_stale = false;
+            }
+            return;
+        }
+
+        // Editing a generated task view makes no sense; fall back to the day.
+        if matches!(self.view, PaneView::Tasks(_)) {
+            self.view = PaneView::Day;
+            self.reload_notes();
+        }
+
+        let target = match &self.doc_path {
+            Some(p) => p.clone(),
+            None => match &self.view {
+                PaneView::Day => notes::daily_path(&self.notes_root, self.selected_day),
+                _ => return,
+            },
+        };
+        // A file that exists but couldn't be read must not be edited from an
+        // empty buffer: autosave would clobber it.
+        if self.doc_text.is_none() && target.exists() {
+            return;
+        }
+        let disk = self.doc_text.clone().unwrap_or_default();
+
+        match self.editor.clone() {
+            None => {
+                let state = cx.new(|cx| {
+                    InputState::new(window, cx).multi_line(true).default_value(disk)
+                });
+                self._editor_sub = Some(cx.subscribe_in(
+                    &state,
+                    window,
+                    |this, state, ev: &InputEvent, _window, cx| {
+                        if !matches!(ev, InputEvent::Change) {
+                            return;
+                        }
+                        let value = state.read(cx).value();
+                        if value.as_ref() != this.doc_text.as_deref().unwrap_or("") {
+                            this.editor_dirty = true;
+                            this._autosave = Some(cx.spawn(async move |this, cx| {
+                                cx.background_executor()
+                                    .timer(Duration::from_millis(800))
+                                    .await;
+                                let _ = this.update(cx, |ws, cx| ws.save_editor(cx));
+                            }));
+                        }
+                    },
+                ));
+                state.update(cx, |s, cx| s.focus(window, cx));
+                self.editor = Some(state);
+                self.editor_doc = Some(target);
+                self.editor_dirty = false;
+                self.editor_stale = false;
+            }
+            Some(editor) => {
+                let switched = self.editor_doc.as_ref() != Some(&target);
+                if switched && self.editor_dirty {
+                    self.save_editor(cx);
+                }
+                let resync = self.editor_stale
+                    && !self.editor_dirty
+                    && editor.read(cx).value().as_ref() != disk;
+                if switched || resync {
+                    editor.update(cx, |s, cx| s.set_value(disk, window, cx));
+                    self.editor_doc = Some(target);
+                    self.editor_dirty = false;
+                }
+                self.editor_stale = false;
+            }
+        }
+    }
+
+    /// Write the editor's buffer to its file (atomic, trailing newline
+    /// ensured) and refresh everything derived from the notes.
+    fn save_editor(&mut self, cx: &mut Context<Self>) {
+        let (Some(editor), Some(path)) = (&self.editor, &self.editor_doc) else {
+            return;
+        };
+        let value = editor.read(cx).value().to_string();
+        match notes::write_note(path, &value) {
+            Ok(()) => self.editor_dirty = false,
+            Err(e) => eprintln!("kairn: could not save {}: {e}", path.display()),
+        }
+        self.reload_notes();
+        cx.notify();
+    }
+
+    fn on_save_note(&mut self, _: &SaveNote, _: &mut Window, cx: &mut Context<Self>) {
+        if self.editor_dirty {
+            self._autosave = None;
+            self.save_editor(cx);
         }
     }
 
@@ -686,6 +821,9 @@ impl Workspace {
     }
 
     fn on_quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
+        if self.editor_dirty {
+            self.save_editor(cx);
+        }
         cx.quit();
     }
 
@@ -1076,6 +1214,7 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.kairn().clone();
+        self.sync_editor(window, cx);
 
         let mut body = div().flex().flex_1().min_h(px(0.));
         if self.sidebar_open {
@@ -1102,6 +1241,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_toggle_theme))
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_capture))
+            .on_action(cx.listener(Self::on_save_note))
             .on_action(cx.listener(Self::on_new_local_session))
             .on_action(cx.listener(Self::on_quit))
             .on_action(cx.listener(|this, _: &Session1, w, cx| this.on_activate_nth(0, w, cx)))
