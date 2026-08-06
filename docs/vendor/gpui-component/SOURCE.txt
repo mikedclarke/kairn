@@ -1,0 +1,14 @@
+gpui-component v0.5.1 (crates.io), pinned as "=0.5.1" in Cargo.toml.
+Upstream: https://github.com/longbridge/gpui-component (tag v0.5.1,
+commit 0f0ab35233212f8f3277028995caf0c41e13ee6c).
+
+crates.io releases of gpui-component depend on the published gpui
+(^0.2.2), which is what this repo and gpui-terminal build against.
+The upstream MAIN BRANCH tracks Zed's git gpui instead - never copy
+example code from main; use the v0.5.1 tag.
+
+Files here are reference copies from the v0.5.1 tag:
+- example-hello-world.rs  examples/hello_world/src/main.rs (init + Root wiring)
+- example-dialog.rs       examples/dialog_overlay/src/main.rs (dialogs + sheets)
+- example-input.rs        examples/input/src/main.rs (InputState + subscriptions)
+- NOTES.md                API facts this app relies on, verified against the tag
