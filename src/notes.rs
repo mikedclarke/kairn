@@ -217,6 +217,37 @@ pub fn parse(text: &str) -> Vec<Line> {
 
 // ----- writeback -----
 
+/// Append a captured line to a day's note as an open task, creating the file
+/// if the day has none yet. Returns the file written.
+pub fn append_to_day(root: &Path, date: NaiveDate, text: &str) -> io::Result<PathBuf> {
+    let path = daily_file(root, date).unwrap_or_else(|| daily_path(root, date));
+    let mut content = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str("* ");
+    content.push_str(text.trim());
+    content.push('\n');
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    atomic_write(&path, &content)?;
+    Ok(path)
+}
+
+fn atomic_write(path: &Path, content: &str) -> io::Result<()> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
+    let tmp = path.with_file_name(format!(".{}.kairn-tmp", name.to_string_lossy()));
+    fs::write(&tmp, content)?;
+    fs::rename(&tmp, path)
+}
+
 /// Toggle one task line between open and done, writing in the line's own
 /// style: indentation and list marker are preserved, only the bracket and the
 /// `@done(...)` stamp change. `* task` becomes `* [x] task @done(now)`; a done
@@ -305,12 +336,7 @@ pub fn toggle_task_on_disk(path: &Path, line_idx: usize, expected: &str) -> io::
     let Some(new_text) = toggle_task_in_text(&text, line_idx, expected, &now) else {
         return Ok(false);
     };
-    let name = path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
-    let tmp = path.with_file_name(format!(".{}.kairn-tmp", name.to_string_lossy()));
-    fs::write(&tmp, &new_text)?;
-    fs::rename(&tmp, path)?;
+    atomic_write(path, &new_text)?;
     Ok(true)
 }
 

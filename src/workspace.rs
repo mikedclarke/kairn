@@ -5,11 +5,14 @@ use std::time::Duration;
 use chrono::{Datelike, Days, Local, NaiveDate};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, Context, FocusHandle, InteractiveElement, IntoElement, KeyBinding,
+    App, AppContext as _, Context, FocusHandle, InteractiveElement, IntoElement, KeyBinding,
     KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render,
     SharedString, StatefulInteractiveElement, Styled, Task, Window, actions, div, point, px,
 };
-use gpui_component::{Root, TitleBar, WindowExt, h_flex};
+use gpui_component::{
+    Root, TitleBar, WindowExt, h_flex,
+    input::{Input, InputEvent, InputState},
+};
 
 use crate::notes;
 use crate::session::{Session, SessionKind, spawn};
@@ -26,6 +29,7 @@ actions!(
         CloseOverlay,
         ToggleThemeMode,
         OpenSettings,
+        Capture,
         NewLocalSession,
         Quit,
         Session1,
@@ -64,6 +68,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(&p("alt-enter"), ToggleWriting, None),
         KeyBinding::new(&p("j"), ToggleSwitcher, None),
         KeyBinding::new(&p(","), OpenSettings, None),
+        KeyBinding::new(&p("shift-k"), Capture, None),
         KeyBinding::new(&p("n"), NewLocalSession, None),
         KeyBinding::new(&p("q"), Quit, None),
         KeyBinding::new(&p("1"), Session1, None),
@@ -143,6 +148,9 @@ pub struct Workspace {
     pub layout: LayoutMode,
     sidebar_open: bool,
     switcher_open: bool,
+    capture_open: bool,
+    capture_input: Option<gpui::Entity<InputState>>,
+    _capture_sub: Option<gpui::Subscription>,
     picker_open: bool,
     picker_pos: Point<Pixels>,
     pub sessions: Vec<Session>,
@@ -201,6 +209,9 @@ impl Workspace {
             layout: LayoutMode::Split,
             sidebar_open: true,
             switcher_open: false,
+            capture_open: false,
+            capture_input: None,
+            _capture_sub: None,
             picker_open: false,
             picker_pos: point(px(0.), px(0.)),
             sessions: Vec::new(),
@@ -445,12 +456,120 @@ impl Workspace {
     }
 
     pub fn close_overlays(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.picker_open || self.switcher_open {
+        if self.picker_open || self.switcher_open || self.capture_open {
             self.picker_open = false;
             self.switcher_open = false;
+            self.capture_open = false;
             self.focus_active_terminal(window, cx);
             cx.notify();
         }
+    }
+
+    // ----- capture -----
+
+    fn on_capture(&mut self, _: &Capture, window: &mut Window, cx: &mut Context<Self>) {
+        if self.capture_open {
+            self.close_overlays(window, cx);
+            return;
+        }
+        // A fresh input each open: empty value, no stale state.
+        let input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Capture to today's note…")
+        });
+        self._capture_sub = Some(cx.subscribe_in(
+            &input,
+            window,
+            |this, _, ev: &InputEvent, window, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. }) {
+                    this.submit_capture(window, cx);
+                }
+            },
+        ));
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.capture_input = Some(input);
+        self.capture_open = true;
+        self.switcher_open = false;
+        self.picker_open = false;
+        cx.notify();
+    }
+
+    fn submit_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self
+            .capture_input
+            .as_ref()
+            .map(|i| i.read(cx).value().trim().to_string())
+            .unwrap_or_default();
+        if !text.is_empty() {
+            let today = Local::now().date_naive();
+            if let Err(e) = notes::append_to_day(&self.notes_root, today, &text) {
+                eprintln!("kairn: capture failed: {e}");
+                window.push_notification("Could not write today's note, see stderr.", cx);
+            }
+            self.reload_notes();
+        }
+        self.close_overlays(window, cx);
+    }
+
+    fn render_capture(&self, t: &KairnTheme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.capture_open {
+            return None;
+        }
+        let input = self.capture_input.clone()?;
+
+        let card = div()
+            .w(px(600.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .rounded(px(12.))
+            .border_1()
+            .border_color(t.border)
+            .bg(t.panel2)
+            .shadow_lg()
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .px(px(16.))
+                    .py(px(13.))
+                    .gap(px(10.))
+                    .text_size(px(15.))
+                    .text_color(t.faint)
+                    .border_b_1()
+                    .border_color(t.border)
+                    .child(div().w(px(2.)).h(px(16.)).bg(t.amber))
+                    .child("Capture"),
+            )
+            .child(div().p(px(12.)).child(Input::new(&input)))
+            .child(
+                h_flex()
+                    .px(px(16.))
+                    .py(px(8.))
+                    .gap(px(14.))
+                    .border_t_1()
+                    .border_color(t.border)
+                    .text_size(px(11.))
+                    .text_color(t.faint)
+                    .child("⏎ add to today")
+                    .child("esc close"),
+            );
+
+        Some(
+            div()
+                .id("capture-backdrop")
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_center()
+                .items_start()
+                .pt(px(100.))
+                .bg(gpui::rgba(0x0a0b0873))
+                .key_context("Overlay")
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        this.close_overlays(window, cx);
+                    }),
+                )
+                .child(card),
+        )
     }
 
     // ----- action handlers -----
@@ -627,8 +746,8 @@ impl Workspace {
                 .child("Capture")
                 .child(kbd(t, format!("{}⇧K", mod_symbol()))),
         );
-        let capture_btn = capture_btn.on_click(cx.listener(|_, _, window, cx| {
-            window.push_notification("Quick capture arrives with the notes phase.", cx);
+        let capture_btn = capture_btn.on_click(cx.listener(|this, _, window, cx| {
+            this.on_capture(&Capture, window, cx);
         }));
 
         let theme_btn = titlebar_button(t, "theme-btn", cx)
@@ -982,6 +1101,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_close_overlay))
             .on_action(cx.listener(Self::on_toggle_theme))
             .on_action(cx.listener(Self::on_open_settings))
+            .on_action(cx.listener(Self::on_capture))
             .on_action(cx.listener(Self::on_new_local_session))
             .on_action(cx.listener(Self::on_quit))
             .on_action(cx.listener(|this, _: &Session1, w, cx| this.on_activate_nth(0, w, cx)))
@@ -999,6 +1119,7 @@ impl Render for Workspace {
             .child(self.render_statusbar(&t, cx))
             .children(self.render_picker(&t, window, cx))
             .children(self.render_switcher(&t, cx))
+            .children(self.render_capture(&t, cx))
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_notification_layer(window, cx))
     }
