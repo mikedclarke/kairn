@@ -4,3 +4,10 @@ Cargo.lock.orig
 .DS_Store
 .env
 /dist
+
+# agent instruction files stay local
+CLAUDE.md
+AGENTS.md
+.claude/
+MEMORY.md
+LEARNINGS.md
