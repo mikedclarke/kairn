@@ -7,7 +7,7 @@ use gpui::{
 
 use crate::session::SessionKind;
 use crate::theme::{self, KairnTheme};
-use crate::workspace::{Workspace, mod_symbol};
+use crate::workspace::{PaneView, TaskQuery, Workspace, mod_symbol};
 
 impl Workspace {
     pub fn render_sidebar(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -45,33 +45,71 @@ impl Workspace {
             })));
         }
 
-        // Tasks and Inbox: stub counts until the notes subsystem exists.
-        side = side
-            .child(sechead(t, "Tasks", None))
-            .child(
-                nav_item(t, "tasks-today")
-                    .child(div().flex_1().child("Today"))
-                    .child(count_label(t, "3", false)),
-            )
-            .child(
-                nav_item(t, "tasks-open")
-                    .child(div().flex_1().child("Open"))
-                    .child(count_label(t, "7", false)),
-            )
-            .child(
-                nav_item(t, "tasks-overdue")
-                    .child(div().flex_1().child("Overdue"))
-                    .child(count_label(t, "2", true)),
-            )
-            .child(sechead(t, "Inbox", Some("2")))
-            .child(nav_item(t, "inbox-0").child("Clipped: GPUI layout notes"))
-            .child(nav_item(t, "inbox-1").child("Idea: week strip drag animation"))
-            .child(sechead(t, "Notes", None))
-            .child(nav_item(t, "notes-0").child("▸ knowledge"))
-            .child(nav_item(t, "notes-1").child("▾ projects"))
-            .child(nav_item(t, "notes-2").pl(px(28.)).child("kairn · prd"))
-            .child(nav_item(t, "notes-3").pl(px(28.)).child("kairn · shell notes"))
-            .child(nav_item(t, "notes-4").child("▸ archive"));
+        // Tasks: real counts from the daily-note scan; each row opens a view.
+        side = side.child(sechead(t, "Tasks", None));
+        let queries = [
+            ("tasks-today", "Today", TaskQuery::Today),
+            ("tasks-open", "Open", TaskQuery::Open),
+            ("tasks-overdue", "Overdue", TaskQuery::Overdue),
+        ];
+        for (id, label, query) in queries {
+            let count = self.tasks_for(query).count();
+            let active = self.view == PaneView::Tasks(query);
+            let hot = query == TaskQuery::Overdue && count > 0;
+            side = side.child(
+                nav_item(t, id)
+                    .when(active, |d| d.bg(t.sel).text_color(t.text))
+                    .child(div().flex_1().child(label))
+                    .child(count_label(t, &count.to_string(), hot))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_task_view(query, cx);
+                    })),
+            );
+        }
+
+        // Notes: the real tree of the Notes/ folder.
+        side = side.child(sechead(t, "Notes", None));
+        if self.notes_tree.is_empty() {
+            side = side.child(
+                nav_item(t, "notes-empty")
+                    .text_color(t.faint)
+                    .child("No notes yet"),
+            );
+        }
+        for (i, entry) in self.notes_tree.iter().enumerate() {
+            let path = entry.path.clone();
+            let indent = px(14. + entry.depth as f32 * 14.);
+            let mut row = nav_item(t, ("note-row", i)).pl(indent);
+            if entry.special {
+                row = row.text_color(t.faint);
+            }
+            if entry.is_dir {
+                let open = self.notes_expanded_contains(&entry.path);
+                row = row
+                    .child(
+                        div()
+                            .w(px(11.))
+                            .flex_none()
+                            .text_size(px(9.))
+                            .text_color(t.faint)
+                            .child(if open { "▾" } else { "▸" }),
+                    )
+                    .child(div().flex_1().child(entry.name.clone()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_notes_folder(path.clone(), cx);
+                    }));
+            } else {
+                let selected = self.view == PaneView::Note(entry.path.clone());
+                row = row
+                    .when(selected, |d| d.bg(t.sel).text_color(t.text))
+                    .child(div().w(px(11.)).flex_none())
+                    .child(div().flex_1().min_w(px(0.)).overflow_hidden().whitespace_nowrap().text_ellipsis().child(entry.name.clone()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_note(path.clone(), cx);
+                    }));
+            }
+            side = side.child(row);
+        }
 
         // Sessions: the real list.
         side = side.child(sechead(t, "Sessions", Some(&session_count.to_string())));

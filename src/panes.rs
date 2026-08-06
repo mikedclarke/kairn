@@ -6,9 +6,9 @@ use gpui::{
 };
 use gpui_component::resizable::{h_resizable, resizable_panel};
 
-use crate::notes::{Line, Span, SpanKind, TaskState};
+use crate::notes::{self, Line, Span, SpanKind, TaskState};
 use crate::theme::{self, KairnTheme};
-use crate::workspace::{LayoutMode, Workspace, chord, kbd, mod_symbol};
+use crate::workspace::{LayoutMode, PaneView, TaskQuery, Workspace, chord, kbd, mod_symbol};
 
 impl Workspace {
     pub fn render_main(
@@ -165,56 +165,54 @@ impl Workspace {
         t: &KairnTheme,
         writing: bool,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let date = self.selected_day;
+    ) -> AnyElement {
+        if let PaneView::Tasks(query) = self.view {
+            return self.render_task_view(t, query, writing, cx);
+        }
+
         let today = Local::now().date_naive();
-        let masthead = format!(
-            "{}, {} {}",
-            date.format("%A"),
-            date.format("%-d"),
-            date.format("%B")
-        );
-        let relative_label = match (date - today).num_days() {
-            0 => Some("today"),
-            1 => Some("tomorrow"),
-            -1 => Some("yesterday"),
-            _ => None,
-        };
-        let subline = match relative_label {
-            Some(label) => format!("Week {} · {}", date.iso_week().week(), label),
-            None => format!("Week {}", date.iso_week().week()),
-        };
-
-        let mut note = div()
-            .px(px(38.))
-            .py(px(26.))
-            .line_height(relative(1.58))
-            .when(writing, |d| d.max_w(px(720.)).mx_auto().pt(px(44.)))
-            .child(
-                div()
-                    .font_family(theme::serif_font())
-                    .text_size(px(27.))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .mb(px(3.))
-                    .child(masthead),
-            )
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(t.faint)
-                    .mb(px(12.))
-                    .child(subline),
-            )
-            .child(div().my(px(14.)).h(px(1.)).bg(t.border));
-
-        match &self.day_note {
-            None => {
-                note = note.child(
-                    div()
-                        .mt(px(10.))
-                        .text_color(t.faint)
-                        .child("No note for this day yet."),
+        let (masthead, subline, empty_text) = match &self.view {
+            PaneView::Note(path) => {
+                let title = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let folder = path
+                    .parent()
+                    .and_then(|p| p.strip_prefix(&self.notes_root).ok())
+                    .map(|p| p.display().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "Notes".to_string());
+                (title, folder, "Couldn't read this note.")
+            }
+            _ => {
+                let date = self.selected_day;
+                let masthead = format!(
+                    "{}, {} {}",
+                    date.format("%A"),
+                    date.format("%-d"),
+                    date.format("%B")
                 );
+                let relative_label = match (date - today).num_days() {
+                    0 => Some("today"),
+                    1 => Some("tomorrow"),
+                    -1 => Some("yesterday"),
+                    _ => None,
+                };
+                let subline = match relative_label {
+                    Some(label) => format!("Week {} · {}", date.iso_week().week(), label),
+                    None => format!("Week {}", date.iso_week().week()),
+                };
+                (masthead, subline, "No note for this day yet.")
+            }
+        };
+
+        let mut note = note_frame(t, writing, masthead, subline);
+
+        match &self.doc_lines {
+            None => {
+                note = note.child(div().mt(px(10.)).text_color(t.faint).child(empty_text));
             }
             Some(lines) => {
                 for (idx, line) in lines.iter().enumerate() {
@@ -234,7 +232,97 @@ impl Workspace {
                 .child(kbd(t, format!("⌥{}⏎", mod_symbol())))
                 .child("writing mode · markdown editing lands in the notes phase"),
         )
+        .into_any_element()
     }
+
+    fn render_task_view(
+        &self,
+        t: &KairnTheme,
+        query: TaskQuery,
+        writing: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let tasks: Vec<notes::TaskRef> = self.tasks_for(query).cloned().collect();
+        let subline = format!("{} open", tasks.len());
+        let mut note = note_frame(t, writing, query.title().to_string(), subline);
+
+        if tasks.is_empty() {
+            note = note.child(div().mt(px(10.)).text_color(t.faint).child("Nothing here."));
+        }
+
+        let sel = t.sel;
+        let dim = t.dim;
+        for (i, task) in tasks.into_iter().enumerate() {
+            let date = task.date;
+            let date_label = format!("{} {}", date.format("%-d"), date.format("%b"));
+            let spans = task.spans.clone();
+            let checkbox = div()
+                .id(("task-view-box", i))
+                .w(px(13.))
+                .h(px(13.))
+                .flex_none()
+                .mt(px(4.))
+                .rounded(px(4.))
+                .border_1()
+                .border_color(t.faint)
+                .cursor_pointer()
+                .hover(move |s| s.border_color(dim))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.toggle_task_ref(&task, cx);
+                }));
+            note = note.child(
+                div()
+                    .id(("task-view-row", i))
+                    .flex()
+                    .items_start()
+                    .gap(px(9.))
+                    .py(px(2.5))
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(sel))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_day(date, cx);
+                    }))
+                    .child(checkbox)
+                    .child(div().flex_1().min_w(px(0.)).child(spans_el(t, &spans, t.text)))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.))
+                            .text_color(t.faint)
+                            .child(date_label),
+                    ),
+            );
+        }
+
+        note.into_any_element()
+    }
+}
+
+/// The shared pane scaffold: serif masthead, faint subline, rule.
+fn note_frame(t: &KairnTheme, writing: bool, masthead: String, subline: String) -> gpui::Div {
+    div()
+        .px(px(38.))
+        .py(px(26.))
+        .line_height(relative(1.58))
+        .when(writing, |d| d.max_w(px(720.)).mx_auto().pt(px(44.)))
+        .child(
+            div()
+                .font_family(theme::serif_font())
+                .text_size(px(27.))
+                .font_weight(gpui::FontWeight::BOLD)
+                .mb(px(3.))
+                .child(masthead),
+        )
+        .child(
+            div()
+                .text_size(px(12.))
+                .text_color(t.faint)
+                .mb(px(12.))
+                .child(subline),
+        )
+        .child(div().my(px(14.)).h(px(1.)).bg(t.border))
 }
 
 fn section_heading(t: &KairnTheme, label: String) -> impl IntoElement {

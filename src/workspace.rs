@@ -100,6 +100,42 @@ pub enum LayoutMode {
     Writing,
 }
 
+/// What the note pane is showing.
+#[derive(Clone, PartialEq, Debug)]
+pub enum PaneView {
+    /// The selected day's daily note.
+    Day,
+    /// A note from the `Notes/` tree.
+    Note(PathBuf),
+    /// A generated list of open tasks from the daily notes.
+    Tasks(TaskQuery),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TaskQuery {
+    Today,
+    Open,
+    Overdue,
+}
+
+impl TaskQuery {
+    pub fn matches(self, date: NaiveDate, today: NaiveDate) -> bool {
+        match self {
+            TaskQuery::Today => date == today,
+            TaskQuery::Open => true,
+            TaskQuery::Overdue => date < today,
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            TaskQuery::Today => "Today's tasks",
+            TaskQuery::Open => "Open tasks",
+            TaskQuery::Overdue => "Overdue tasks",
+        }
+    }
+}
+
 pub struct Workspace {
     pub settings: Settings,
     focus_handle: FocusHandle,
@@ -115,16 +151,23 @@ pub struct Workspace {
     pub cal_offset: i32,
     pub notes_root: PathBuf,
     pub selected_day: NaiveDate,
-    /// Parsed note for the selected day; `None` when no file exists.
-    pub day_note: Option<Vec<notes::Line>>,
-    /// The selected day's note as read from disk, line-aligned with
-    /// `day_note`; toggles pass the rendered line back so a file that changed
-    /// underneath is never clobbered.
-    day_note_text: Option<String>,
-    /// The file `day_note_text` was read from (`.md` or NotePlan's `.txt`).
-    day_note_path: Option<PathBuf>,
+    pub view: PaneView,
+    /// Parsed document the pane is showing; `None` when no file exists.
+    pub doc_lines: Option<Vec<notes::Line>>,
+    /// The document as read from disk, line-aligned with `doc_lines`; toggles
+    /// pass the rendered line back so a file that changed underneath is never
+    /// clobbered.
+    doc_text: Option<String>,
+    /// The file `doc_text` was read from (`.md` or NotePlan's `.txt`).
+    doc_path: Option<PathBuf>,
     /// Days that have a daily note, for calendar indicators.
     pub note_days: HashSet<NaiveDate>,
+    /// Every open task across the daily notes, newest first.
+    pub open_tasks: Vec<notes::TaskRef>,
+    /// Visible rows of the sidebar Notes browser.
+    pub notes_tree: Vec<notes::NoteEntry>,
+    /// Folders currently expanded in the Notes browser.
+    notes_expanded: HashSet<PathBuf>,
     /// Open-task counts for Monday..Sunday of the selected day's week.
     pub week_open_counts: [usize; 7],
     _activity_timer: Task<()>,
@@ -166,10 +209,14 @@ impl Workspace {
             cal_offset: 0,
             notes_root,
             selected_day: Local::now().date_naive(),
-            day_note: None,
-            day_note_text: None,
-            day_note_path: None,
+            view: PaneView::Day,
+            doc_lines: None,
+            doc_text: None,
+            doc_path: None,
             note_days: HashSet::new(),
+            open_tasks: Vec::new(),
+            notes_tree: Vec::new(),
+            notes_expanded: HashSet::new(),
             week_open_counts: [0; 7],
             _activity_timer: activity_timer,
             _notes_watcher: notes_watcher,
@@ -184,31 +231,67 @@ impl Workspace {
 
     pub fn select_day(&mut self, day: NaiveDate, cx: &mut Context<Self>) {
         self.selected_day = day;
+        self.view = PaneView::Day;
         self.reload_notes();
         cx.notify();
     }
 
-    /// Re-read the selected day's note and the calendar/week indicators.
+    pub fn open_note(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.view = PaneView::Note(path);
+        self.reload_notes();
+        cx.notify();
+    }
+
+    pub fn open_task_view(&mut self, query: TaskQuery, cx: &mut Context<Self>) {
+        self.view = PaneView::Tasks(query);
+        self.reload_notes();
+        cx.notify();
+    }
+
+    pub fn notes_expanded_contains(&self, path: &std::path::Path) -> bool {
+        self.notes_expanded.contains(path)
+    }
+
+    pub fn toggle_notes_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if !self.notes_expanded.remove(&path) {
+            self.notes_expanded.insert(path);
+        }
+        self.notes_tree = notes::notes_tree(&self.notes_root, &self.notes_expanded);
+        cx.notify();
+    }
+
+    pub fn tasks_for(&self, query: TaskQuery) -> impl Iterator<Item = &notes::TaskRef> {
+        let today = Local::now().date_naive();
+        self.open_tasks.iter().filter(move |t| query.matches(t.date, today))
+    }
+
+    /// Re-read the pane's document and everything the sidebar derives from
+    /// the notes: calendar indicators, open-task counts, the Notes tree.
     pub fn reload_notes(&mut self) {
-        let path = notes::daily_file(&self.notes_root, self.selected_day);
-        let text = path.as_deref().and_then(|p| std::fs::read_to_string(p).ok());
-        self.day_note = text.as_deref().map(notes::parse);
-        self.day_note_text = text;
-        self.day_note_path = path;
         self.note_days = notes::days_with_notes(&self.notes_root);
+        self.open_tasks = notes::open_tasks_in_dailies(&self.notes_root);
+        self.notes_tree = notes::notes_tree(&self.notes_root, &self.notes_expanded);
         let monday = self.selected_day
             - Days::new(self.selected_day.weekday().num_days_from_monday() as u64);
         for (i, count) in self.week_open_counts.iter_mut().enumerate() {
-            *count = notes::load_day(&self.notes_root, monday + Days::new(i as u64))
-                .map(|t| notes::open_task_count(&t))
-                .unwrap_or(0);
+            let day = monday + Days::new(i as u64);
+            *count = self.open_tasks.iter().filter(|t| t.date == day).count();
         }
+        let path = match &self.view {
+            PaneView::Day => notes::daily_file(&self.notes_root, self.selected_day),
+            PaneView::Note(p) => Some(p.clone()),
+            PaneView::Tasks(_) => None,
+        };
+        let text = path.as_deref().and_then(|p| std::fs::read_to_string(p).ok());
+        self.doc_lines = text.as_deref().map(notes::parse);
+        self.doc_text = text;
+        self.doc_path = path;
     }
 
-    /// Toggle the task on line `line_idx` of the selected day's note between
-    /// open and done, writing the change back to the file.
+    /// Toggle the task on line `line_idx` of the pane's document between open
+    /// and done, writing the change back to the file.
     pub fn toggle_task(&mut self, line_idx: usize, cx: &mut Context<Self>) {
-        let (Some(path), Some(text)) = (&self.day_note_path, &self.day_note_text) else {
+        let (Some(path), Some(text)) = (&self.doc_path, &self.doc_text) else {
             return;
         };
         let Some(expected) = text.lines().nth(line_idx) else {
@@ -220,6 +303,17 @@ impl Workspace {
             // up whatever is there now.
             Ok(false) => {}
             Err(e) => eprintln!("kairn: could not update {}: {e}", path.display()),
+        }
+        self.reload_notes();
+        cx.notify();
+    }
+
+    /// Toggle a task from a task view, addressed at whichever daily note it
+    /// was scanned from.
+    pub fn toggle_task_ref(&mut self, task: &notes::TaskRef, cx: &mut Context<Self>) {
+        match notes::toggle_task_on_disk(&task.path, task.line_idx, &task.line) {
+            Ok(_) => {}
+            Err(e) => eprintln!("kairn: could not update {}: {e}", task.path.display()),
         }
         self.reload_notes();
         cx.notify();

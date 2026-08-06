@@ -51,11 +51,6 @@ pub fn daily_file(root: &Path, date: NaiveDate) -> Option<PathBuf> {
     txt.exists().then_some(txt)
 }
 
-/// Read a day's note.
-pub fn load_day(root: &Path, date: NaiveDate) -> Option<String> {
-    fs::read_to_string(daily_file(root, date)?).ok()
-}
-
 /// Every date with a daily note, from one scan of `Calendar/`.
 pub fn days_with_notes(root: &Path) -> HashSet<NaiveDate> {
     let mut days = HashSet::new();
@@ -79,6 +74,103 @@ pub fn days_with_notes(root: &Path) -> HashSet<NaiveDate> {
         }
     }
     days
+}
+
+/// One open task found in a daily note, addressable for toggling.
+#[derive(Clone, Debug)]
+pub struct TaskRef {
+    pub path: PathBuf,
+    pub date: NaiveDate,
+    pub line_idx: usize,
+    /// The raw line, passed back on toggle so a file that changed since the
+    /// scan is never clobbered.
+    pub line: String,
+    pub spans: Vec<Span>,
+}
+
+/// Every open task across the daily notes, newest day first.
+pub fn open_tasks_in_dailies(root: &Path) -> Vec<TaskRef> {
+    let mut days: Vec<NaiveDate> = days_with_notes(root).into_iter().collect();
+    days.sort_unstable_by(|a, b| b.cmp(a));
+    let mut tasks = Vec::new();
+    for date in days {
+        let Some(path) = daily_file(root, date) else { continue };
+        let Ok(text) = fs::read_to_string(&path) else { continue };
+        for (line_idx, raw) in text.lines().enumerate() {
+            if let Line::Task { state: TaskState::Open, spans } = parse_line(raw) {
+                tasks.push(TaskRef {
+                    path: path.clone(),
+                    date,
+                    line_idx,
+                    line: raw.to_string(),
+                    spans,
+                });
+            }
+        }
+    }
+    tasks
+}
+
+/// One visible row of the Notes browser.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NoteEntry {
+    pub path: PathBuf,
+    /// Display name: folder name, or file stem without extension.
+    pub name: String,
+    pub is_dir: bool,
+    /// NotePlan `@`-special folder (Archive, Templates, Trash…), shown last
+    /// and de-emphasized.
+    pub special: bool,
+    pub depth: usize,
+}
+
+/// The visible rows of the `Notes/` tree given the expanded folders: folders
+/// before files, alphabetical, `@`-special folders last within their level.
+pub fn notes_tree(root: &Path, expanded: &HashSet<PathBuf>) -> Vec<NoteEntry> {
+    let mut rows = Vec::new();
+    push_tree_level(&root.join("Notes"), 0, expanded, &mut rows);
+    rows
+}
+
+fn push_tree_level(
+    dir: &Path,
+    depth: usize,
+    expanded: &HashSet<PathBuf>,
+    rows: &mut Vec<NoteEntry>,
+) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    let mut items: Vec<(bool, bool, String, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()).map(String::from) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        let is_dir = path.is_dir();
+        if !is_dir {
+            let ext = path.extension().and_then(|x| x.to_str());
+            if !matches!(ext, Some("md") | Some("txt")) {
+                continue;
+            }
+        }
+        // Sort key: specials last, then folders before files, then name.
+        items.push((name.starts_with('@'), !is_dir, name.to_lowercase(), path));
+    }
+    items.sort();
+    for (special, not_dir, _, path) in items {
+        let is_dir = !not_dir;
+        let name = if is_dir {
+            path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string()
+        } else {
+            path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string()
+        };
+        rows.push(NoteEntry { path: path.clone(), name, is_dir, special, depth });
+        if is_dir && expanded.contains(&path) {
+            push_tree_level(&path, depth + 1, expanded, rows);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,13 +213,6 @@ pub type Span = (SpanKind, String);
 
 pub fn parse(text: &str) -> Vec<Line> {
     text.lines().map(parse_line).collect()
-}
-
-pub fn open_task_count(text: &str) -> usize {
-    parse(text)
-        .iter()
-        .filter(|l| matches!(l, Line::Task { state: TaskState::Open, .. }))
-        .count()
 }
 
 // ----- writeback -----
