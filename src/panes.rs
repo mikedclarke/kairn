@@ -1,15 +1,24 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use chrono::{Datelike, Days, Local};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, Context, HighlightStyle, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, StyledText, Window, div, px, relative,
+    AnyElement, ClickEvent, Context, HighlightStyle, InteractiveElement, IntoElement,
+    ParentElement, StatefulInteractiveElement, Styled, StyledText, TextLayout, Window, div, px,
+    relative,
 };
 use gpui_component::input::Input;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 
 use crate::notes::{self, Line, Span, SpanKind, TaskState};
 use crate::theme::{self, KairnTheme};
-use crate::workspace::{LayoutMode, PaneView, TaskQuery, Workspace, chord, kbd, mod_symbol};
+use crate::workspace::{
+    LayoutMode, LineEditDown, LineEditUp, PaneView, TaskQuery, Workspace, chord, kbd, mod_symbol,
+};
+
+/// Per-render stash of each note line's text layout, for click hit-testing.
+type LineLayouts = RefCell<HashMap<usize, TextLayout>>;
 
 impl Workspace {
     pub fn render_main(
@@ -227,11 +236,12 @@ impl Workspace {
 
         let mut note = note_frame(t, writing, masthead, subline);
         let editing_idx = self.line_edit.as_ref().map(|le| le.line_idx);
+        self.line_layouts.borrow_mut().clear();
 
         match &self.doc_lines {
             None => {
                 if editing_idx == Some(0) {
-                    note = note.child(self.render_line_editor());
+                    note = note.child(self.render_line_editor(cx));
                 } else {
                     note = note.child(
                         div()
@@ -250,13 +260,17 @@ impl Workspace {
             Some(lines) => {
                 for (idx, line) in lines.iter().enumerate() {
                     if editing_idx == Some(idx) {
-                        note = note.child(self.render_line_editor());
+                        note = note.child(self.render_line_editor(cx));
                     } else {
-                        note = note.child(clickable_line(idx, render_line(t, idx, line, cx), cx));
+                        note = note.child(clickable_line(
+                            idx,
+                            render_line(t, idx, line, &self.line_layouts, cx),
+                            cx,
+                        ));
                     }
                 }
                 if editing_idx == Some(lines.len()) {
-                    note = note.child(self.render_line_editor());
+                    note = note.child(self.render_line_editor(cx));
                 }
             }
         }
@@ -283,13 +297,26 @@ impl Workspace {
         .into_any_element()
     }
 
-    /// The single-line input standing in for the line being edited.
-    fn render_line_editor(&self) -> AnyElement {
+    /// The single-line input standing in for the line being edited. The
+    /// wrapper owns the cross-line movement actions: the LineEdit* bindings
+    /// match any focused input, but only here do they find a handler, so
+    /// everywhere else they fall through to the input's normal behaviour.
+    fn render_line_editor(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(le) = &self.line_edit else {
             return div().into_any_element();
         };
         div()
             .py(px(1.))
+            .on_action(cx.listener(|this, _: &LineEditUp, window, cx| {
+                this.line_edit_vertical(-1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &LineEditDown, window, cx| {
+                this.line_edit_vertical(1, window, cx);
+            }))
+            .on_action(cx.listener(Self::on_line_edit_left))
+            .on_action(cx.listener(Self::on_line_edit_right))
+            .on_action(cx.listener(Self::on_line_edit_backspace))
+            .on_action(cx.listener(Self::on_line_edit_delete))
             .child(Input::new(&le.input).appearance(false).w_full())
             .into_any_element()
     }
@@ -384,16 +411,6 @@ fn note_frame(t: &KairnTheme, writing: bool, masthead: String, subline: String) 
         .child(div().my(px(14.)).h(px(1.)).bg(t.border))
 }
 
-fn section_heading(t: &KairnTheme, label: String) -> impl IntoElement {
-    div()
-        .mt(px(18.))
-        .mb(px(8.))
-        .text_size(px(11.))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(t.faint)
-        .child(label.to_uppercase())
-}
-
 fn week_nav(t: &KairnTheme, id: &'static str, glyph: &'static str) -> gpui::Stateful<gpui::Div> {
     let hover_text = t.text;
     div()
@@ -406,15 +423,19 @@ fn week_nav(t: &KairnTheme, id: &'static str, glyph: &'static str) -> gpui::Stat
         .child(glyph)
 }
 
-/// Wrap a rendered line so clicking it starts editing it in place.
+/// Wrap a rendered line so clicking it starts editing it in place, cursor
+/// under the pointer.
 fn clickable_line(idx: usize, inner: AnyElement, cx: &mut Context<Workspace>) -> AnyElement {
     div()
         .id(("line", idx))
         .cursor_text()
         .child(inner)
-        .on_click(cx.listener(move |this, _, window, cx| {
+        .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
             cx.stop_propagation();
-            this.edit_line(idx, window, cx);
+            let col = ev
+                .mouse_position()
+                .and_then(|pos| this.line_click_col(idx, pos));
+            this.edit_line_at(idx, col, window, cx);
         }))
         .into_any_element()
 }
@@ -423,6 +444,7 @@ fn render_line(
     t: &KairnTheme,
     idx: usize,
     line: &Line,
+    layouts: &LineLayouts,
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
     match line {
@@ -434,39 +456,54 @@ fn render_line(
                     .font_family(theme::serif_font())
                     .text_size(px(19.))
                     .font_weight(gpui::FontWeight::BOLD)
-                    .child(spans_el(t, spans, t.text))
+                    .child(spans_line(t, spans, t.text, idx, layouts))
                     .into_any_element()
             } else {
-                section_heading_spans(t, spans).into_any_element()
+                section_heading_spans(t, spans, idx, layouts).into_any_element()
             }
         }
-        Line::Task { state, spans } => task_row(t, idx, *state, spans, cx).into_any_element(),
+        Line::Task { state, spans } => {
+            task_row(t, idx, *state, spans, layouts, cx).into_any_element()
+        }
         Line::Bullet { spans } => div()
             .flex()
             .gap(px(9.))
             .py(px(2.5))
             .child(div().text_color(t.faint).child("–"))
-            .child(div().flex_1().min_w(px(0.)).child(spans_el(t, spans, t.dim)))
+            .child(div().flex_1().min_w(px(0.)).child(spans_line(t, spans, t.dim, idx, layouts)))
             .into_any_element(),
         Line::Quote { spans } => div()
             .my(px(4.))
             .pl(px(12.))
             .border_l_2()
             .border_color(t.border)
-            .child(spans_el(t, spans, t.dim))
+            .child(spans_line(t, spans, t.dim, idx, layouts))
             .into_any_element(),
         Line::Rule => div().my(px(14.)).h(px(1.)).bg(t.border).into_any_element(),
         Line::Blank => div().h(px(8.)).into_any_element(),
         Line::Text { spans } => div()
             .py(px(1.))
-            .child(spans_el(t, spans, t.dim))
+            .child(spans_line(t, spans, t.dim, idx, layouts))
             .into_any_element(),
     }
 }
 
-fn section_heading_spans(t: &KairnTheme, spans: &[Span]) -> impl IntoElement {
+fn section_heading_spans(
+    t: &KairnTheme,
+    spans: &[Span],
+    idx: usize,
+    layouts: &LineLayouts,
+) -> impl IntoElement {
     let label: String = spans.iter().map(|(_, s)| s.as_str()).collect();
-    section_heading(t, label)
+    let styled = StyledText::new(label.to_uppercase());
+    layouts.borrow_mut().insert(idx, styled.layout().clone());
+    div()
+        .mt(px(18.))
+        .mb(px(8.))
+        .text_size(px(11.))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(t.faint)
+        .child(styled)
 }
 
 fn task_row(
@@ -474,6 +511,7 @@ fn task_row(
     idx: usize,
     state: TaskState,
     spans: &[Span],
+    layouts: &LineLayouts,
     cx: &mut Context<Workspace>,
 ) -> gpui::Div {
     let box_base = div()
@@ -533,7 +571,7 @@ fn task_row(
         .flex_1()
         .min_w(px(0.))
         .when(struck, |d| d.line_through())
-        .child(spans_el(t, spans, base_color));
+        .child(spans_line(t, spans, base_color, idx, layouts));
 
     div()
         .flex()
@@ -546,8 +584,9 @@ fn task_row(
         .child(text)
 }
 
-/// Inline fragments as one wrapping text element, tinted per span kind.
-fn spans_el(t: &KairnTheme, spans: &[Span], base_color: gpui::Hsla) -> gpui::Div {
+/// Inline fragments as one wrapping styled-text element, tinted per span
+/// kind.
+fn spans_text(t: &KairnTheme, spans: &[Span]) -> StyledText {
     let mut text = String::new();
     let mut highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = Vec::new();
     for (kind, s) in spans {
@@ -577,8 +616,24 @@ fn spans_el(t: &KairnTheme, spans: &[Span], base_color: gpui::Hsla) -> gpui::Div
             highlights.push((start..text.len(), style));
         }
     }
-    div()
-        .text_color(base_color)
-        .child(StyledText::new(text).with_highlights(highlights))
+    StyledText::new(text).with_highlights(highlights)
+}
+
+fn spans_el(t: &KairnTheme, spans: &[Span], base_color: gpui::Hsla) -> gpui::Div {
+    div().text_color(base_color).child(spans_text(t, spans))
+}
+
+/// [`spans_el`] for a note line, recording its text layout for click
+/// hit-testing.
+fn spans_line(
+    t: &KairnTheme,
+    spans: &[Span],
+    base_color: gpui::Hsla,
+    idx: usize,
+    layouts: &LineLayouts,
+) -> gpui::Div {
+    let styled = spans_text(t, spans);
+    layouts.borrow_mut().insert(idx, styled.layout().clone());
+    div().text_color(base_color).child(styled)
 }
 

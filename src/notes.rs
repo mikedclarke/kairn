@@ -368,6 +368,63 @@ pub fn replace_line_on_disk(
     Ok(true)
 }
 
+/// Replace two adjacent lines with one `replacement` line. The pair is
+/// verified (or found again) by content like [`edit_line_in_text`]; `None`
+/// when the adjacent pair no longer exists.
+fn join_lines_in_text(
+    text: &str,
+    first_idx: usize,
+    expected_first: &str,
+    expected_second: &str,
+    replacement: &str,
+) -> Option<String> {
+    fn content(seg: &str) -> &str {
+        let s = seg.strip_suffix('\n').unwrap_or(seg);
+        s.strip_suffix('\r').unwrap_or(s)
+    }
+    let segs: Vec<&str> = text.split_inclusive('\n').collect();
+    let pair_at = |i: usize| {
+        segs.get(i).is_some_and(|s| content(s) == expected_first)
+            && segs.get(i + 1).is_some_and(|s| content(s) == expected_second)
+    };
+    let idx = if pair_at(first_idx) {
+        first_idx
+    } else {
+        (0..segs.len().saturating_sub(1)).find(|&i| pair_at(i))?
+    };
+    let second = segs[idx + 1];
+    let ending = &second[content(second).len()..];
+    let mut out = String::with_capacity(text.len());
+    for (i, seg) in segs.iter().enumerate() {
+        if i == idx {
+            out.push_str(replacement);
+            out.push_str(ending);
+        } else if i != idx + 1 {
+            out.push_str(seg);
+        }
+    }
+    Some(out)
+}
+
+/// Join two adjacent lines of a note into `replacement`, atomically. Returns
+/// whether a change landed (`false` when the pair is gone from the file).
+pub fn join_lines_on_disk(
+    path: &Path,
+    first_idx: usize,
+    expected_first: &str,
+    expected_second: &str,
+    replacement: &str,
+) -> io::Result<bool> {
+    let text = fs::read_to_string(path)?;
+    let Some(new_text) =
+        join_lines_in_text(&text, first_idx, expected_first, expected_second, replacement)
+    else {
+        return Ok(false);
+    };
+    atomic_write(path, &new_text)?;
+    Ok(true)
+}
+
 /// The list prefix a new line under `line` should start with, NotePlan-style:
 /// tasks and checklists continue with an open marker, bullets with a bullet,
 /// anything else with nothing. Indentation is preserved.
@@ -532,6 +589,67 @@ fn inline_spans(text: &str) -> Vec<Span> {
     spans
 }
 
+/// Byte offset in `raw` where the rendered content begins: past indentation,
+/// list markers, task brackets, heading hashes, or the quote marker,
+/// mirroring [`parse_line`]'s stripping exactly.
+fn content_start(raw: &str, line: &Line) -> usize {
+    let indent = raw.len() - raw.trim_start().len();
+    let trimmed = &raw[indent..];
+    match line {
+        Line::Heading { .. } => {
+            let hashes = trimmed.bytes().take_while(|b| *b == b'#').count();
+            indent + hashes + 1
+        }
+        Line::Quote { .. } => indent + 2,
+        Line::Task { .. } | Line::Bullet { .. } => {
+            let rest = &trimmed[2..];
+            let gap = rest.len() - rest.trim_start().len();
+            let body = &rest[gap..];
+            let mut start = indent + 2 + gap;
+            if matches!(line, Line::Task { .. }) && bracket_state(body).is_some() {
+                let after = &body[3..];
+                start += 3 + (after.len() - after.trim_start().len());
+            }
+            start
+        }
+        Line::Text { .. } => indent,
+        Line::Rule | Line::Blank => raw.len(),
+    }
+}
+
+/// Byte offset in `raw` for a cursor sitting `display_chars` characters into
+/// the line's rendered content (the concatenation of its spans; `==`
+/// highlight markers are invisible when rendered). Past the end of the
+/// content lands at the end of the line.
+pub fn raw_col_for_display_char(raw: &str, display_chars: usize) -> usize {
+    let line = parse_line(raw);
+    let spans = match &line {
+        Line::Heading { spans, .. }
+        | Line::Task { spans, .. }
+        | Line::Bullet { spans }
+        | Line::Quote { spans }
+        | Line::Text { spans } => spans,
+        Line::Rule | Line::Blank => return raw.len(),
+    };
+    let mut raw_pos = content_start(raw, &line);
+    let mut remaining = display_chars;
+    for (kind, s) in spans {
+        let marker = if *kind == SpanKind::Highlight { 2 } else { 0 };
+        let chars = s.chars().count();
+        if remaining <= chars {
+            let byte = s
+                .char_indices()
+                .nth(remaining)
+                .map(|(i, _)| i)
+                .unwrap_or(s.len());
+            return raw_pos + marker + byte;
+        }
+        remaining -= chars;
+        raw_pos += s.len() + marker * 2;
+    }
+    raw.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,6 +812,52 @@ mod tests {
         );
         // Vanished line: no edit.
         assert_eq!(edit_line_in_text(text, 1, "* gone", |_| Some("x".into())), None);
+    }
+
+    #[test]
+    fn join_lines() {
+        let text = "# Day\n* one\n* two\n* three\n";
+        // Straightforward adjacent pair.
+        assert_eq!(
+            join_lines_in_text(text, 1, "* one", "* two", "* onetwo").as_deref(),
+            Some("# Day\n* onetwo\n* three\n")
+        );
+        // Pair moved since render: found again by content.
+        let shifted = "new\n# Day\n* one\n* two\n* three\n";
+        assert_eq!(
+            join_lines_in_text(shifted, 1, "* one", "* two", "* onetwo").as_deref(),
+            Some("new\n# Day\n* onetwo\n* three\n")
+        );
+        // Second line changed underneath: nothing is written.
+        assert_eq!(join_lines_in_text(text, 1, "* one", "* other", "x"), None);
+        // Joining the last pair with no trailing newline keeps it that way.
+        assert_eq!(
+            join_lines_in_text("* a\n* b", 0, "* a", "* b", "* ab").as_deref(),
+            Some("* ab")
+        );
+    }
+
+    #[test]
+    fn display_char_to_raw_col() {
+        // Task: content starts after "* [ ] ".
+        assert_eq!(raw_col_for_display_char("* [ ] buy milk", 0), 6);
+        assert_eq!(raw_col_for_display_char("* [ ] buy milk", 4), 10);
+        // Past the content end: end of line.
+        assert_eq!(raw_col_for_display_char("* [ ] buy milk", 99), 14);
+        // Bare task marker and indentation.
+        assert_eq!(raw_col_for_display_char("  * buy", 1), 5);
+        // Heading.
+        assert_eq!(raw_col_for_display_char("## Today", 2), 5);
+        // Wiki links render with their brackets: offsets line up.
+        assert_eq!(raw_col_for_display_char("see [[kairn]] now", 5), 5);
+        // Highlight markers are stripped when rendered: clicking on the
+        // first highlighted char lands inside the markers.
+        assert_eq!(raw_col_for_display_char("== hot ==x", 0), 2);
+        // Multi-byte characters stay on boundaries.
+        assert_eq!(raw_col_for_display_char("* 中文", 1), "* 中".len());
+        // Blank-ish lines land at the end.
+        assert_eq!(raw_col_for_display_char("   ", 0), 3);
+        assert_eq!(raw_col_for_display_char("---", 0), 3);
     }
 
     #[test]

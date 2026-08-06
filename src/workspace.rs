@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -7,11 +8,12 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext as _, Context, FocusHandle, InteractiveElement, IntoElement, KeyBinding,
     KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render,
-    SharedString, StatefulInteractiveElement, Styled, Task, Window, actions, div, point, px,
+    SharedString, StatefulInteractiveElement, Styled, Task, TextLayout, Window, actions, div,
+    point, px,
 };
 use gpui_component::{
     Root, TitleBar, WindowExt, h_flex,
-    input::{Input, InputEvent, InputState},
+    input::{Input, InputEvent, InputState, Position},
 };
 
 use crate::notes;
@@ -33,6 +35,12 @@ actions!(
         SaveNote,
         NewLocalSession,
         Quit,
+        LineEditUp,
+        LineEditDown,
+        LineEditLeft,
+        LineEditRight,
+        LineEditBackspace,
+        LineEditDelete,
         Session1,
         Session2,
         Session3,
@@ -83,6 +91,16 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(&p("8"), Session8, None),
         KeyBinding::new(&p("9"), Session9, None),
         KeyBinding::new("escape", CloseOverlay, Some("Overlay")),
+        // Cross-line movement for the in-place line editor. Bound in the
+        // Input context AFTER gpui-component's own bindings so they match
+        // first; anywhere but a line edit (or away from a line boundary) the
+        // handler propagates and the input's normal binding runs instead.
+        KeyBinding::new("up", LineEditUp, Some("Input")),
+        KeyBinding::new("down", LineEditDown, Some("Input")),
+        KeyBinding::new("left", LineEditLeft, Some("Input")),
+        KeyBinding::new("right", LineEditRight, Some("Input")),
+        KeyBinding::new("backspace", LineEditBackspace, Some("Input")),
+        KeyBinding::new("delete", LineEditDelete, Some("Input")),
     ]);
 }
 
@@ -180,6 +198,10 @@ pub struct Workspace {
     /// live editing path; the Writing layout's full editor is separate).
     pub line_edit: Option<LineEdit>,
     _line_edit_sub: Option<gpui::Subscription>,
+    /// Text layout of each rendered note line from the latest render, for
+    /// mapping a click position to a character. Interior-mutable because it
+    /// is filled in while rendering.
+    pub line_layouts: RefCell<HashMap<usize, TextLayout>>,
     picker_open: bool,
     picker_pos: Point<Pixels>,
     pub sessions: Vec<Session>,
@@ -249,6 +271,7 @@ impl Workspace {
             _autosave: None,
             line_edit: None,
             _line_edit_sub: None,
+            line_layouts: RefCell::new(HashMap::new()),
             picker_open: false,
             picker_pos: point(px(0.), px(0.)),
             sessions: Vec::new(),
@@ -512,9 +535,38 @@ impl Workspace {
 
     // ----- editing -----
 
-    /// Start editing a line of the pane document in place. `line_idx` at or
-    /// past the end starts a new line appended to the file.
+    /// Start editing a line of the pane document in place, cursor at the end.
     pub fn edit_line(&mut self, line_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_line_at(line_idx, None, window, cx);
+    }
+
+    /// The raw-markdown cursor column (in characters) for a click at `pos` on
+    /// rendered line `idx`, from the line's text layout. `None` falls back to
+    /// the end of the line.
+    pub fn line_click_col(&self, idx: usize, pos: Point<Pixels>) -> Option<usize> {
+        let layouts = self.line_layouts.borrow();
+        let layout = layouts.get(&idx)?;
+        let display_ix = layout.index_for_position(pos).unwrap_or_else(|ix| ix);
+        let display = layout.text();
+        let display_chars = display
+            .get(..display_ix)
+            .map(|s| s.chars().count())
+            .unwrap_or_else(|| display.chars().count());
+        let raw = self.doc_text.as_deref()?.lines().nth(idx)?;
+        let byte = notes::raw_col_for_display_char(raw, display_chars);
+        Some(raw.get(..byte).map(|s| s.chars().count()).unwrap_or(0))
+    }
+
+    /// Start editing a line of the pane document in place, placing the cursor
+    /// `cursor_chars` characters in (end of line when `None`). `line_idx` at
+    /// or past the end starts a new line appended to the file.
+    pub fn edit_line_at(
+        &mut self,
+        line_idx: usize,
+        cursor_chars: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if matches!(self.view, PaneView::Tasks(_)) || self.layout == LayoutMode::Writing {
             return;
         }
@@ -547,6 +599,11 @@ impl Workspace {
         input.update(cx, |s, cx| {
             // set_value puts the cursor at the end on single-line inputs.
             s.set_value(expected.clone(), window, cx);
+            if let Some(chars) = cursor_chars {
+                // position_to_offset clamps past-the-end columns to the line.
+                let col = chars.min(u32::MAX as usize) as u32;
+                s.set_cursor_position(Position::new(0, col), window, cx);
+            }
             s.focus(window, cx);
         });
         self._line_edit_sub = Some(cx.subscribe_in(
@@ -615,21 +672,29 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Enter inside a line edit: NotePlan behaviour. A line with content
-    /// commits and continues the list on a new line below; a bare list marker
-    /// clears itself instead.
+    /// Enter inside a line edit: NotePlan behaviour. At the end of a line
+    /// with content it commits and continues the list on a new line below; a
+    /// bare list marker clears itself instead; mid-line it splits at the
+    /// cursor, the remainder keeping the list style.
     fn on_line_edit_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(le) = self.line_edit.take() else { return };
         self._autosave = None;
+        let cursor = le.input.read(cx).cursor();
         let value = le.input.read(cx).value().to_string();
-        let prefix = notes::continuation_prefix(&value);
-        if !value.is_empty() && prefix == value {
-            le.input.update(cx, |s, cx| s.set_value("", window, cx));
-            self.line_edit = Some(le);
-            self.commit_line_edit(false, cx);
-            return;
-        }
-        let combined = format!("{value}\n{prefix}");
+        let (combined, next_col) = if cursor < value.len() {
+            let (head, tail) = value.split_at(cursor);
+            let prefix = notes::continuation_prefix(head);
+            (format!("{head}\n{prefix}{tail}"), Some(prefix.chars().count()))
+        } else {
+            let prefix = notes::continuation_prefix(&value);
+            if !value.is_empty() && prefix == value {
+                le.input.update(cx, |s, cx| s.set_value("", window, cx));
+                self.line_edit = Some(le);
+                self.commit_line_edit(false, cx);
+                return;
+            }
+            (format!("{value}\n{prefix}"), None)
+        };
         let written = if le.appending {
             let mut text = self.doc_text.clone().unwrap_or_default();
             if !text.is_empty() && !text.ends_with('\n') {
@@ -644,7 +709,7 @@ impl Workspace {
         match written {
             Ok(true) => {
                 self.reload_notes();
-                self.edit_line(next, window, cx);
+                self.edit_line_at(next, next_col, window, cx);
             }
             Ok(false) => {
                 self.reload_notes();
@@ -652,6 +717,187 @@ impl Workspace {
             }
             Err(e) => {
                 eprintln!("kairn: could not save {}: {e}", le.path.display());
+                cx.notify();
+            }
+        }
+    }
+
+    /// Up/Down inside a line edit: move the edit to the adjacent line,
+    /// keeping the cursor column. Above the first line the cursor goes to the
+    /// start; below the last, to the end.
+    pub fn line_edit_vertical(&mut self, delta: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(le) = &self.line_edit else { return };
+        let col = le.input.read(cx).cursor_position().character as usize;
+        let line_count = self.doc_text.as_deref().map(|t| t.lines().count()).unwrap_or(0);
+        let target = le.line_idx as i64 + delta;
+        if target < 0 {
+            le.input.update(cx, |s, cx| {
+                s.set_cursor_position(Position::new(0, 0), window, cx);
+            });
+            return;
+        }
+        if target >= line_count as i64 {
+            let input = le.input.clone();
+            input.update(cx, |s, cx| {
+                let end = s.value().chars().count() as u32;
+                s.set_cursor_position(Position::new(0, end), window, cx);
+            });
+            return;
+        }
+        self.commit_line_edit(true, cx);
+        self.edit_line_at(target as usize, Some(col), window, cx);
+    }
+
+    pub(crate) fn on_line_edit_left(
+        &mut self,
+        _: &LineEditLeft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(le) = &self.line_edit else {
+            cx.propagate();
+            return;
+        };
+        if le.input.read(cx).cursor() != 0 || le.line_idx == 0 {
+            cx.propagate();
+            return;
+        }
+        let target = le.line_idx - 1;
+        self.commit_line_edit(true, cx);
+        let end = self
+            .doc_text
+            .as_deref()
+            .and_then(|t| t.lines().nth(target))
+            .map(|l| l.chars().count());
+        self.edit_line_at(target, end.or(Some(0)), window, cx);
+    }
+
+    pub(crate) fn on_line_edit_right(
+        &mut self,
+        _: &LineEditRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(le) = &self.line_edit else {
+            cx.propagate();
+            return;
+        };
+        let state = le.input.read(cx);
+        let at_end = state.cursor() == state.text().len();
+        let line_count = self.doc_text.as_deref().map(|t| t.lines().count()).unwrap_or(0);
+        if !at_end || le.appending || le.line_idx + 1 >= line_count {
+            cx.propagate();
+            return;
+        }
+        let target = le.line_idx + 1;
+        self.commit_line_edit(true, cx);
+        self.edit_line_at(target, Some(0), window, cx);
+    }
+
+    /// Backspace at the very start of a line edit merges the line into the
+    /// previous one, cursor at the junction.
+    pub(crate) fn on_line_edit_backspace(
+        &mut self,
+        _: &LineEditBackspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(le) = &self.line_edit else {
+            cx.propagate();
+            return;
+        };
+        if le.input.read(cx).cursor() != 0 || le.line_idx == 0 {
+            cx.propagate();
+            return;
+        }
+        let prev_idx = le.line_idx - 1;
+        let Some(prev_line) = self
+            .doc_text
+            .as_deref()
+            .and_then(|t| t.lines().nth(prev_idx))
+            .map(str::to_string)
+        else {
+            cx.propagate();
+            return;
+        };
+        let value = le.input.read(cx).value().to_string();
+        let (appending, path, expected) = (le.appending, le.path.clone(), le.expected.clone());
+        self._autosave = None;
+        self.line_edit = None;
+        let junction = prev_line.chars().count();
+        let merged = format!("{prev_line}{value}");
+        let written = if appending {
+            // The appended line was never written; fold its text (if any)
+            // onto the last real line.
+            if value.is_empty() {
+                Ok(true)
+            } else {
+                notes::replace_line_on_disk(&path, prev_idx, &prev_line, &merged)
+            }
+        } else {
+            notes::join_lines_on_disk(&path, prev_idx, &prev_line, &expected, &merged)
+        };
+        match written {
+            Ok(true) => {
+                self.reload_notes();
+                self.edit_line_at(prev_idx, Some(junction), window, cx);
+            }
+            Ok(false) => {
+                self.reload_notes();
+                cx.notify();
+            }
+            Err(e) => {
+                eprintln!("kairn: could not save {}: {e}", path.display());
+                cx.notify();
+            }
+        }
+    }
+
+    /// Delete at the very end of a line edit merges the next line into this
+    /// one, cursor staying at the junction.
+    pub(crate) fn on_line_edit_delete(
+        &mut self,
+        _: &LineEditDelete,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(le) = &self.line_edit else {
+            cx.propagate();
+            return;
+        };
+        let state = le.input.read(cx);
+        let at_end = state.cursor() == state.text().len();
+        if !at_end || le.appending {
+            cx.propagate();
+            return;
+        }
+        let next_idx = le.line_idx + 1;
+        let Some(next_line) = self
+            .doc_text
+            .as_deref()
+            .and_then(|t| t.lines().nth(next_idx))
+            .map(str::to_string)
+        else {
+            cx.propagate();
+            return;
+        };
+        let value = le.input.read(cx).value().to_string();
+        let (idx, path, expected) = (le.line_idx, le.path.clone(), le.expected.clone());
+        self._autosave = None;
+        self.line_edit = None;
+        let junction = value.chars().count();
+        let merged = format!("{value}{next_line}");
+        match notes::join_lines_on_disk(&path, idx, &expected, &next_line, &merged) {
+            Ok(true) => {
+                self.reload_notes();
+                self.edit_line_at(idx, Some(junction), window, cx);
+            }
+            Ok(false) => {
+                self.reload_notes();
+                cx.notify();
+            }
+            Err(e) => {
+                eprintln!("kairn: could not save {}: {e}", path.display());
                 cx.notify();
             }
         }
