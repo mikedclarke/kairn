@@ -37,9 +37,19 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
+    // Primary chords: Cmd on macOS, Ctrl on Linux. On Linux, plain Ctrl+letter
+    // combos are shell control characters (Ctrl+J accept-line, Ctrl+N
+    // next-history, Ctrl+Q XON resume) and bindings win over the terminal, so
+    // letter chords take Ctrl+Shift instead (the GNOME Terminal / VS Code
+    // convention). Digits and punctuation stay plain Ctrl: the terminal emits
+    // nothing for them, and shifted punctuation resolves to a different key
+    // per layout (Ctrl+Shift+\ arrives as ctrl-|), so it can't be bound
+    // reliably.
     let p = |k: &str| {
         if cfg!(target_os = "macos") {
             format!("cmd-{k}")
+        } else if k.len() == 1 && k.chars().next().unwrap().is_ascii_alphabetic() {
+            format!("ctrl-shift-{k}")
         } else {
             format!("ctrl-{k}")
         }
@@ -67,6 +77,16 @@ pub fn init(cx: &mut App) {
 
 pub fn mod_symbol() -> &'static str {
     if cfg!(target_os = "macos") { "⌘" } else { "Ctrl+" }
+}
+
+/// Display label for a primary-modifier letter chord, matching `init`:
+/// ⌘ on macOS, Ctrl+⇧ on Linux.
+pub fn chord(key: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("⌘{key}")
+    } else {
+        format!("Ctrl+⇧{key}")
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -339,7 +359,7 @@ impl Workspace {
                 this.on_toggle_switcher(&ToggleSwitcher, window, cx);
             }))
             .child(div().flex_1().child("Jump to session, day, or note"))
-            .child(kbd(t, format!("{}J", mod_symbol())));
+            .child(kbd(t, chord("J")));
 
         let capture_btn = titlebar_button(t, "capture-btn", cx).child(
             h_flex()
@@ -394,7 +414,7 @@ impl Workspace {
         let hints = [
             format!("{m}\\ sidebar"),
             format!("{m}1–9 sessions"),
-            format!("{m}J jump"),
+            format!("{} jump", chord("J")),
             format!("⇧{m}⏎ terminal"),
             format!("⌥{m}⏎ writing"),
         ];

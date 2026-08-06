@@ -7,7 +7,7 @@ use gpui::{
 use gpui_component::resizable::{h_resizable, resizable_panel};
 
 use crate::theme::{self, KairnTheme};
-use crate::workspace::{LayoutMode, Workspace, kbd, mod_symbol};
+use crate::workspace::{LayoutMode, Workspace, chord, kbd, mod_symbol};
 
 impl Workspace {
     pub fn render_main(
@@ -50,7 +50,7 @@ impl Workspace {
                 .child(
                     div()
                         .text_size(px(11.5))
-                        .child(format!("{}N starts a new shell", mod_symbol())),
+                        .child(format!("{} starts a new shell", chord("N"))),
                 ),
         }
     }
