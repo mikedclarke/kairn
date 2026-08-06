@@ -117,11 +117,21 @@ pub struct Workspace {
     pub selected_day: NaiveDate,
     /// Parsed note for the selected day; `None` when no file exists.
     pub day_note: Option<Vec<notes::Line>>,
+    /// The selected day's note as read from disk, line-aligned with
+    /// `day_note`; toggles pass the rendered line back so a file that changed
+    /// underneath is never clobbered.
+    day_note_text: Option<String>,
+    /// The file `day_note_text` was read from (`.md` or NotePlan's `.txt`).
+    day_note_path: Option<PathBuf>,
     /// Days that have a daily note, for calendar indicators.
     pub note_days: HashSet<NaiveDate>,
     /// Open-task counts for Monday..Sunday of the selected day's week.
     pub week_open_counts: [usize; 7],
     _activity_timer: Task<()>,
+    /// Watches the notes root so outside edits (agents, Syncthing, NotePlan
+    /// elsewhere) appear without a restart. Dropped with the workspace.
+    _notes_watcher: Option<notify::RecommendedWatcher>,
+    _notes_watch_task: Task<()>,
 }
 
 impl Workspace {
@@ -139,6 +149,7 @@ impl Workspace {
 
         let notes_root = settings.notes_root();
         notes::ensure_layout(&notes_root);
+        let (notes_watcher, notes_watch_task) = Self::watch_notes(notes_root.clone(), cx);
 
         let mut this = Self {
             settings,
@@ -156,9 +167,13 @@ impl Workspace {
             notes_root,
             selected_day: Local::now().date_naive(),
             day_note: None,
+            day_note_text: None,
+            day_note_path: None,
             note_days: HashSet::new(),
             week_open_counts: [0; 7],
             _activity_timer: activity_timer,
+            _notes_watcher: notes_watcher,
+            _notes_watch_task: notes_watch_task,
         };
         this.reload_notes();
         this.spawn_session(SessionKind::Local, window, cx);
@@ -175,8 +190,11 @@ impl Workspace {
 
     /// Re-read the selected day's note and the calendar/week indicators.
     pub fn reload_notes(&mut self) {
-        self.day_note =
-            notes::load_day(&self.notes_root, self.selected_day).map(|t| notes::parse(&t));
+        let path = notes::daily_file(&self.notes_root, self.selected_day);
+        let text = path.as_deref().and_then(|p| std::fs::read_to_string(p).ok());
+        self.day_note = text.as_deref().map(notes::parse);
+        self.day_note_text = text;
+        self.day_note_path = path;
         self.note_days = notes::days_with_notes(&self.notes_root);
         let monday = self.selected_day
             - Days::new(self.selected_day.weekday().num_days_from_monday() as u64);
@@ -185,6 +203,80 @@ impl Workspace {
                 .map(|t| notes::open_task_count(&t))
                 .unwrap_or(0);
         }
+    }
+
+    /// Toggle the task on line `line_idx` of the selected day's note between
+    /// open and done, writing the change back to the file.
+    pub fn toggle_task(&mut self, line_idx: usize, cx: &mut Context<Self>) {
+        let (Some(path), Some(text)) = (&self.day_note_path, &self.day_note_text) else {
+            return;
+        };
+        let Some(expected) = text.lines().nth(line_idx) else {
+            return;
+        };
+        match notes::toggle_task_on_disk(path, line_idx, expected) {
+            Ok(true) => {}
+            // The line changed on disk since render; the reload below picks
+            // up whatever is there now.
+            Ok(false) => {}
+            Err(e) => eprintln!("kairn: could not update {}: {e}", path.display()),
+        }
+        self.reload_notes();
+        cx.notify();
+    }
+
+    /// Watch the notes root recursively; any change outside `.kairn/` reloads
+    /// the pane. Events are debounced briefly so an editor's save dance (or
+    /// our own temp-file + rename write) causes one reload, not several.
+    fn watch_notes(
+        root: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> (Option<notify::RecommendedWatcher>, Task<()>) {
+        use futures::StreamExt as _;
+        use notify::Watcher as _;
+
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<()>();
+        let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            let Ok(event) = res else { return };
+            let relevant = event.paths.is_empty()
+                || event.paths.iter().any(|p| {
+                    !p.components().any(|c| c.as_os_str() == ".kairn")
+                        && !p
+                            .file_name()
+                            .is_some_and(|n| n.to_string_lossy().ends_with(".kairn-tmp"))
+                });
+            if relevant {
+                let _ = tx.unbounded_send(());
+            }
+        })
+        .and_then(|mut w| {
+            w.watch(&root, notify::RecursiveMode::Recursive)?;
+            Ok(w)
+        });
+        let watcher = match watcher {
+            Ok(w) => Some(w),
+            Err(e) => {
+                eprintln!("kairn: notes watching unavailable: {e}");
+                None
+            }
+        };
+
+        let task = cx.spawn(async move |this, cx| {
+            while rx.next().await.is_some() {
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+                while rx.try_recv().is_ok() {}
+                let ok = this.update(cx, |ws, cx| {
+                    ws.reload_notes();
+                    cx.notify();
+                });
+                if ok.is_err() {
+                    break;
+                }
+            }
+        });
+        (watcher, task)
     }
 
     pub fn mode(&self) -> Mode {

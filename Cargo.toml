@@ -12,6 +12,8 @@ gpui-component = "=0.5.1"
 gpui-component-assets = "=0.5.1"
 gpui-terminal = { git = "https://github.com/zortax/gpui-terminal", rev = "51f0292938876c8da3de03f0139088591e3be518" }
 portable-pty = "0.9"
+notify = "8"
+futures = "0.3"
 anyhow = "1"
 parking_lot = "0.12"
 chrono = "0.4"

@@ -15,9 +15,10 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
-use chrono::NaiveDate;
+use chrono::{Local, NaiveDate};
 
 /// Create the root and its expected folders. Safe to call every launch:
 /// existing folders (e.g. a NotePlan directory) are left untouched.
@@ -39,15 +40,20 @@ pub fn daily_path(root: &Path, date: NaiveDate) -> PathBuf {
         .join(format!("{}.md", date.format("%Y%m%d")))
 }
 
-/// Read a day's note, accepting NotePlan's optional `.txt` extension when no
-/// `.md` file exists.
-pub fn load_day(root: &Path, date: NaiveDate) -> Option<String> {
+/// The daily note file that actually exists for a date, accepting NotePlan's
+/// optional `.txt` extension when no `.md` file does.
+pub fn daily_file(root: &Path, date: NaiveDate) -> Option<PathBuf> {
     let md = daily_path(root, date);
-    if let Ok(text) = fs::read_to_string(&md) {
-        return Some(text);
+    if md.exists() {
+        return Some(md);
     }
     let txt = md.with_extension("txt");
-    fs::read_to_string(&txt).ok()
+    txt.exists().then_some(txt)
+}
+
+/// Read a day's note.
+pub fn load_day(root: &Path, date: NaiveDate) -> Option<String> {
+    fs::read_to_string(daily_file(root, date)?).ok()
 }
 
 /// Every date with a daily note, from one scan of `Calendar/`.
@@ -122,6 +128,105 @@ pub fn open_task_count(text: &str) -> usize {
         .iter()
         .filter(|l| matches!(l, Line::Task { state: TaskState::Open, .. }))
         .count()
+}
+
+// ----- writeback -----
+
+/// Toggle one task line between open and done, writing in the line's own
+/// style: indentation and list marker are preserved, only the bracket and the
+/// `@done(...)` stamp change. `* task` becomes `* [x] task @done(now)`; a done
+/// task reopens as `[ ]` with the stamp stripped (the `-` marker needs the
+/// bracket to stay a task at all, and `[ ]` reads identically everywhere).
+/// Returns `None` for anything that isn't an open or done task.
+pub fn toggle_task_line(line: &str, now: &str) -> Option<String> {
+    let indent_len = line.len() - line.trim_start().len();
+    let (indent, rest) = line.split_at(indent_len);
+    let marker = ["* ", "+ ", "- "].iter().find(|m| rest.starts_with(**m))?;
+    let body = &rest[2..];
+    let gap_len = body.len() - body.trim_start().len();
+    let (gap, body) = body.split_at(gap_len);
+    match bracket_state(body) {
+        Some(TaskState::Open) => {
+            let content = body[3..].trim_end();
+            Some(format!("{indent}{marker}{gap}[x]{content} @done({now})"))
+        }
+        Some(TaskState::Done) => {
+            let content = strip_done_stamps(&body[3..]);
+            Some(format!("{indent}{marker}{gap}[ ]{}", content.trim_end()))
+        }
+        Some(_) => None,
+        None if *marker == "- " || body.is_empty() => None,
+        None => Some(format!("{indent}{marker}{gap}[x] {} @done({now})", body.trim_end())),
+    }
+}
+
+/// Remove every well-formed ` @done(...)` from a line's content.
+fn strip_done_stamps(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find("@done(") {
+        let Some(close) = rest[pos..].find(')') else { break };
+        let before = &rest[..pos];
+        out.push_str(before.strip_suffix(' ').unwrap_or(before));
+        rest = &rest[pos + close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Toggle the task at `line_idx` in a note's full text. `expected` is the line
+/// as it read when rendered: if the text has changed underneath us and the
+/// line has moved, it is found again by content; if it's gone, `None` (the
+/// caller reloads rather than guessing). Line endings are preserved.
+pub fn toggle_task_in_text(
+    text: &str,
+    line_idx: usize,
+    expected: &str,
+    now: &str,
+) -> Option<String> {
+    fn content(seg: &str) -> &str {
+        let s = seg.strip_suffix('\n').unwrap_or(seg);
+        s.strip_suffix('\r').unwrap_or(s)
+    }
+    let segs: Vec<&str> = text.split_inclusive('\n').collect();
+    let idx = if segs.get(line_idx).is_some_and(|s| content(s) == expected) {
+        line_idx
+    } else {
+        segs.iter().position(|s| content(s) == expected)?
+    };
+    let line = content(segs[idx]);
+    let ending = &segs[idx][line.len()..];
+    let new_line = toggle_task_line(line, now)?;
+    let mut out = String::with_capacity(text.len() + 32);
+    for (i, seg) in segs.iter().enumerate() {
+        if i == idx {
+            out.push_str(&new_line);
+            out.push_str(ending);
+        } else {
+            out.push_str(seg);
+        }
+    }
+    Some(out)
+}
+
+/// Toggle a task in a note on disk. The file is re-read fresh so a change made
+/// since it was rendered is never clobbered: the single-line edit is re-applied
+/// against current content, and if the line no longer exists nothing is
+/// written. The write is atomic (temp file + rename). Returns whether a
+/// change was applied.
+pub fn toggle_task_on_disk(path: &Path, line_idx: usize, expected: &str) -> io::Result<bool> {
+    let text = fs::read_to_string(path)?;
+    let now = Local::now().format("%Y-%m-%d %H:%M").to_string();
+    let Some(new_text) = toggle_task_in_text(&text, line_idx, expected, &now) else {
+        return Ok(false);
+    };
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
+    let tmp = path.with_file_name(format!(".{}.kairn-tmp", name.to_string_lossy()));
+    fs::write(&tmp, &new_text)?;
+    fs::rename(&tmp, path)?;
+    Ok(true)
 }
 
 fn parse_line(line: &str) -> Line {
@@ -329,6 +434,64 @@ mod tests {
         assert_eq!(
             parse_line("### ==Todays Tasks=="),
             Line::Heading { level: 3, spans: vec![(SpanKind::Highlight, "Todays Tasks".into())] }
+        );
+    }
+
+    #[test]
+    fn toggle_line_styles() {
+        let now = "2026-08-06 21:30";
+        // Bare NotePlan task and checklist gain a bracket and a stamp.
+        assert_eq!(
+            toggle_task_line("* buy milk", now).as_deref(),
+            Some("* [x] buy milk @done(2026-08-06 21:30)")
+        );
+        assert_eq!(
+            toggle_task_line("+ pack bag", now).as_deref(),
+            Some("+ [x] pack bag @done(2026-08-06 21:30)")
+        );
+        // Bracketed style keeps its marker, indentation survives.
+        assert_eq!(
+            toggle_task_line("  - [ ] call bank", now).as_deref(),
+            Some("  - [x] call bank @done(2026-08-06 21:30)")
+        );
+        // Reopening strips the stamp and keeps a bracket.
+        assert_eq!(
+            toggle_task_line("* [x] shipped @done(2026-08-06 18:00)", now).as_deref(),
+            Some("* [ ] shipped")
+        );
+        assert_eq!(
+            toggle_task_line("- [x] paid @done(2026-08-05) again @done(2026-08-06)", now)
+                .as_deref(),
+            Some("- [ ] paid again")
+        );
+        // Not toggleable: bullets, scheduled, cancelled, plain text.
+        assert_eq!(toggle_task_line("- just a bullet", now), None);
+        assert_eq!(toggle_task_line("* [>] moved", now), None);
+        assert_eq!(toggle_task_line("+ [-] cancelled", now), None);
+        assert_eq!(toggle_task_line("plain text", now), None);
+    }
+
+    #[test]
+    fn toggle_in_text_tracks_moved_lines() {
+        let now = "2026-08-06 21:30";
+        let text = "# Day\n* one\n* two\n";
+        // Straightforward: index matches.
+        assert_eq!(
+            toggle_task_in_text(text, 2, "* two", now).as_deref(),
+            Some("# Day\n* one\n* [x] two @done(2026-08-06 21:30)\n")
+        );
+        // A line was inserted above since render: found again by content.
+        let shifted = "# Day\nnew line\n* one\n* two\n";
+        assert_eq!(
+            toggle_task_in_text(shifted, 2, "* two", now).as_deref(),
+            Some("# Day\nnew line\n* one\n* [x] two @done(2026-08-06 21:30)\n")
+        );
+        // The line is gone: nothing is written.
+        assert_eq!(toggle_task_in_text("# Day\n* other\n", 1, "* two", now), None);
+        // No trailing newline is preserved as-is.
+        assert_eq!(
+            toggle_task_in_text("* one", 0, "* one", now).as_deref(),
+            Some("* [x] one @done(2026-08-06 21:30)")
         );
     }
 

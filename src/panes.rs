@@ -75,7 +75,7 @@ impl Workspace {
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_y_scroll()
-                    .child(self.render_note(t, writing)),
+                    .child(self.render_note(t, writing, cx)),
             )
     }
 
@@ -160,7 +160,12 @@ impl Workspace {
         )
     }
 
-    fn render_note(&self, t: &KairnTheme, writing: bool) -> impl IntoElement {
+    fn render_note(
+        &self,
+        t: &KairnTheme,
+        writing: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let date = self.selected_day;
         let today = Local::now().date_naive();
         let masthead = format!(
@@ -212,8 +217,8 @@ impl Workspace {
                 );
             }
             Some(lines) => {
-                for line in lines {
-                    note = note.child(render_line(t, line));
+                for (idx, line) in lines.iter().enumerate() {
+                    note = note.child(render_line(t, idx, line, cx));
                 }
             }
         }
@@ -254,7 +259,12 @@ fn week_nav(t: &KairnTheme, id: &'static str, glyph: &'static str) -> gpui::Stat
         .child(glyph)
 }
 
-fn render_line(t: &KairnTheme, line: &Line) -> AnyElement {
+fn render_line(
+    t: &KairnTheme,
+    idx: usize,
+    line: &Line,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
     match line {
         Line::Heading { level, spans } => {
             if *level == 1 {
@@ -270,7 +280,7 @@ fn render_line(t: &KairnTheme, line: &Line) -> AnyElement {
                 section_heading_spans(t, spans).into_any_element()
             }
         }
-        Line::Task { state, spans } => task_row(t, *state, spans).into_any_element(),
+        Line::Task { state, spans } => task_row(t, idx, *state, spans, cx).into_any_element(),
         Line::Bullet { spans } => div()
             .flex()
             .gap(px(9.))
@@ -299,8 +309,29 @@ fn section_heading_spans(t: &KairnTheme, spans: &[Span]) -> impl IntoElement {
     section_heading(t, label)
 }
 
-fn task_row(t: &KairnTheme, state: TaskState, spans: &[Span]) -> gpui::Div {
-    let box_base = div().w(px(13.)).h(px(13.)).flex_none().rounded(px(4.));
+fn task_row(
+    t: &KairnTheme,
+    idx: usize,
+    state: TaskState,
+    spans: &[Span],
+    cx: &mut Context<Workspace>,
+) -> gpui::Div {
+    let box_base = div()
+        .id(("task-box", idx))
+        .w(px(13.))
+        .h(px(13.))
+        .flex_none()
+        .rounded(px(4.));
+    // Open and done boxes toggle on click; scheduled and cancelled stay
+    // inert until full editing.
+    let box_base = if matches!(state, TaskState::Open | TaskState::Done) {
+        box_base
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_task(idx, cx)))
+    } else {
+        box_base
+    };
+    let dim = t.dim;
     let box_el = match state {
         TaskState::Done => box_base.bg(t.accent).flex().items_center().justify_center().child(
             div()
@@ -323,7 +354,10 @@ fn task_row(t: &KairnTheme, state: TaskState, spans: &[Span]) -> gpui::Div {
             .items_center()
             .justify_center()
             .child(div().text_size(px(8.)).text_color(t.faint).child("›")),
-        TaskState::Open => box_base.border_1().border_color(t.faint),
+        TaskState::Open => box_base
+            .border_1()
+            .border_color(t.faint)
+            .hover(move |s| s.border_color(dim)),
     };
 
     let struck = matches!(state, TaskState::Done | TaskState::Cancelled);
