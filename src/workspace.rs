@@ -25,7 +25,7 @@ actions!(
         ToggleSwitcher,
         CloseOverlay,
         ToggleThemeMode,
-        EditHosts,
+        OpenSettings,
         NewLocalSession,
         Quit,
         Session1,
@@ -63,7 +63,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(&p("shift-enter"), ToggleTerminalFull, None),
         KeyBinding::new(&p("alt-enter"), ToggleWriting, None),
         KeyBinding::new(&p("j"), ToggleSwitcher, None),
-        KeyBinding::new(&p(","), EditHosts, None),
+        KeyBinding::new(&p(","), OpenSettings, None),
         KeyBinding::new(&p("n"), NewLocalSession, None),
         KeyBinding::new(&p("q"), Quit, None),
         KeyBinding::new(&p("1"), Session1, None),
@@ -411,7 +411,10 @@ impl Workspace {
     }
 
     fn on_toggle_theme(&mut self, _: &ToggleThemeMode, window: &mut Window, cx: &mut Context<Self>) {
-        let mode = self.mode().toggled();
+        self.set_theme(self.mode().toggled(), window, cx);
+    }
+
+    pub fn set_theme(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
         self.settings.theme = mode.as_str().to_string();
         if let Err(e) = self.settings.save() {
             eprintln!("kairn: failed to save settings: {e}");
@@ -427,9 +430,37 @@ impl Workspace {
         cx.notify();
     }
 
-    fn on_edit_hosts(&mut self, _: &EditHosts, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
         self.picker_open = false;
-        crate::hosts_dialog::open(self, window, cx);
+        crate::settings_dialog::open(self, window, cx);
+    }
+
+    /// Apply and persist edits from the settings dialog. A changed notes
+    /// folder re-bootstraps the layout, re-points the file watcher, and
+    /// reloads the pane and calendar.
+    pub fn apply_settings(
+        &mut self,
+        notes_root: Option<String>,
+        hosts: Vec<crate::settings::SshHost>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.ssh_hosts = hosts;
+        self.settings.notes_root = notes_root;
+        if let Err(e) = self.settings.save() {
+            eprintln!("kairn: failed to save settings: {e}");
+            window.push_notification("Could not write settings.json, see stderr.", cx);
+        }
+        let root = self.settings.notes_root();
+        if root != self.notes_root {
+            self.notes_root = root;
+            notes::ensure_layout(&self.notes_root);
+            let (watcher, task) = Self::watch_notes(self.notes_root.clone(), cx);
+            self._notes_watcher = watcher;
+            self._notes_watch_task = task;
+            self.reload_notes();
+        }
+        cx.notify();
     }
 
     fn on_new_local_session(
@@ -677,11 +708,11 @@ impl Workspace {
         }
 
         menu = menu.child(picker_rule(t)).child(
-            picker_item(t, "picker-edit", cx)
+            picker_item(t, "picker-settings", cx)
                 .text_color(t.dim)
-                .child("Edit hosts…")
+                .child("Settings…")
                 .on_click(cx.listener(|this, _, window, cx| {
-                    this.on_edit_hosts(&EditHosts, window, cx);
+                    this.on_open_settings(&OpenSettings, window, cx);
                 })),
         );
 
@@ -856,7 +887,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_toggle_switcher))
             .on_action(cx.listener(Self::on_close_overlay))
             .on_action(cx.listener(Self::on_toggle_theme))
-            .on_action(cx.listener(Self::on_edit_hosts))
+            .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_new_local_session))
             .on_action(cx.listener(Self::on_quit))
             .on_action(cx.listener(|this, _: &Session1, w, cx| this.on_activate_nth(0, w, cx)))

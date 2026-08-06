@@ -1,8 +1,8 @@
-mod hosts_dialog;
 mod notes;
 mod panes;
 mod session;
 mod settings;
+mod settings_dialog;
 mod sidebar;
 mod theme;
 mod workspace;
