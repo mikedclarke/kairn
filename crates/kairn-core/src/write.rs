@@ -92,6 +92,14 @@ pub fn create_note_if_absent(path: &Path, content: &str) -> io::Result<bool> {
     }
 }
 
+/// Write a note's full content atomically (temp file + rename, permissions
+/// preserved). The whole-buffer save path: callers own staleness protection
+/// via `NoteBuffer::reconcile`, which is the only sanctioned route here for
+/// content that was edited from a snapshot.
+pub fn write_note(path: &Path, content: &str) -> io::Result<()> {
+    atomic_write(path, content)
+}
+
 fn atomic_write(path: &Path, content: &str) -> io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);

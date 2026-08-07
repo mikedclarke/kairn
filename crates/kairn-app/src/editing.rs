@@ -176,13 +176,13 @@ impl Workspace {
                     // The line vanished or moved ambiguously under the edit;
                     // keep the user's text visible instead of dropping it.
                     self.orphaned = Some((le.path.clone(), value));
-                    self.reload_notes();
+                    self.reload_notes(cx);
                     cx.notify();
                     return;
                 }
                 Err(e) => eprintln!("kairn: could not save {}: {e}", le.path.display()),
             }
-            self.reload_notes();
+            self.reload_notes(cx);
         }
         if !close {
             self.line_edit = Some(le);
@@ -230,14 +230,14 @@ impl Workspace {
         match written {
             Ok(Some(idx)) => {
                 self.note_self_write(&le.path);
-                self.reload_notes();
+                self.reload_notes(cx);
                 self.edit_line_at(idx + 1, next_col, window, cx);
             }
             Ok(None) => {
                 if value != le.expected {
                     self.orphaned = Some((le.path.clone(), value));
                 }
-                self.reload_notes();
+                self.reload_notes(cx);
                 cx.notify();
             }
             Err(e) => {
@@ -365,14 +365,14 @@ impl Workspace {
         match written {
             Ok(Some(idx)) => {
                 self.note_self_write(&path);
-                self.reload_notes();
+                self.reload_notes(cx);
                 self.edit_line_at(idx, Some(junction), window, cx);
             }
             Ok(None) => {
                 if value != expected {
                     self.orphaned = Some((path, value));
                 }
-                self.reload_notes();
+                self.reload_notes(cx);
                 cx.notify();
             }
             Err(e) => {
@@ -419,14 +419,14 @@ impl Workspace {
         match notes::join_lines_on_disk(&path, idx, &expected, &next_line, &merged) {
             Ok(Some(resolved)) => {
                 self.note_self_write(&path);
-                self.reload_notes();
+                self.reload_notes(cx);
                 self.edit_line_at(resolved, Some(junction), window, cx);
             }
             Ok(None) => {
                 if value != expected {
                     self.orphaned = Some((path, value));
                 }
-                self.reload_notes();
+                self.reload_notes(cx);
                 cx.notify();
             }
             Err(e) => {
@@ -437,8 +437,9 @@ impl Workspace {
     }
 
     pub(crate) fn on_save_note(&mut self, _: &SaveNote, _: &mut Window, cx: &mut Context<Self>) {
-        // Flush a pending line edit now instead of waiting for the autosave.
+        // Flush a pending edit now instead of waiting for the autosave.
         self.commit_line_edit(false, cx);
+        self.flush_note_editor(cx);
     }
 
     /// Dismiss the orphaned-line banner, optionally appending its text to
@@ -452,7 +453,7 @@ impl Workspace {
                 return;
             }
             self.note_self_write(&path);
-            self.reload_notes();
+            self.reload_notes(cx);
         }
         cx.notify();
     }

@@ -55,6 +55,11 @@ pub struct Workspace {
     /// line-rendered note, not a separate editor.
     pub line_edit: Option<LineEdit>,
     pub(crate) _line_edit_sub: Option<gpui::Subscription>,
+    /// The single-buffer editor for the pane's document (dev flag
+    /// `new_editor` in settings.json); replaces the line-edit model while
+    /// present.
+    pub(crate) note_editor: Option<gpui::Entity<crate::note_editor::NoteEditor>>,
+    pub(crate) _note_editor_sub: Option<gpui::Subscription>,
     /// A line edit whose target vanished from the file before it could be
     /// saved: (file it was bound for, the user's text). Rendered as a banner
     /// so typed text is never silently dropped.
@@ -157,10 +162,15 @@ impl Workspace {
         let (notes_watcher, notes_watch_task) =
             Self::watch_notes(notes_root.clone(), self_writes.clone(), cx);
 
-        // Closing the window must not drop a pending line edit.
+        // Closing the window must not drop a pending edit, in either editor.
         let flush = cx.weak_entity();
         window.on_window_should_close(cx, move |_, cx| {
-            flush.update(cx, |ws, cx| ws.commit_line_edit(true, cx)).ok();
+            flush
+                .update(cx, |ws, cx| {
+                    ws.commit_line_edit(true, cx);
+                    ws.flush_note_editor(cx);
+                })
+                .ok();
             true
         });
 
@@ -174,6 +184,8 @@ impl Workspace {
             _autosave: None,
             line_edit: None,
             _line_edit_sub: None,
+            note_editor: None,
+            _note_editor_sub: None,
             orphaned: None,
             line_layouts: RefCell::new(HashMap::new()),
             sessions: Vec::new(),
@@ -203,7 +215,7 @@ impl Workspace {
             _notes_watcher: notes_watcher,
             _notes_watch_task: notes_watch_task,
         };
-        this.reload_notes();
+        this.reload_notes(cx);
         this.spawn_session(SessionKind::Local, window, cx);
         this
     }

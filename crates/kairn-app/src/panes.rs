@@ -114,12 +114,16 @@ impl Workspace {
             .bg(t.bg)
             .child(self.render_week_strip(t, cx));
 
+        // The single-buffer editor scrolls this container to keep the caret
+        // visible, so it needs the handle the container tracks.
+        let editor_scroll = self.note_editor.as_ref().map(|e| e.read(cx).scroll_handle.clone());
         pane.child(
             div()
                 .id("note-scroll")
                 .flex_1()
                 .min_h(px(0.))
                 .overflow_y_scroll()
+                .when_some(editor_scroll, |d, h| d.track_scroll(&h))
                 .child(self.render_note(t, writing, cx)),
         )
     }
@@ -270,6 +274,15 @@ impl Workspace {
         for banner in self.render_conflict_banners(t, cx) {
             note = note.child(banner);
         }
+        // Single-buffer editor (dev flag): the document body is the editor
+        // entity; masthead, banners, and mentions stay with the pane.
+        if let Some(editor) = &self.note_editor {
+            return note
+                .child(editor.clone())
+                .child(self.render_mentions(t, cx))
+                .into_any_element();
+        }
+
         let editing_idx = self.line_edit.as_ref().map(|le| le.line_idx);
         self.line_layouts.borrow_mut().clear();
 

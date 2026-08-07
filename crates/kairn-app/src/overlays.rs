@@ -134,7 +134,7 @@ impl Workspace {
         match notes::capture(&self.notes_root, today, &text) {
             Ok(Some(path)) => {
                 self.note_self_write(&path);
-                self.reload_notes()
+                self.reload_notes(cx)
             }
             Ok(None) => {}
             Err(e) => {

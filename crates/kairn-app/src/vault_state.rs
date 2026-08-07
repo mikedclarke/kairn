@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{Datelike, Days, Local, NaiveDate};
-use gpui::{Context, Task, Window};
+use gpui::{AppContext as _, Context, Task, Window};
 use gpui_component::WindowExt;
 use kairn_core as notes;
 use kairn_core::TaskQuery;
@@ -62,27 +62,90 @@ impl Workspace {
 
     pub fn select_day(&mut self, day: NaiveDate, cx: &mut Context<Self>) {
         self.commit_line_edit(true, cx);
+        self.flush_note_editor(cx);
         self.selected_day = day;
         self.view = PaneView::Day;
         self.show_note_pane();
-        self.reload_notes();
+        self.reload_notes(cx);
         cx.notify();
     }
 
     pub fn open_note(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.commit_line_edit(true, cx);
+        self.flush_note_editor(cx);
         self.view = PaneView::Note(path);
         self.show_note_pane();
-        self.reload_notes();
+        self.reload_notes(cx);
         cx.notify();
     }
 
     pub fn open_task_view(&mut self, query: TaskQuery, cx: &mut Context<Self>) {
         self.commit_line_edit(true, cx);
+        self.flush_note_editor(cx);
         self.view = PaneView::Tasks(query);
         self.show_note_pane();
-        self.reload_notes();
+        self.reload_notes(cx);
         cx.notify();
+    }
+
+    /// Write the single-buffer editor's pending edits now (navigation, save
+    /// shortcut, window close). A no-op when the editor is clean or absent.
+    pub(crate) fn flush_note_editor(&mut self, cx: &mut Context<Self>) {
+        if let Some(editor) = &self.note_editor {
+            editor.update(cx, |ed, cx| ed.save_now(cx));
+        }
+    }
+
+    /// Keep the single-buffer editor entity in step with the pane's document
+    /// after a reload: same file merges the fresh disk state into any
+    /// in-flight edits; a different file (or view) swaps the editor out.
+    fn sync_note_editor(&mut self, cx: &mut Context<Self>) {
+        use crate::note_editor::{NoteEditor, NoteEditorEvent};
+
+        if !self.settings.new_editor || self.doc_error.is_some() || self.root_missing {
+            self.note_editor = None;
+            self._note_editor_sub = None;
+            return;
+        }
+        // The editor needs a save target even before the file exists: a day
+        // with no note yet saves to its daily path on first edit.
+        let path = self.doc_path.clone().or_else(|| match &self.view {
+            PaneView::Day => Some(notes::daily_path(&self.notes_root, self.selected_day)),
+            _ => None,
+        });
+        let Some(path) = path else {
+            self.note_editor = None;
+            self._note_editor_sub = None;
+            return;
+        };
+        let text = self.doc_text.clone().unwrap_or_default();
+        if let Some(editor) = &self.note_editor
+            && editor.read(cx).path == path
+        {
+            editor.update(cx, |ed, cx| ed.reconcile_from_disk(&text, cx));
+            return;
+        }
+        let editor = cx.new(|cx| NoteEditor::new(path, &text, cx));
+        self._note_editor_sub = Some(cx.subscribe(
+            &editor,
+            |this, _editor, event: &NoteEditorEvent, cx| match event {
+                NoteEditorEvent::Saved(path) => {
+                    this.note_self_write(path);
+                    this.reload_notes(cx);
+                    cx.notify();
+                }
+                NoteEditorEvent::Conflicts(path, conflicts) => {
+                    this.orphaned = Some((path.clone(), conflicts.join("\n")));
+                    cx.notify();
+                }
+                NoteEditorEvent::OpenWikiLink(title) => {
+                    let title = title.clone();
+                    this.open_wiki_link_quiet(&title, cx);
+                }
+                NoteEditorEvent::OpenDate(date) => this.select_day(*date, cx),
+            },
+        ));
+        self.note_editor = Some(editor);
     }
 
     pub fn notes_expanded_contains(&self, path: &std::path::Path) -> bool {
@@ -115,7 +178,7 @@ impl Workspace {
 
     /// Re-read the pane's document and everything the sidebar derives from
     /// the notes: calendar indicators, open-task counts, the Notes tree.
-    pub fn reload_notes(&mut self) {
+    pub fn reload_notes(&mut self, cx: &mut Context<Self>) {
         self.root_missing = self.settings.notes_root.as_deref().is_some_and(|r| !r.is_empty())
             && !self.notes_root.exists();
         // One walk of Calendar/ and Notes/ and one read of each daily,
@@ -197,6 +260,7 @@ impl Workspace {
             .unwrap_or_default();
         self.doc_path = path;
         self.note_days = scan.days;
+        self.sync_note_editor(cx);
     }
 
     /// Open whatever a wiki link points at: a day, an existing note, or a
@@ -221,6 +285,27 @@ impl Workspace {
             }
             notes::WikiTarget::Invalid => {
                 window.push_notification("That link can't name a note inside the notes folder.", cx);
+            }
+        }
+    }
+
+    /// [`Self::open_wiki_link`] for callers without a window (entity event
+    /// handlers): failures log to stderr instead of raising a notification.
+    pub fn open_wiki_link_quiet(&mut self, title: &str, cx: &mut Context<Self>) {
+        match notes::resolve_wiki_target(&self.notes_root, title) {
+            notes::WikiTarget::Day(date) => self.select_day(date, cx),
+            notes::WikiTarget::Note(path) => self.open_note(path, cx),
+            notes::WikiTarget::Missing(path) => {
+                match notes::create_note_if_absent(&path, &format!("# {title}\n")) {
+                    Ok(_) => {
+                        self.note_self_write(&path);
+                        self.open_note(path, cx)
+                    }
+                    Err(e) => eprintln!("kairn: could not create {}: {e}", path.display()),
+                }
+            }
+            notes::WikiTarget::Invalid => {
+                eprintln!("kairn: link can't name a note inside the notes folder: {title}");
             }
         }
     }
@@ -272,7 +357,7 @@ impl Workspace {
             Ok(None) => {}
             Err(e) => eprintln!("kairn: could not update {}: {e}", path.display()),
         }
-        self.reload_notes();
+        self.reload_notes(cx);
         cx.notify();
     }
 
@@ -295,7 +380,7 @@ impl Workspace {
             Ok(false) => {}
             Err(e) => eprintln!("kairn: could not update {}: {e}", path.display()),
         }
-        self.reload_notes();
+        self.reload_notes(cx);
         cx.notify();
     }
 
@@ -308,7 +393,7 @@ impl Workspace {
             Ok(false) => {}
             Err(e) => eprintln!("kairn: could not update {}: {e}", task.path.display()),
         }
-        self.reload_notes();
+        self.reload_notes(cx);
         cx.notify();
     }
 
@@ -363,7 +448,7 @@ impl Workspace {
                     .await;
                 while rx.try_recv().is_ok() {}
                 let ok = this.update(cx, |ws, cx| {
-                    ws.reload_notes();
+                    ws.reload_notes(cx);
                     cx.notify();
                 });
                 if ok.is_err() {
@@ -407,7 +492,7 @@ impl Workspace {
             Self::watch_notes(self.notes_root.clone(), self.self_writes.clone(), cx);
         self._notes_watcher = watcher;
         self._notes_watch_task = task;
-        self.reload_notes();
+        self.reload_notes(cx);
         cx.notify();
     }
 }

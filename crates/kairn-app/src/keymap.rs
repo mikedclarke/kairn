@@ -22,6 +22,16 @@ actions!(
         LineEditRight,
         LineEditBackspace,
         LineEditDelete,
+        EditorEnter,
+        EditorBackspace,
+        EditorDelete,
+        EditorLeft,
+        EditorRight,
+        EditorUp,
+        EditorDown,
+        EditorUndo,
+        EditorRedo,
+        EditorPaste,
         Session1,
         Session2,
         Session3,
@@ -83,6 +93,18 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("right", LineEditRight, Some("Input")),
         KeyBinding::new("backspace", LineEditBackspace, Some("Input")),
         KeyBinding::new("delete", LineEditDelete, Some("Input")),
+        // The single-buffer note editor (dev-flagged): its own context so
+        // nothing here collides with the Input-context line-editor bindings.
+        KeyBinding::new("enter", EditorEnter, Some("NoteEditor")),
+        KeyBinding::new("backspace", EditorBackspace, Some("NoteEditor")),
+        KeyBinding::new("delete", EditorDelete, Some("NoteEditor")),
+        KeyBinding::new("left", EditorLeft, Some("NoteEditor")),
+        KeyBinding::new("right", EditorRight, Some("NoteEditor")),
+        KeyBinding::new("up", EditorUp, Some("NoteEditor")),
+        KeyBinding::new("down", EditorDown, Some("NoteEditor")),
+        KeyBinding::new(&p("z"), EditorUndo, Some("NoteEditor")),
+        KeyBinding::new(&p("shift-z"), EditorRedo, Some("NoteEditor")),
+        KeyBinding::new(&p("v"), EditorPaste, Some("NoteEditor")),
     ]);
 }
 
