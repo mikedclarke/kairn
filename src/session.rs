@@ -26,6 +26,9 @@ pub struct Session {
     pub display_name: SharedString,
     /// Latest OSC title from the shell (cwd/command on most setups).
     pub title: SharedString,
+    /// Cached busy state, polled by the workspace activity timer; renders read
+    /// this field rather than probing the PTY per frame.
+    pub busy: bool,
     pub view: Entity<TerminalView>,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     _child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
@@ -165,6 +168,7 @@ pub fn spawn(
     });
 
     Ok(Session {
+        busy: matches!(kind, SessionKind::Ssh(_)),
         id,
         kind,
         display_name,

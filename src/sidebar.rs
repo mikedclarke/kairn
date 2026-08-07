@@ -109,7 +109,7 @@ impl Workspace {
         // Sessions: the real list.
         side = side.child(sechead(t, "Sessions", Some(&session_count.to_string())));
         for (i, session) in self.sessions.iter().enumerate() {
-            let busy = session.is_busy();
+            let busy = session.busy;
             let active = i == self.active_session;
             let dot = div()
                 .w(px(7.))

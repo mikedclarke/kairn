@@ -3,6 +3,12 @@ name = "kairn"
 version = "0.1.0"
 edition = "2024"
 
+# Debug builds keep Kairn's own code unoptimised but compile every dependency
+# (gpui, taffy, cosmic-text, alacritty) at opt-level 2: a full UI frame with
+# deps at opt-level 0 costs hundreds of milliseconds on a power-limited machine.
+[profile.dev.package."*"]
+opt-level = 2
+
 [dependencies]
 gpui = "0.2.2"
 # Pre-1.0 ecosystem: gpui-component pinned exactly (it must resolve to the same gpui

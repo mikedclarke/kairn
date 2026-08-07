@@ -248,12 +248,26 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn new(settings: Settings, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        // Sidebar status dots poll the PTY foreground process; tick a repaint
-        // so they stay honest without any terminal event.
+        // Sidebar status dots reflect the PTY foreground process. Poll it here
+        // and repaint only when a session's busy state actually changed: a
+        // repaint is a full-window rebuild, far too expensive for a blind tick.
         let activity_timer = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(2)).await;
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                let tick = this.update(cx, |ws, cx| {
+                    let mut changed = false;
+                    for session in &mut ws.sessions {
+                        let busy = session.is_busy();
+                        if busy != session.busy {
+                            session.busy = busy;
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        cx.notify();
+                    }
+                });
+                if tick.is_err() {
                     break;
                 }
             }
@@ -1048,10 +1062,10 @@ impl Workspace {
         if self.doc_text.is_none() && target.exists() {
             return;
         }
-        let disk = self.doc_text.clone().unwrap_or_default();
 
         match self.editor.clone() {
             None => {
+                let disk = self.doc_text.clone().unwrap_or_default();
                 let state = cx.new(|cx| {
                     InputState::new(window, cx).multi_line(true).default_value(disk)
                 });
@@ -1087,8 +1101,9 @@ impl Workspace {
                 }
                 let resync = self.editor_stale
                     && !self.editor_dirty
-                    && editor.read(cx).value().as_ref() != disk;
+                    && editor.read(cx).value().as_ref() != self.doc_text.as_deref().unwrap_or("");
                 if switched || resync {
+                    let disk = self.doc_text.clone().unwrap_or_default();
                     editor.update(cx, |s, cx| s.set_value(disk, window, cx));
                     self.editor_doc = Some(target);
                     self.editor_dirty = false;
@@ -1483,7 +1498,7 @@ impl Workspace {
     }
 
     fn render_statusbar(&self, t: &KairnTheme, cx: &App) -> impl IntoElement {
-        let running = self.sessions.iter().filter(|s| s.is_busy()).count();
+        let running = self.sessions.iter().filter(|s| s.busy).count();
         let m = mod_symbol();
         let hints = [
             format!("{m}\\ sidebar"),
@@ -1756,7 +1771,7 @@ impl Workspace {
         card = card.child(switcher_section(t, "Sessions"));
 
         for (i, session) in self.sessions.iter().enumerate() {
-            let busy = session.is_busy();
+            let busy = session.busy;
             let meta = match &session.kind {
                 SessionKind::Local => {
                     if busy {
