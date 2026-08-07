@@ -180,6 +180,11 @@ pub struct Workspace {
     pub layout: LayoutMode,
     sidebar_open: bool,
     switcher_open: bool,
+    /// Search field of the ⌘J switcher; fresh each open.
+    switcher_input: Option<gpui::Entity<InputState>>,
+    _switcher_sub: Option<gpui::Subscription>,
+    /// Live results for the switcher's query.
+    pub switcher_hits: Vec<notes::SearchHit>,
     capture_open: bool,
     capture_input: Option<gpui::Entity<InputState>>,
     _capture_sub: Option<gpui::Subscription>,
@@ -219,6 +224,8 @@ pub struct Workspace {
     doc_text: Option<String>,
     /// The file `doc_text` was read from (`.md` or NotePlan's `.txt`).
     doc_path: Option<PathBuf>,
+    /// Lines elsewhere that link to the pane's document.
+    pub mentions: Vec<notes::Mention>,
     /// Days that have a daily note, for calendar indicators.
     pub note_days: HashSet<NaiveDate>,
     /// Every open task across the daily notes, newest first.
@@ -260,6 +267,9 @@ impl Workspace {
             layout: LayoutMode::Split,
             sidebar_open: true,
             switcher_open: false,
+            switcher_input: None,
+            _switcher_sub: None,
+            switcher_hits: Vec::new(),
             capture_open: false,
             capture_input: None,
             _capture_sub: None,
@@ -284,6 +294,7 @@ impl Workspace {
             doc_lines: None,
             doc_text: None,
             doc_path: None,
+            mentions: Vec::new(),
             note_days: HashSet::new(),
             open_tasks: Vec::new(),
             notes_tree: Vec::new(),
@@ -359,7 +370,65 @@ impl Workspace {
         let text = path.as_deref().and_then(|p| std::fs::read_to_string(p).ok());
         self.doc_lines = text.as_deref().map(notes::parse);
         self.doc_text = text;
+        // Linked mentions for the pane's document: a day is referenced by its
+        // ISO date ([[2026-08-07]] and >2026-08-07 alike), a note by its stem.
+        let title = match &self.view {
+            PaneView::Day => Some(self.selected_day.format("%Y-%m-%d").to_string()),
+            PaneView::Note(p) => p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string),
+            PaneView::Tasks(_) => None,
+        };
+        self.mentions = match title {
+            Some(t) => notes::mentions_of(&self.notes_root, &t, path.as_deref()),
+            None => Vec::new(),
+        };
         self.doc_path = path;
+    }
+
+    /// Open whatever a wiki link points at: a day, an existing note, or a
+    /// brand-new note created wiki-style on first click.
+    pub fn open_wiki_link(&mut self, title: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match notes::resolve_wiki_target(&self.notes_root, title) {
+            notes::WikiTarget::Day(date) => self.select_day(date, cx),
+            notes::WikiTarget::Note(path) => self.open_note(path, cx),
+            notes::WikiTarget::Missing(path) => {
+                match notes::write_note(&path, &format!("# {title}\n")) {
+                    Ok(()) => self.open_note(path, cx),
+                    Err(e) => {
+                        eprintln!("kairn: could not create {}: {e}", path.display());
+                        window.push_notification("Could not create the linked note, see stderr.", cx);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Jump to a mention's source note.
+    pub fn open_mention(&mut self, mention: &notes::Mention, cx: &mut Context<Self>) {
+        match mention.date {
+            Some(date) => self.select_day(date, cx),
+            None => self.open_note(mention.path.clone(), cx),
+        }
+    }
+
+    /// Open a switcher search hit. The note pane must end up visible, so a
+    /// full-screen terminal drops back to the split.
+    pub fn open_search_hit(
+        &mut self,
+        hit: &notes::SearchHit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match hit.date {
+            Some(date) => self.select_day(date, cx),
+            None => self.open_note(hit.path.clone(), cx),
+        }
+        if self.layout == LayoutMode::TerminalFull {
+            self.layout = LayoutMode::Split;
+        }
+        self.close_overlays(window, cx);
     }
 
     /// Toggle the task on line `line_idx` of the pane's document between open
@@ -527,6 +596,9 @@ impl Workspace {
         if self.picker_open || self.switcher_open || self.capture_open {
             self.picker_open = false;
             self.switcher_open = false;
+            self.switcher_input = None;
+            self._switcher_sub = None;
+            self.switcher_hits = Vec::new();
             self.capture_open = false;
             self.focus_active_terminal(window, cx);
             cx.notify();
@@ -555,6 +627,20 @@ impl Workspace {
         let raw = self.doc_text.as_deref()?.lines().nth(idx)?;
         let byte = notes::raw_col_for_display_char(raw, display_chars);
         Some(raw.get(..byte).map(|s| s.chars().count()).unwrap_or(0))
+    }
+
+    /// The link span (wiki link or date ref) under a click at `pos` on
+    /// rendered line `idx`. Only exact hits count: a click in the empty space
+    /// past a line must edit, never follow a link.
+    pub fn line_click_link(&self, idx: usize, pos: Point<Pixels>) -> Option<notes::Span> {
+        let layouts = self.line_layouts.borrow();
+        let layout = layouts.get(&idx)?;
+        let display_ix = layout.index_for_position(pos).ok()?;
+        let display = layout.text();
+        let display_chars = display.get(..display_ix)?.chars().count();
+        let raw = self.doc_text.as_deref()?.lines().nth(idx)?;
+        let span = notes::span_at_display_char(raw, display_chars)?;
+        matches!(span.0, notes::SpanKind::WikiLink | notes::SpanKind::DateRef).then_some(span)
     }
 
     /// Start editing a line of the pane document in place, placing the cursor
@@ -1164,9 +1250,35 @@ impl Workspace {
         if self.switcher_open {
             self.close_overlays(window, cx);
         } else {
+            // A fresh search input each open: empty query, no stale results.
+            let input = cx.new(|cx| {
+                InputState::new(window, cx).placeholder("Search notes and days…")
+            });
+            self._switcher_sub = Some(cx.subscribe_in(
+                &input,
+                window,
+                |this, state, ev: &InputEvent, window, cx| {
+                    match ev {
+                        InputEvent::Change => {
+                            let query = state.read(cx).value().to_string();
+                            this.switcher_hits =
+                                notes::search_notes(&this.notes_root, &query, 12);
+                            cx.notify();
+                        }
+                        InputEvent::PressEnter { .. } => {
+                            if let Some(hit) = this.switcher_hits.first().cloned() {
+                                this.open_search_hit(&hit, window, cx);
+                            }
+                        }
+                        _ => {}
+                    }
+                },
+            ));
+            input.update(cx, |state, cx| state.focus(window, cx));
+            self.switcher_input = Some(input);
+            self.switcher_hits = Vec::new();
             self.switcher_open = true;
             self.picker_open = false;
-            self.overlay_focus.focus(window);
             cx.notify();
         }
     }
@@ -1537,8 +1649,80 @@ impl Workspace {
                     .border_color(t.border)
                     .child(div().w(px(2.)).h(px(16.)).bg(t.accent))
                     .child("Jump to session, day, or note"),
-            )
-            .child(switcher_section(t, "Sessions"));
+            );
+
+        let query = self
+            .switcher_input
+            .as_ref()
+            .map(|i| i.read(cx).value().trim().to_string())
+            .unwrap_or_default();
+        if let Some(input) = self.switcher_input.clone() {
+            card = card.child(
+                div()
+                    .px(px(10.))
+                    .py(px(4.))
+                    .border_b_1()
+                    .border_color(t.border)
+                    .child(Input::new(&input).appearance(false)),
+            );
+        }
+
+        // A live query swaps the jump lists for search results.
+        if !query.is_empty() {
+            card = card.child(switcher_section(t, "Notes & days"));
+            if self.switcher_hits.is_empty() {
+                card = card.child(
+                    h_flex()
+                        .px(px(16.))
+                        .py(px(6.))
+                        .text_color(t.faint)
+                        .child("Nothing found"),
+                );
+            }
+            let hits = self.switcher_hits.clone();
+            for (i, hit) in hits.into_iter().enumerate() {
+                let icon = if hit.date.is_some() { "◷" } else { "≡" };
+                let snippet: Option<String> = hit.snippet.as_ref().map(|s| {
+                    let mut short: String = s.chars().take(48).collect();
+                    if short.len() < s.len() {
+                        short.push('…');
+                    }
+                    short
+                });
+                card = card.child(
+                    switcher_item(t, ("switcher-hit", i), cx)
+                        .child(div().w(px(14.)).text_color(t.faint).child(icon))
+                        .child(div().flex_none().text_color(t.text).child(hit.name.clone()))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .overflow_hidden()
+                                .text_size(px(11.))
+                                .text_color(t.faint)
+                                .children(snippet),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_search_hit(&hit, window, cx);
+                        })),
+                );
+            }
+            let card = card.child(
+                h_flex()
+                    .px(px(16.))
+                    .py(px(8.))
+                    .gap(px(14.))
+                    .border_t_1()
+                    .border_color(t.border)
+                    .text_size(px(11.))
+                    .text_color(t.faint)
+                    .child("⏎ open top result")
+                    .child("esc close"),
+            );
+            return Some(switcher_backdrop(self, t, cx).child(card));
+        }
+
+        card = card.child(switcher_section(t, "Sessions"));
 
         for (i, session) in self.sessions.iter().enumerate() {
             let busy = session.is_busy();
@@ -1574,27 +1758,18 @@ impl Workspace {
             );
         }
 
+        let today_day = today.date_naive();
         card = card
             .child(switcher_section(t, "Days"))
             .child(
-                h_flex()
-                    .px(px(16.))
-                    .py(px(6.))
-                    .gap(px(9.))
-                    .text_color(t.dim)
+                switcher_item(t, "switcher-today", cx)
                     .child(div().w(px(14.)).text_color(t.faint).child("◷"))
                     .child(div().flex_1().child(day_label))
-                    .child(div().text_size(px(11.)).text_color(t.faint).child("today")),
-            )
-            .child(switcher_section(t, "Notes"))
-            .child(
-                h_flex()
-                    .px(px(16.))
-                    .py(px(6.))
-                    .gap(px(9.))
-                    .text_color(t.faint)
-                    .child(div().w(px(14.)).child("≡"))
-                    .child(div().flex_1().child("Search lands with the notes phase")),
+                    .child(div().text_size(px(11.)).text_color(t.faint).child("today"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.select_day(today_day, cx);
+                        this.close_overlays(window, cx);
+                    })),
             )
             .child(
                 h_flex()
@@ -1605,31 +1780,38 @@ impl Workspace {
                     .border_color(t.border)
                     .text_size(px(11.))
                     .text_color(t.faint)
+                    .child("type to search notes")
                     .child("⏎ open")
                     .child("esc close"),
             );
 
-        Some(
-            div()
-                .id("switcher-backdrop")
-                .absolute()
-                .inset_0()
-                .flex()
-                .justify_center()
-                .items_start()
-                .pt(px(100.))
-                .bg(gpui::rgba(0x0a0b0873))
-                .track_focus(&self.overlay_focus)
-                .key_context("Overlay")
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                        this.close_overlays(window, cx);
-                    }),
-                )
-                .child(card),
-        )
+        Some(switcher_backdrop(self, t, cx).child(card))
     }
+}
+
+/// The click-away backdrop shared by both switcher states.
+fn switcher_backdrop(
+    ws: &Workspace,
+    _t: &KairnTheme,
+    cx: &mut Context<Workspace>,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("switcher-backdrop")
+        .absolute()
+        .inset_0()
+        .flex()
+        .justify_center()
+        .items_start()
+        .pt(px(100.))
+        .bg(gpui::rgba(0x0a0b0873))
+        .track_focus(&ws.overlay_focus)
+        .key_context("Overlay")
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                this.close_overlays(window, cx);
+            }),
+        )
 }
 
 impl Render for Workspace {

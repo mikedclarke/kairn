@@ -215,6 +215,234 @@ pub fn parse(text: &str) -> Vec<Line> {
     text.lines().map(parse_line).collect()
 }
 
+// ----- links, mentions, search -----
+
+/// What a `[[wiki link]]` target refers to.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WikiTarget {
+    /// `[[YYYY-MM-DD]]`: that day's daily note.
+    Day(NaiveDate),
+    /// An existing note under `Notes/`.
+    Note(PathBuf),
+    /// No note has this title yet; the path one would be created at.
+    Missing(PathBuf),
+}
+
+/// The note title inside a wiki-link span: brackets stripped, any
+/// `#heading` or `|alias` suffix dropped.
+pub fn wiki_link_title(span_text: &str) -> &str {
+    let inner = span_text.strip_prefix("[[").unwrap_or(span_text);
+    let inner = inner.strip_suffix("]]").unwrap_or(inner);
+    inner.split(['#', '|']).next().unwrap_or(inner).trim()
+}
+
+/// The styled span sitting `display_chars` characters into the line's
+/// rendered content, for dispatching clicks on links.
+pub fn span_at_display_char(raw: &str, display_chars: usize) -> Option<Span> {
+    let line = parse_line(raw);
+    let spans = match &line {
+        Line::Heading { spans, .. }
+        | Line::Task { spans, .. }
+        | Line::Bullet { spans }
+        | Line::Quote { spans }
+        | Line::Text { spans } => spans,
+        Line::Rule | Line::Blank => return None,
+    };
+    let mut seen = 0usize;
+    for (kind, s) in spans {
+        let chars = s.chars().count();
+        if display_chars < seen + chars {
+            return Some((*kind, s.clone()));
+        }
+        seen += chars;
+    }
+    None
+}
+
+/// Every note file under `Notes/` with its folder depth, recursively,
+/// deterministic order. `@Trash` is skipped everywhere links and search are
+/// concerned.
+fn notes_files(root: &Path) -> Vec<(usize, PathBuf)> {
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<(usize, PathBuf)>) {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        for path in paths {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            if name.starts_with('.') || name == "@Trash" {
+                continue;
+            }
+            if path.is_dir() {
+                walk(&path, depth + 1, out);
+            } else if matches!(
+                path.extension().and_then(|x| x.to_str()),
+                Some("md") | Some("txt")
+            ) {
+                out.push((depth, path));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&root.join("Notes"), 0, &mut out);
+    out
+}
+
+/// Resolve a wiki-link title: an ISO date goes to that day, anything else
+/// matches a note stem case-insensitively anywhere under `Notes/` (the
+/// shallowest match wins), and an unknown title yields the path a new note
+/// would be created at.
+pub fn resolve_wiki_target(root: &Path, title: &str) -> WikiTarget {
+    if let Ok(date) = NaiveDate::parse_from_str(title, "%Y-%m-%d") {
+        return WikiTarget::Day(date);
+    }
+    let lower = title.to_lowercase();
+    let best = notes_files(root)
+        .into_iter()
+        .filter(|(_, p)| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.to_lowercase() == lower)
+        })
+        .min_by(|a, b| a.cmp(b));
+    match best {
+        Some((_, p)) => WikiTarget::Note(p),
+        None => WikiTarget::Missing(root.join("Notes").join(format!("{title}.md"))),
+    }
+}
+
+/// A line in another note that references this one.
+#[derive(Clone, Debug)]
+pub struct Mention {
+    pub path: PathBuf,
+    /// Daily notes carry their date, for navigation.
+    pub date: Option<NaiveDate>,
+    /// Source label: the note's stem, or the day spelled out.
+    pub name: String,
+    pub spans: Vec<Span>,
+}
+
+/// Every line elsewhere that links to `title`: a `[[title]]` in any form,
+/// plus `>date` references when the title is a day's `YYYY-MM-DD`. The note
+/// itself is excluded; dailies come newest first, then notes in tree order.
+pub fn mentions_of(root: &Path, title: &str, exclude: Option<&Path>) -> Vec<Mention> {
+    let lower = title.to_lowercase();
+    let mut out = Vec::new();
+    let mut scan = |path: &Path, date: Option<NaiveDate>, name: &str| {
+        if Some(path) == exclude {
+            return;
+        }
+        let Ok(text) = fs::read_to_string(path) else { return };
+        for raw in text.lines() {
+            // Cheap gate; the span check below is authoritative.
+            if !raw.to_lowercase().contains(&lower) {
+                continue;
+            }
+            let spans = match parse_line(raw) {
+                Line::Heading { spans, .. }
+                | Line::Task { spans, .. }
+                | Line::Bullet { spans }
+                | Line::Quote { spans }
+                | Line::Text { spans } => spans,
+                Line::Rule | Line::Blank => continue,
+            };
+            let hit = spans.iter().any(|(kind, s)| match kind {
+                SpanKind::WikiLink => wiki_link_title(s).to_lowercase() == lower,
+                SpanKind::DateRef => s.strip_prefix('>').is_some_and(|d| d == title),
+                _ => false,
+            });
+            if hit {
+                out.push(Mention {
+                    path: path.to_path_buf(),
+                    date,
+                    name: name.to_string(),
+                    spans,
+                });
+            }
+        }
+    };
+    let mut days: Vec<NaiveDate> = days_with_notes(root).into_iter().collect();
+    days.sort_unstable_by(|a, b| b.cmp(a));
+    for date in days {
+        let Some(path) = daily_file(root, date) else { continue };
+        scan(&path, Some(date), &date.format("%-d %b %Y").to_string());
+    }
+    for (_, path) in notes_files(root) {
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        scan(&path, None, &name);
+    }
+    out
+}
+
+/// One switcher search result.
+#[derive(Clone, Debug)]
+pub struct SearchHit {
+    pub path: PathBuf,
+    /// Set when the hit is a daily note.
+    pub date: Option<NaiveDate>,
+    pub name: String,
+    /// The matching body line, when the match wasn't in the title.
+    pub snippet: Option<String>,
+}
+
+/// Case-insensitive substring search over every note: title matches first
+/// (notes in tree order), then one body match per file (dailies newest
+/// first, then notes), capped at `limit`.
+pub fn search_notes(root: &Path, query: &str, limit: usize) -> Vec<SearchHit> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let files = notes_files(root);
+    let mut out: Vec<SearchHit> = Vec::new();
+    for (_, path) in &files {
+        if out.len() >= limit {
+            return out;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        if stem.to_lowercase().contains(&q) {
+            out.push(SearchHit {
+                path: path.clone(),
+                date: None,
+                name: stem.to_string(),
+                snippet: None,
+            });
+        }
+    }
+    let mut days: Vec<NaiveDate> = days_with_notes(root).into_iter().collect();
+    days.sort_unstable_by(|a, b| b.cmp(a));
+    let dailies = days
+        .into_iter()
+        .filter_map(|d| daily_file(root, d).map(|p| (p, Some(d))));
+    let title_hits: HashSet<PathBuf> = out.iter().map(|h| h.path.clone()).collect();
+    let notes = files
+        .into_iter()
+        .filter(|(_, p)| !title_hits.contains(p))
+        .map(|(_, p)| (p, None));
+    for (path, date) in dailies.chain(notes) {
+        if out.len() >= limit {
+            break;
+        }
+        let Ok(text) = fs::read_to_string(&path) else { continue };
+        let Some(line) = text.lines().find(|l| l.to_lowercase().contains(&q)) else {
+            continue;
+        };
+        let name = match date {
+            Some(d) => d.format("%-d %b %Y").to_string(),
+            None => path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string(),
+        };
+        out.push(SearchHit { path, date, name, snippet: Some(line.trim().to_string()) });
+    }
+    out
+}
+
 // ----- writeback -----
 
 /// Append a captured line to a day's note as an open task, creating the file
@@ -858,6 +1086,133 @@ mod tests {
         // Blank-ish lines land at the end.
         assert_eq!(raw_col_for_display_char("   ", 0), 3);
         assert_eq!(raw_col_for_display_char("---", 0), 3);
+    }
+
+    /// A scratch notes root with a NotePlan-shaped tree, removed on drop.
+    struct ScratchRoot(PathBuf);
+
+    impl ScratchRoot {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!("kairn-test-{tag}-{nanos}"));
+            ensure_layout(&root);
+            Self(root)
+        }
+
+        fn write(&self, rel: &str, content: &str) -> PathBuf {
+            let path = self.0.join(rel);
+            fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            fs::write(&path, content).expect("write");
+            path
+        }
+    }
+
+    impl Drop for ScratchRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn wiki_link_titles() {
+        assert_eq!(wiki_link_title("[[kairn prd]]"), "kairn prd");
+        assert_eq!(wiki_link_title("[[kairn prd#phases]]"), "kairn prd");
+        assert_eq!(wiki_link_title("[[kairn prd|the plan]]"), "kairn prd");
+        assert_eq!(wiki_link_title("[[ padded ]]"), "padded");
+    }
+
+    #[test]
+    fn span_under_display_char() {
+        let raw = "* [ ] see [[kairn]] now";
+        // Content renders as "see [[kairn]] now": char 0 is in the text span.
+        assert_eq!(
+            span_at_display_char(raw, 0),
+            Some((SpanKind::Text, "see ".into()))
+        );
+        // Char 4 is the first bracket of the link.
+        assert_eq!(
+            span_at_display_char(raw, 4),
+            Some((SpanKind::WikiLink, "[[kairn]]".into()))
+        );
+        assert_eq!(
+            span_at_display_char(raw, 13),
+            Some((SpanKind::Text, " now".into()))
+        );
+        // Past the end: nothing.
+        assert_eq!(span_at_display_char(raw, 99), None);
+        assert_eq!(span_at_display_char("---", 0), None);
+    }
+
+    #[test]
+    fn wiki_resolution() {
+        let root = ScratchRoot::new("resolve");
+        let prd = root.write("Notes/Kairn PRD.md", "# Kairn PRD\n");
+        root.write("Notes/deep/Kairn PRD.md", "# duplicate deeper\n");
+        root.write("Notes/@Trash/Ghost.md", "# trashed\n");
+
+        // Case-insensitive stem match; the shallowest copy wins.
+        assert_eq!(
+            resolve_wiki_target(&root.0, "kairn prd"),
+            WikiTarget::Note(prd)
+        );
+        // ISO dates are days, whether or not a file exists.
+        assert_eq!(
+            resolve_wiki_target(&root.0, "2026-08-07"),
+            WikiTarget::Day(NaiveDate::from_ymd_opt(2026, 8, 7).expect("valid"))
+        );
+        // Trash never resolves; unknown titles point at the file to create.
+        assert_eq!(
+            resolve_wiki_target(&root.0, "Ghost"),
+            WikiTarget::Missing(root.0.join("Notes/Ghost.md"))
+        );
+    }
+
+    #[test]
+    fn mentions_find_links_and_daterefs() {
+        let root = ScratchRoot::new("mentions");
+        let plan = root.write("Notes/Plan.md", "# Plan\n");
+        root.write("Notes/Other.md", "see [[plan#top]] for detail\nno link here\n");
+        root.write("Calendar/20260806.md", "* review [[Plan]]\n");
+        root.write("Calendar/20260807.md", "* ship >2026-08-09\n");
+
+        let hits = mentions_of(&root.0, "Plan", Some(&plan));
+        assert_eq!(hits.len(), 2);
+        // Dailies first, then notes.
+        assert_eq!(hits[0].date, NaiveDate::from_ymd_opt(2026, 8, 6));
+        assert_eq!(hits[1].name, "Other");
+
+        // A day's mentions include schedule refs pointing at it.
+        let day_hits = mentions_of(&root.0, "2026-08-09", None);
+        assert_eq!(day_hits.len(), 1);
+        assert_eq!(day_hits[0].date, NaiveDate::from_ymd_opt(2026, 8, 7));
+
+        // The note itself is excluded.
+        root.write("Notes/Plan.md", "# Plan\nself link [[plan]]\n");
+        assert_eq!(mentions_of(&root.0, "Plan", Some(&plan)).len(), 2);
+    }
+
+    #[test]
+    fn search_titles_then_content() {
+        let root = ScratchRoot::new("search");
+        root.write("Notes/Alpha project.md", "body without the word\n");
+        root.write("Notes/Beta.md", "mentions alpha inline\n");
+        root.write("Calendar/20260805.md", "* alpha task\n");
+
+        let hits = search_notes(&root.0, "ALPHA", 10);
+        assert_eq!(hits.len(), 3);
+        // Title match first, no snippet.
+        assert_eq!(hits[0].name, "Alpha project");
+        assert_eq!(hits[0].snippet, None);
+        // Then body matches: the daily before the note, snippets trimmed.
+        assert_eq!(hits[1].date, NaiveDate::from_ymd_opt(2026, 8, 5));
+        assert_eq!(hits[1].snippet.as_deref(), Some("* alpha task"));
+        assert_eq!(hits[2].name, "Beta");
+
+        assert_eq!(search_notes(&root.0, "  ", 10).len(), 0);
+        assert_eq!(search_notes(&root.0, "alpha", 1).len(), 1);
     }
 
     #[test]

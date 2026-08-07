@@ -283,6 +283,8 @@ impl Workspace {
             },
         )));
 
+        note = note.child(self.render_mentions(t, cx));
+
         note.child(
             div()
                 .mt(px(4.))
@@ -319,6 +321,55 @@ impl Workspace {
             .on_action(cx.listener(Self::on_line_edit_delete))
             .child(Input::new(&le.input).appearance(false).w_full())
             .into_any_element()
+    }
+
+    /// Lines elsewhere that link here, at the foot of the note. Empty when
+    /// nothing links in.
+    fn render_mentions(&self, t: &KairnTheme, cx: &mut Context<Self>) -> AnyElement {
+        if self.mentions.is_empty() {
+            return div().into_any_element();
+        }
+        let mut section = div()
+            .mb(px(10.))
+            .child(
+                div()
+                    .mb(px(8.))
+                    .text_size(px(11.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(t.faint)
+                    .child(format!("LINKED MENTIONS · {}", self.mentions.len())),
+            )
+            .child(div().mb(px(8.)).h(px(1.)).bg(t.border));
+        let sel = t.sel;
+        for (i, mention) in self.mentions.iter().cloned().enumerate() {
+            let name = mention.name.clone();
+            let spans = mention.spans.clone();
+            section = section.child(
+                div()
+                    .id(("mention", i))
+                    .flex()
+                    .items_start()
+                    .gap(px(9.))
+                    .py(px(2.5))
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(sel))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.open_mention(&mention, cx);
+                    }))
+                    .child(
+                        div()
+                            .flex_none()
+                            .mt(px(1.))
+                            .text_size(px(11.))
+                            .text_color(t.faint)
+                            .child(name),
+                    )
+                    .child(div().flex_1().min_w(px(0.)).child(spans_el(t, &spans, t.dim))),
+            );
+        }
+        section.into_any_element()
     }
 
     fn render_task_view(
@@ -432,9 +483,28 @@ fn clickable_line(idx: usize, inner: AnyElement, cx: &mut Context<Workspace>) ->
         .child(inner)
         .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
             cx.stop_propagation();
-            let col = ev
-                .mouse_position()
-                .and_then(|pos| this.line_click_col(idx, pos));
+            let pos = ev.mouse_position();
+            // A click landing on a link navigates; anywhere else edits.
+            if let Some((kind, text)) = pos.and_then(|p| this.line_click_link(idx, p)) {
+                match kind {
+                    SpanKind::WikiLink => {
+                        let title = notes::wiki_link_title(&text).to_string();
+                        this.open_wiki_link(&title, window, cx);
+                        return;
+                    }
+                    SpanKind::DateRef => {
+                        if let Some(date) = text
+                            .strip_prefix('>')
+                            .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+                        {
+                            this.select_day(date, cx);
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let col = pos.and_then(|p| this.line_click_col(idx, p));
             this.edit_line_at(idx, col, window, cx);
         }))
         .into_any_element()
