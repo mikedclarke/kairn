@@ -1,27 +1,34 @@
 # Kairn
 
-A calm, native workspace for people who live in notes and terminals: daily notes, tasks,
-a markdown knowledge base, and real terminal sessions in one window, built on plain
-markdown files you own, with AI agents as first-class users of the same content.
+[![release](https://img.shields.io/github/v/release/mikedclarke/kairn)](https://github.com/mikedclarke/kairn/releases)
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-blue)](#build-and-run)
 
-A cairn is a stack of stones that marks a path. Kairn is where you leave markers
-(notes, decisions, knowledge) for your future self and for your agents.
+Your notes and your terminals in one calm, native window.
+
+Kairn is a daily-notes and tasks app with real terminal sessions beside the page:
+plan the day, run the work, and capture what you learned without switching apps.
+Everything is plain markdown files on disk, and AI agents are first-class users of
+those files, not a chat panel bolted on.
 
 Built in Rust on [GPUI](https://www.gpui.rs) (Zed's UI framework). One codebase for
 macOS and Linux. Not Electron.
 
 ## Why
 
-Most note apps treat AI as a bolt-on chat panel. Kairn flips it: your notes are plain
-markdown on disk, and agents work on them through a plain CLI, through the same
-never-clobber write paths the app uses. An agent and a human can edit the same note at
-the same moment without destroying each other's work, and everything an agent does shows
-up in an activity feed inside the app.
+If you work with coding agents, your day is split between terminals where the agents
+run and notes where the plans, context, and decisions live. Keep those in separate
+apps and the knowledge your agents need is never where the agents are.
 
-## Status
+Kairn puts them on one surface. Notes are plain markdown on disk, so an agent needs
+no importer, sync bridge, or API key to read them. The `kairn` CLI gives agents
+tasks, capture, search, and backlinks with JSON output and honest exit codes. And
+every write, human or agent, goes through the same atomic never-clobber merge, so an
+agent editing a note you have open cannot destroy your work. What agents do shows up
+in a live activity feed beside your own notes.
 
-Early and moving fast. The author uses it daily as the primary notes app and terminal.
-No packaged releases yet; build from source (below). Expect rough edges.
+No cloud, no accounts, no database. A folder of markdown you could still read in
+twenty years.
 
 ## Features
 
