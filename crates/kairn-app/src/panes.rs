@@ -1,25 +1,15 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
-
 use chrono::{Datelike, Days, Local};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, AppContext as _, ClickEvent, Context, HighlightStyle, InteractiveElement,
-    IntoElement, ParentElement, StatefulInteractiveElement, Styled, StyledText, TextLayout,
-    Window, div, px, relative,
+    AnyElement, Context, HighlightStyle, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled, StyledText, Window, div, px, relative,
 };
 use gpui_component::h_flex;
-use gpui_component::input::Input;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 
-use kairn_core::{self as notes, Line, Span, SpanKind, TaskState};
-use crate::theme::{self, KairnTheme, KairnThemeExt as _};
-use crate::workspace::{
-    InputDown, InputUp, LayoutMode, PaneView, TaskQuery, Workspace, chord,
-};
-
-/// Per-render stash of each note line's text layout, for click hit-testing.
-type LineLayouts = RefCell<HashMap<usize, TextLayout>>;
+use kairn_core::{Span, SpanKind};
+use crate::theme::{self, KairnTheme};
+use crate::workspace::{LayoutMode, PaneView, TaskQuery, Workspace, chord};
 
 impl Workspace {
     pub fn render_main(
@@ -274,8 +264,9 @@ impl Workspace {
         for banner in self.render_conflict_banners(t, cx) {
             note = note.child(banner);
         }
-        // Single-buffer editor (dev flag): the document body is the editor
-        // entity; masthead, banners, and mentions stay with the pane.
+        // The document body is the editor entity; masthead, banners, and
+        // mentions stay with the pane. No editor means the note can't be
+        // edited here: an unreadable file or a missing notes root.
         if let Some(editor) = &self.note_editor {
             return note
                 .child(editor.clone())
@@ -283,85 +274,16 @@ impl Workspace {
                 .into_any_element();
         }
 
-        let editing_idx = self.line_edit.as_ref().map(|le| le.line_idx);
-        self.line_layouts.borrow_mut().clear();
-
-        match &self.doc_lines {
-            None => {
-                if let Some(err) = &self.doc_error {
-                    note = note.child(
-                        div()
-                            .mt(px(10.))
-                            .text_color(t.faint)
-                            .child(format!("Couldn't read this note: {err}")),
-                    );
-                } else if editing_idx == Some(0) {
-                    note = note.child(self.render_line_editor(cx));
-                } else {
-                    note = note.child(
-                        div()
-                            .id("empty-note")
-                            .mt(px(10.))
-                            .text_color(t.faint)
-                            .cursor_text()
-                            .child(empty_text)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.edit_line(0, window, cx);
-                            })),
-                    );
-                }
-            }
-            Some(lines) => {
-                let raw: Vec<String> = self
-                    .doc_text
-                    .as_deref()
-                    .map(|text| text.lines().map(str::to_string).collect())
-                    .unwrap_or_default();
-                for (idx, line) in lines.iter().enumerate() {
-                    if editing_idx == Some(idx) {
-                        note = note.child(self.render_line_editor(cx));
-                    } else {
-                        let inner = clickable_line(
-                            idx,
-                            render_line(t, idx, line, &self.line_layouts, cx),
-                            cx,
-                        );
-                        let draggable = !matches!(line, Line::Blank | Line::Rule);
-                        note = note.child(draggable_row(
-                            t,
-                            idx,
-                            raw.get(idx).cloned().unwrap_or_default(),
-                            draggable,
-                            inner,
-                            cx,
-                        ));
-                    }
-                }
-                if editing_idx == Some(lines.len()) {
-                    note = note.child(self.render_line_editor(cx));
-                }
-            }
+        if let Some(err) = &self.doc_error {
+            note = note.child(
+                div()
+                    .mt(px(10.))
+                    .text_color(t.faint)
+                    .child(format!("Couldn't read this note: {err}")),
+            );
+        } else {
+            note = note.child(div().mt(px(10.)).text_color(t.faint).child(empty_text));
         }
-
-        // Clicking the space under the note starts a new line at the end;
-        // dropping a dragged line here moves it to the end.
-        let accent = t.accent;
-        note = note.child(
-            div()
-                .id("note-append")
-                .h(px(140.))
-                .border_t_2()
-                .border_color(gpui::transparent_black())
-                .drag_over::<DragLine>(move |style, _, _, _| style.border_color(accent))
-                .on_drop::<DragLine>(cx.listener(|this, drag: &DragLine, _, cx| {
-                    this.drop_line(drag.idx, &drag.text, usize::MAX, cx);
-                }))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.edit_line(usize::MAX, window, cx);
-                })),
-        );
 
         note.child(self.render_mentions(t, cx)).into_any_element()
     }
@@ -474,41 +396,6 @@ impl Workspace {
                     .into_any_element()
             })
             .collect()
-    }
-
-    /// The single-line input standing in for the line being edited. The
-    /// wrapper owns the cross-line movement actions: the LineEdit* bindings
-    /// match any focused input, but only here do they find a handler, so
-    /// everywhere else they fall through to the input's normal behaviour.
-    fn render_line_editor(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(le) = &self.line_edit else {
-            return div().into_any_element();
-        };
-        div()
-            .py(px(1.))
-            .on_action(cx.listener(|this, _: &InputUp, window, cx| {
-                this.line_edit_vertical(-1, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &InputDown, window, cx| {
-                this.line_edit_vertical(1, window, cx);
-            }))
-            .on_action(cx.listener(Self::on_line_edit_left))
-            .on_action(cx.listener(Self::on_line_edit_right))
-            .on_action(cx.listener(Self::on_line_edit_backspace))
-            .on_action(cx.listener(Self::on_line_edit_delete))
-            // Strip the input's own metrics so the raw line sits exactly
-            // where the rendered line was: same size, leading, and left
-            // edge. Height stays automatic — the input grows with wrapped
-            // paragraphs.
-            .child(
-                Input::new(&le.input)
-                    .appearance(false)
-                    .w_full()
-                    .p_0()
-                    .text_size(px(13.))
-                    .line_height(relative(1.58)),
-            )
-            .into_any_element()
     }
 
     /// Lines elsewhere that link here, at the foot of the note. Empty when
@@ -664,270 +551,6 @@ fn week_nav(t: &KairnTheme, id: &'static str, glyph: &'static str) -> gpui::Stat
         .child(glyph)
 }
 
-/// A dragged note line: the source index plus the raw markdown, so the drop
-/// applies a verified move that can never clobber a file that shifted.
-#[derive(Clone)]
-struct DragLine {
-    idx: usize,
-    text: String,
-}
-
-/// The floating preview while a line is dragged.
-struct DragPreview(String);
-
-impl gpui::Render for DragPreview {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = cx.kairn().clone();
-        div()
-            .px(px(10.))
-            .py(px(4.))
-            .rounded(px(6.))
-            .bg(t.panel2)
-            .border_1()
-            .border_color(t.border)
-            .text_size(px(12.))
-            .text_color(t.dim)
-            .max_w(px(420.))
-            .overflow_hidden()
-            .child(self.0.clone())
-    }
-}
-
-/// Wrap a rendered line with its reorder affordances: a grab handle in the
-/// left margin, visible while the row is hovered, and a drop target that
-/// moves the dragged line to sit above this one.
-fn draggable_row(
-    t: &KairnTheme,
-    idx: usize,
-    raw: String,
-    draggable: bool,
-    inner: AnyElement,
-    cx: &mut Context<Workspace>,
-) -> AnyElement {
-    let group = gpui::SharedString::from(format!("note-line-{idx}"));
-    let accent = t.accent;
-    let grip_hover = t.dim;
-    let mut row = div()
-        .id(("line-row", idx))
-        .group(group.clone())
-        .flex()
-        .items_start()
-        .border_t_2()
-        .border_color(gpui::transparent_black())
-        .drag_over::<DragLine>(move |style, _, _, _| style.border_color(accent))
-        .on_drop::<DragLine>(cx.listener(move |this, drag: &DragLine, _, cx| {
-            this.drop_line(drag.idx, &drag.text, idx, cx);
-        }));
-    if draggable {
-        row = row.child(
-            div()
-                .id(("line-grip", idx))
-                .flex_none()
-                .w(px(16.))
-                .ml(px(-16.))
-                .pt(px(5.))
-                .text_size(px(10.))
-                .text_color(t.faint)
-                .opacity(0.)
-                .group_hover(group, |s| s.opacity(1.))
-                .hover(move |s| s.text_color(grip_hover))
-                .cursor_grab()
-                .on_drag(DragLine { idx, text: raw }, |drag, _, _, cx| {
-                    cx.new(|_| DragPreview(drag.text.clone()))
-                })
-                .child("⠿"),
-        );
-    }
-    row.child(div().flex_1().min_w(px(0.)).child(inner))
-        .into_any_element()
-}
-
-/// Wrap a rendered line so clicking it starts editing it in place, cursor
-/// under the pointer.
-fn clickable_line(idx: usize, inner: AnyElement, cx: &mut Context<Workspace>) -> AnyElement {
-    div()
-        .id(("line", idx))
-        .cursor_text()
-        .child(inner)
-        .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
-            cx.stop_propagation();
-            let pos = ev.mouse_position();
-            // A click landing on a link navigates; anywhere else edits.
-            if let Some((kind, text)) = pos.and_then(|p| this.line_click_link(idx, p)) {
-                match kind {
-                    SpanKind::WikiLink => {
-                        let title = notes::wiki_link_title(&text).to_string();
-                        this.open_wiki_link(&title, window, cx);
-                        return;
-                    }
-                    SpanKind::DateRef => {
-                        if let Some(date) = text
-                            .strip_prefix('>')
-                            .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
-                        {
-                            this.select_day(date, cx);
-                            return;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let col = pos.and_then(|p| this.line_click_col(idx, p));
-            this.edit_line_at(idx, col, window, cx);
-        }))
-        .into_any_element()
-}
-
-fn render_line(
-    t: &KairnTheme,
-    idx: usize,
-    line: &Line,
-    layouts: &LineLayouts,
-    cx: &mut Context<Workspace>,
-) -> AnyElement {
-    match line {
-        Line::Heading { level, spans } => {
-            if *level == 1 {
-                div()
-                    .mt(px(18.))
-                    .mb(px(6.))
-                    .font_family(theme::serif_font())
-                    .text_size(px(19.))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child(spans_line(t, spans, t.text, idx, layouts))
-                    .into_any_element()
-            } else {
-                section_heading_spans(t, spans, idx, layouts).into_any_element()
-            }
-        }
-        Line::Task { state, spans } => {
-            task_row(t, idx, *state, spans, layouts, cx).into_any_element()
-        }
-        Line::Bullet { spans } => div()
-            .flex()
-            .gap(px(9.))
-            .py(px(2.5))
-            .child(div().text_color(t.faint).child("–"))
-            .child(div().flex_1().min_w(px(0.)).child(spans_line(t, spans, t.text, idx, layouts)))
-            .into_any_element(),
-        Line::Quote { spans } => div()
-            .my(px(4.))
-            .pl(px(12.))
-            .border_l_2()
-            .border_color(t.border)
-            .child(spans_line(t, spans, t.dim, idx, layouts))
-            .into_any_element(),
-        Line::Rule => div().my(px(14.)).h(px(1.)).bg(t.border).into_any_element(),
-        Line::Blank => div().h(px(8.)).into_any_element(),
-        // Body text renders in the same color and size the editor uses, so
-        // leaving an edit never dims or restyles what was just typed.
-        Line::Text { spans } => div()
-            .py(px(1.))
-            .child(spans_line(t, spans, t.text, idx, layouts))
-            .into_any_element(),
-    }
-}
-
-fn section_heading_spans(
-    t: &KairnTheme,
-    spans: &[Span],
-    idx: usize,
-    layouts: &LineLayouts,
-) -> impl IntoElement {
-    let label: String = spans
-        .iter()
-        .filter(|(kind, _)| !matches!(kind, SpanKind::Hidden))
-        .map(|(_, s)| s.as_str())
-        .collect();
-    let styled = StyledText::new(label.to_uppercase());
-    layouts.borrow_mut().insert(idx, styled.layout().clone());
-    div()
-        .mt(px(18.))
-        .mb(px(8.))
-        .text_size(px(11.))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(t.faint)
-        .child(styled)
-}
-
-fn task_row(
-    t: &KairnTheme,
-    idx: usize,
-    state: TaskState,
-    spans: &[Span],
-    layouts: &LineLayouts,
-    cx: &mut Context<Workspace>,
-) -> gpui::Div {
-    let box_base = div()
-        .id(("task-box", idx))
-        .w(px(13.))
-        .h(px(13.))
-        .flex_none()
-        .rounded(px(4.));
-    // Open and done boxes toggle on click; scheduled and cancelled stay
-    // inert until full editing.
-    let box_base = if matches!(state, TaskState::Open | TaskState::Done) {
-        box_base
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                this.toggle_task(idx, cx);
-            }))
-    } else {
-        box_base
-    };
-    let dim = t.dim;
-    let box_el = match state {
-        TaskState::Done => box_base.bg(t.accent).flex().items_center().justify_center().child(
-            div()
-                .text_size(px(9.))
-                .font_weight(gpui::FontWeight::BOLD)
-                .text_color(t.bg)
-                .child("✓"),
-        ),
-        TaskState::Cancelled => box_base
-            .border_1()
-            .border_color(t.faint)
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(div().text_size(px(8.)).text_color(t.faint).child("✕")),
-        TaskState::Scheduled => box_base
-            .border_1()
-            .border_color(t.faint)
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(div().text_size(px(8.)).text_color(t.faint).child("›")),
-        TaskState::Open => box_base
-            .border_1()
-            .border_color(t.faint)
-            .hover(move |s| s.border_color(dim)),
-    };
-
-    let struck = matches!(state, TaskState::Done | TaskState::Cancelled);
-    let base_color = match state {
-        TaskState::Open => t.text,
-        TaskState::Scheduled => t.dim,
-        TaskState::Done | TaskState::Cancelled => t.faint,
-    };
-    let text = div()
-        .flex_1()
-        .min_w(px(0.))
-        .when(struck, |d| d.line_through())
-        .child(spans_line(t, spans, base_color, idx, layouts));
-
-    div()
-        .flex()
-        .items_start()
-        .gap(px(9.))
-        .py(px(2.5))
-        .rounded(px(6.))
-        .hover(|s| s.bg(t.sel))
-        .child(box_el.mt(px(4.)))
-        .child(text)
-}
-
 /// Inline fragments as one wrapping styled-text element, tinted per span
 /// kind.
 fn spans_text(t: &KairnTheme, spans: &[Span]) -> StyledText {
@@ -983,17 +606,4 @@ fn spans_el(t: &KairnTheme, spans: &[Span], base_color: gpui::Hsla) -> gpui::Div
     div().text_color(base_color).child(spans_text(t, spans))
 }
 
-/// [`spans_el`] for a note line, recording its text layout for click
-/// hit-testing.
-fn spans_line(
-    t: &KairnTheme,
-    spans: &[Span],
-    base_color: gpui::Hsla,
-    idx: usize,
-    layouts: &LineLayouts,
-) -> gpui::Div {
-    let styled = spans_text(t, spans);
-    layouts.borrow_mut().insert(idx, styled.layout().clone());
-    div().text_color(base_color).child(styled)
-}
 

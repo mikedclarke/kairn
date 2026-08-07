@@ -35,11 +35,6 @@ pub struct Settings {
     pub notes_root: Option<String>,
     #[serde(default)]
     pub ssh_hosts: Vec<SshHost>,
-    /// Dev flag: the single-buffer note editor instead of the per-line
-    /// editor. No UI; set `"new_editor": true` in settings.json. Removed
-    /// when the new editor becomes the only one.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub new_editor: bool,
     /// Set when the settings file existed but couldn't be parsed. While
     /// degraded, [`Settings::save`] refuses to run: auto-saving defaults
     /// over a corrupt file is how SSH hosts and the notes root get wiped.
@@ -58,7 +53,6 @@ impl Default for Settings {
             theme: default_theme(),
             notes_root: None,
             ssh_hosts: Vec::new(),
-            new_editor: false,
             degraded: false,
         }
     }

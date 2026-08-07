@@ -1,5 +1,4 @@
 mod chrome;
-mod editing;
 mod keymap;
 mod note_editor;
 mod overlays;

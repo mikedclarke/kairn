@@ -18,10 +18,6 @@ actions!(
         Quit,
         InputUp,
         InputDown,
-        LineEditLeft,
-        LineEditRight,
-        LineEditBackspace,
-        LineEditDelete,
         EditorEnter,
         EditorBackspace,
         EditorDelete,
@@ -90,18 +86,13 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(&p("9"), Session9, None),
         KeyBinding::new("escape", CloseOverlay, Some("Overlay")),
         // Movement keys inside any Input, bound in the Input context AFTER
-        // gpui-component's own bindings so they match first. Whichever
-        // surface is active handles them (the line editor moves the edit
-        // across lines, the switcher moves its selection); anywhere else the
-        // handler propagates and the input's normal binding runs instead.
+        // gpui-component's own bindings so they match first. The switcher
+        // moves its selection; anywhere else the handler propagates and the
+        // input's normal binding runs instead.
         KeyBinding::new("up", InputUp, Some("Input")),
         KeyBinding::new("down", InputDown, Some("Input")),
-        KeyBinding::new("left", LineEditLeft, Some("Input")),
-        KeyBinding::new("right", LineEditRight, Some("Input")),
-        KeyBinding::new("backspace", LineEditBackspace, Some("Input")),
-        KeyBinding::new("delete", LineEditDelete, Some("Input")),
-        // The single-buffer note editor (dev-flagged): its own context so
-        // nothing here collides with the Input-context line-editor bindings.
+        // The single-buffer note editor: its own context so nothing here
+        // collides with the Input-context bindings.
         KeyBinding::new("enter", EditorEnter, Some("NoteEditor")),
         KeyBinding::new("backspace", EditorBackspace, Some("NoteEditor")),
         KeyBinding::new("delete", EditorDelete, Some("NoteEditor")),

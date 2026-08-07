@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -6,12 +5,11 @@ use std::time::Duration;
 use chrono::{Local, NaiveDate};
 use gpui::{
     Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, Render, SharedString, Styled, Task, TextLayout, Window, div, px,
+    ParentElement, Render, SharedString, Styled, Task, Window, div, px,
 };
 use gpui_component::Root;
 use kairn_core as notes;
 
-use crate::editing::LineEdit;
 use crate::overlays::Overlay;
 use crate::session::{Session, SessionKind, spawn};
 use crate::theme::{self, KairnThemeExt, Mode};
@@ -49,25 +47,16 @@ pub struct Workspace {
     sidebar_open: bool,
     /// The one open overlay (picker, switcher, or capture), if any.
     pub(crate) overlay: Option<Overlay>,
-    pub(crate) _autosave: Option<Task<()>>,
-    /// In-place edit of one line of the pane document: the only editing
+    /// The single-buffer editor over the pane's document: the only editing
     /// model. The Writing layout is a focused-width view of the same
-    /// line-rendered note, not a separate editor.
-    pub line_edit: Option<LineEdit>,
-    pub(crate) _line_edit_sub: Option<gpui::Subscription>,
-    /// The single-buffer editor for the pane's document (dev flag
-    /// `new_editor` in settings.json); replaces the line-edit model while
-    /// present.
+    /// editor, not a separate one. Absent when nothing here is editable
+    /// (task views, unreadable notes, missing root).
     pub(crate) note_editor: Option<gpui::Entity<crate::note_editor::NoteEditor>>,
     pub(crate) _note_editor_sub: Option<gpui::Subscription>,
-    /// A line edit whose target vanished from the file before it could be
-    /// saved: (file it was bound for, the user's text). Rendered as a banner
-    /// so typed text is never silently dropped.
+    /// Editor text whose merge target vanished or conflicted before it could
+    /// be saved: (file it was bound for, the user's text). Rendered as a
+    /// banner so typed text is never silently dropped.
     pub orphaned: Option<(PathBuf, String)>,
-    /// Text layout of each rendered note line from the latest render, for
-    /// mapping a click position to a character. Interior-mutable because it
-    /// is filled in while rendering.
-    pub line_layouts: RefCell<HashMap<usize, TextLayout>>,
     pub sessions: Vec<Session>,
     pub active_session: usize,
     next_session_id: u64,
@@ -75,15 +64,9 @@ pub struct Workspace {
     pub notes_root: PathBuf,
     pub selected_day: NaiveDate,
     pub view: PaneView,
-    /// Parsed document the pane is showing; `None` when no file exists.
-    pub doc_lines: Option<Vec<notes::Line>>,
-    /// The document as read from disk, line-aligned with `doc_lines`; toggles
-    /// pass the rendered line back so a file that changed underneath is never
-    /// clobbered.
+    /// The pane's document as read from disk (or the daily template for a
+    /// day with no file yet), seeded into the editor on each reload.
     pub(crate) doc_text: Option<String>,
-    /// The pane document is the daily template rendered for a day with no
-    /// file yet; the first mutation writes it to disk.
-    pub(crate) doc_seeded: bool,
     /// The file `doc_text` was read from (`.md` or NotePlan's `.txt`).
     pub(crate) doc_path: Option<PathBuf>,
     /// Lines elsewhere that link to the pane's document.
@@ -164,14 +147,11 @@ impl Workspace {
         let (notes_watcher, notes_watch_task) =
             Self::watch_notes(notes_root.clone(), self_writes.clone(), cx);
 
-        // Closing the window must not drop a pending edit, in either editor.
+        // Closing the window must not drop a pending edit.
         let flush = cx.weak_entity();
         window.on_window_should_close(cx, move |_, cx| {
             flush
-                .update(cx, |ws, cx| {
-                    ws.commit_line_edit(true, cx);
-                    ws.flush_note_editor(cx);
-                })
+                .update(cx, |ws, cx| ws.flush_note_editor(cx))
                 .ok();
             true
         });
@@ -183,13 +163,9 @@ impl Workspace {
             layout: LayoutMode::Split,
             sidebar_open: true,
             overlay: None,
-            _autosave: None,
-            line_edit: None,
-            _line_edit_sub: None,
             note_editor: None,
             _note_editor_sub: None,
             orphaned: None,
-            line_layouts: RefCell::new(HashMap::new()),
             sessions: Vec::new(),
             active_session: 0,
             next_session_id: 1,
@@ -197,9 +173,7 @@ impl Workspace {
             notes_root,
             selected_day: Local::now().date_naive(),
             view: PaneView::Day,
-            doc_lines: None,
             doc_text: None,
-            doc_seeded: false,
             doc_path: None,
             mentions: Vec::new(),
             conflicts: Vec::new(),
@@ -354,7 +328,7 @@ impl Workspace {
     }
 
     fn on_quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
-        self.commit_line_edit(true, cx);
+        self.flush_note_editor(cx);
         cx.quit();
     }
 

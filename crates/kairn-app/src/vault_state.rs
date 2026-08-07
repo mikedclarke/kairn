@@ -61,7 +61,6 @@ impl Workspace {
     }
 
     pub fn select_day(&mut self, day: NaiveDate, cx: &mut Context<Self>) {
-        self.commit_line_edit(true, cx);
         self.flush_note_editor(cx);
         self.selected_day = day;
         self.view = PaneView::Day;
@@ -71,7 +70,6 @@ impl Workspace {
     }
 
     pub fn open_note(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.commit_line_edit(true, cx);
         self.flush_note_editor(cx);
         self.view = PaneView::Note(path);
         self.show_note_pane();
@@ -80,7 +78,6 @@ impl Workspace {
     }
 
     pub fn open_task_view(&mut self, query: TaskQuery, cx: &mut Context<Self>) {
-        self.commit_line_edit(true, cx);
         self.flush_note_editor(cx);
         self.view = PaneView::Tasks(query);
         self.show_note_pane();
@@ -102,7 +99,7 @@ impl Workspace {
     fn sync_note_editor(&mut self, cx: &mut Context<Self>) {
         use crate::note_editor::{NoteEditor, NoteEditorEvent};
 
-        if !self.settings.new_editor || self.doc_error.is_some() || self.root_missing {
+        if self.doc_error.is_some() || self.root_missing {
             self.note_editor = None;
             self._note_editor_sub = None;
             return;
@@ -219,20 +216,16 @@ impl Workspace {
         // template (Notes/@Templates/Daily.md): rendered immediately, written
         // to disk only when the first edit lands. Past days stay blank — a
         // template there would dress up history that never happened.
-        self.doc_seeded = false;
         let text = if text.is_none()
             && matches!(self.view, PaneView::Day)
             && self.doc_error.is_none()
             && !self.root_missing
             && self.selected_day >= today
         {
-            let seed = notes::daily_template(&self.notes_root);
-            self.doc_seeded = seed.is_some();
-            seed
+            notes::daily_template(&self.notes_root)
         } else {
             text
         };
-        self.doc_lines = text.as_deref().map(notes::parse);
         self.doc_text = text;
         // Linked mentions for the pane's document: a day is referenced by its
         // ISO date ([[2026-08-07]] and >2026-08-07 alike), a note by its stem.
@@ -268,30 +261,8 @@ impl Workspace {
     /// brand-new note created wiki-style on first click. Creation never
     /// overwrites: if the file exists by the time we write, it is opened
     /// as-is (links arrive in synced files and race external writers).
-    pub fn open_wiki_link(&mut self, title: &str, window: &mut Window, cx: &mut Context<Self>) {
-        match notes::resolve_wiki_target(&self.notes_root, title) {
-            notes::WikiTarget::Day(date) => self.select_day(date, cx),
-            notes::WikiTarget::Note(path) => self.open_note(path, cx),
-            notes::WikiTarget::Missing(path) => {
-                match notes::create_note_if_absent(&path, &format!("# {title}\n")) {
-                    Ok(_) => {
-                        self.note_self_write(&path);
-                        self.open_note(path, cx)
-                    }
-                    Err(e) => {
-                        eprintln!("kairn: could not create {}: {e}", path.display());
-                        window.push_notification("Could not create the linked note, see stderr.", cx);
-                    }
-                }
-            }
-            notes::WikiTarget::Invalid => {
-                window.push_notification("That link can't name a note inside the notes folder.", cx);
-            }
-        }
-    }
-
-    /// [`Self::open_wiki_link`] for callers without a window (entity event
-    /// handlers): failures log to stderr instead of raising a notification.
+    /// Callers are entity event handlers without a window, so failures log
+    /// to stderr instead of raising a notification.
     pub fn open_wiki_link_quiet(&mut self, title: &str, cx: &mut Context<Self>) {
         match notes::resolve_wiki_target(&self.notes_root, title) {
             notes::WikiTarget::Day(date) => self.select_day(date, cx),
@@ -319,82 +290,41 @@ impl Workspace {
         }
     }
 
-    /// A day rendered from the template exists only in memory until the
-    /// first mutation: write the seeded content now so line edits, toggles,
-    /// and moves land in a real file. Never overwrites — if the file
-    /// appeared meanwhile (sync, an agent), the per-line verification of
-    /// whatever edit follows sorts out any mismatch.
-    pub(crate) fn materialize_seed(&mut self) {
-        if !self.doc_seeded {
-            return;
-        }
-        self.doc_seeded = false;
-        if !matches!(self.view, PaneView::Day) {
-            return;
-        }
-        let Some(text) = &self.doc_text else { return };
-        let path = notes::daily_path(&self.notes_root, self.selected_day);
-        match notes::create_note_if_absent(&path, text) {
-            Ok(_) => {
-                self.note_self_write(&path);
-                self.doc_path = Some(path);
-            }
-            Err(e) => eprintln!("kairn: could not create {}: {e}", path.display()),
-        }
-    }
-
-    /// Move a dragged line so it sits before `before_idx`, writing the
-    /// reorder back to the file.
-    pub fn drop_line(&mut self, from_idx: usize, from_line: &str, before_idx: usize, cx: &mut Context<Self>) {
-        self.commit_line_edit(true, cx);
-        self.materialize_seed();
-        let Some(path) = self.doc_path.clone() else {
-            return;
-        };
-        match notes::move_line_on_disk(&path, from_idx, from_line, before_idx) {
-            Ok(Some(_)) => self.note_self_write(&path),
-            // The line changed on disk since render; the reload below picks
-            // up whatever is there now.
-            Ok(None) => {}
-            Err(e) => eprintln!("kairn: could not update {}: {e}", path.display()),
-        }
-        self.reload_notes(cx);
-        cx.notify();
-    }
-
-    /// Toggle the task on line `line_idx` of the pane's document between open
-    /// and done, writing the change back to the file.
-    pub fn toggle_task(&mut self, line_idx: usize, cx: &mut Context<Self>) {
-        self.commit_line_edit(true, cx);
-        self.materialize_seed();
-        let (Some(path), Some(text)) = (&self.doc_path, &self.doc_text) else {
-            return;
-        };
-        let path = path.clone();
-        let Some(expected) = text.lines().nth(line_idx) else {
-            return;
-        };
-        match notes::toggle_task_on_disk(&path, line_idx, expected) {
-            Ok(true) => self.note_self_write(&path),
-            // The line changed on disk since render; the reload below picks
-            // up whatever is there now.
-            Ok(false) => {}
-            Err(e) => eprintln!("kairn: could not update {}: {e}", path.display()),
-        }
-        self.reload_notes(cx);
-        cx.notify();
-    }
-
     /// Toggle a task from a task view, addressed at whichever daily note it
     /// was scanned from.
     pub fn toggle_task_ref(&mut self, task: &notes::TaskRef, cx: &mut Context<Self>) {
-        self.commit_line_edit(true, cx);
         match notes::toggle_task_on_disk(&task.path, task.line_idx, &task.line) {
             Ok(true) => self.note_self_write(&task.path),
             Ok(false) => {}
             Err(e) => eprintln!("kairn: could not update {}: {e}", task.path.display()),
         }
         self.reload_notes(cx);
+        cx.notify();
+    }
+
+    /// Flush pending editor changes now instead of waiting for the autosave.
+    pub(crate) fn on_save_note(
+        &mut self,
+        _: &crate::keymap::SaveNote,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.flush_note_editor(cx);
+    }
+
+    /// Dismiss the orphaned-line banner, optionally appending its text to
+    /// the note it was bound for so nothing typed is lost.
+    pub fn resolve_orphan(&mut self, append: bool, cx: &mut Context<Self>) {
+        let Some((path, text)) = self.orphaned.take() else { return };
+        if append {
+            if let Err(e) = notes::append_line(&path, &text) {
+                eprintln!("kairn: could not save {}: {e}", path.display());
+                self.orphaned = Some((path, text));
+                return;
+            }
+            self.note_self_write(&path);
+            self.reload_notes(cx);
+        }
         cx.notify();
     }
 
