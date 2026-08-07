@@ -59,13 +59,43 @@ pub struct DayText {
     pub text: std::sync::Arc<str>,
 }
 
-/// Daily-note text carried across reloads, invalidated per file by
-/// modification time and length: a reload stats every daily but re-reads
-/// only the files that actually changed. On a real NotePlan archive that
-/// turns hundreds of reads per click into a handful.
+/// Note text carried across reloads, invalidated per file by modification
+/// time and length: a reload stats every file but re-reads only the ones
+/// that actually changed. On a real NotePlan archive that turns hundreds
+/// of reads per click into a handful. One instance per file population
+/// (dailies, non-daily notes) so eviction stays a simple retain.
 #[derive(Default)]
-pub struct DailyCache {
+pub struct TextCache {
     map: HashMap<PathBuf, (std::time::SystemTime, u64, std::sync::Arc<str>)>,
+}
+
+impl TextCache {
+    /// The file's text, from cache when its mtime and length are unchanged.
+    /// `None` when the file can't be statted or read (vanished, unreadable).
+    fn read(&mut self, path: &Path) -> Option<std::sync::Arc<str>> {
+        let meta = fs::metadata(path).ok()?;
+        let (mtime, len) = (meta.modified().ok()?, meta.len());
+        match self.map.get(path) {
+            Some((m, l, text)) if *m == mtime && *l == len => Some(text.clone()),
+            _ => {
+                let text: std::sync::Arc<str> = fs::read_to_string(path).ok()?.into();
+                self.map
+                    .insert(path.to_path_buf(), (mtime, len, text.clone()));
+                Some(text)
+            }
+        }
+    }
+
+    /// Drop entries for files no longer in the live set.
+    fn retain_live(&mut self, live: &HashSet<&PathBuf>) {
+        self.map.retain(|path, _| live.contains(path));
+    }
+}
+
+/// A non-daily note read into memory for the task scan.
+pub struct NoteText {
+    pub path: PathBuf,
+    pub text: std::sync::Arc<str>,
 }
 
 impl VaultScan {
@@ -108,37 +138,46 @@ impl VaultScan {
 
     /// Every daily note read once, newest day first.
     pub fn read_dailies(&self) -> Vec<DayText> {
-        self.read_dailies_cached(&mut DailyCache::default())
+        self.read_dailies_cached(&mut TextCache::default())
     }
 
     /// [`Self::read_dailies`] through a cache that persists across reloads:
     /// unchanged files (same mtime and length) reuse their text, changed or
     /// new files are re-read, vanished files fall out of the cache.
-    pub fn read_dailies_cached(&self, cache: &mut DailyCache) -> Vec<DayText> {
+    pub fn read_dailies_cached(&self, cache: &mut TextCache) -> Vec<DayText> {
         let mut days: Vec<(&NaiveDate, &PathBuf)> = self.days.iter().collect();
         days.sort_unstable_by(|a, b| b.0.cmp(a.0));
         let dailies: Vec<DayText> = days
             .into_iter()
             .filter_map(|(date, path)| {
-                let meta = fs::metadata(path).ok()?;
-                let (mtime, len) = (meta.modified().ok()?, meta.len());
-                let text = match cache.map.get(path) {
-                    Some((m, l, text)) if *m == mtime && *l == len => text.clone(),
-                    _ => {
-                        let text: std::sync::Arc<str> =
-                            fs::read_to_string(path).ok()?.into();
-                        cache
-                            .map
-                            .insert(path.clone(), (mtime, len, text.clone()));
-                        text
-                    }
-                };
+                let text = cache.read(path)?;
                 Some(DayText { date: *date, path: path.clone(), text })
             })
             .collect();
-        let live: std::collections::HashSet<&PathBuf> = self.days.values().collect();
-        cache.map.retain(|path, _| live.contains(path));
+        let live: HashSet<&PathBuf> = self.days.values().collect();
+        cache.retain_live(&live);
         dailies
+    }
+
+    /// Every non-daily note (period notes and `Notes/` files) read once,
+    /// through a persistent cache like [`Self::read_dailies_cached`]. Feeds
+    /// the task scan; keep it on its own cache instance, not the dailies'.
+    pub fn read_notes_cached(&self, cache: &mut TextCache) -> Vec<NoteText> {
+        let paths = self
+            .periods
+            .iter()
+            .map(|(_, p)| p)
+            .chain(self.notes.iter().map(|(_, p)| p));
+        let notes: Vec<NoteText> = paths
+            .clone()
+            .filter_map(|path| {
+                let text = cache.read(path)?;
+                Some(NoteText { path: path.clone(), text })
+            })
+            .collect();
+        let live: HashSet<&PathBuf> = paths.collect();
+        cache.retain_live(&live);
+        notes
     }
 }
 
@@ -498,7 +537,7 @@ mod tests {
         let a = root.write("Calendar/20260805.md", "* task a\n");
         let b = root.write("Calendar/20260806.md", "* task b\n");
 
-        let mut cache = DailyCache::default();
+        let mut cache = TextCache::default();
         let dailies = VaultScan::new(&root.0).read_dailies_cached(&mut cache);
         assert_eq!(dailies.len(), 2);
         assert_eq!(cache.map.len(), 2);

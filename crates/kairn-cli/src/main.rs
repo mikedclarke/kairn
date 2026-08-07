@@ -9,7 +9,7 @@ use chrono::{Duration, Local, NaiveDate};
 use clap::{ArgAction, Parser, Subcommand};
 use kairn_core::{
     ActivityEntry, Mention, SearchHit, TaskQuery, TaskRef, WikiTarget, daily_file,
-    fuzzy_score, log_activity, mentions_of, open_tasks_in_dailies, resolve_wiki_target,
+    fuzzy_score, log_activity, mentions_of, open_tasks_in_vault, resolve_wiki_target,
     search_notes, settings::Settings, toggle_task_on_disk, vault, write,
 };
 use serde_json::json;
@@ -95,16 +95,18 @@ note. Exit 3 with suggestions when nothing has that title.")]
         path: bool,
     },
 
-    /// List open tasks from the daily notes
+    /// List open tasks, by due date
     #[command(long_about = "\
-List open tasks across every daily note, newest day first, one per line
-as `DATE  TEXT`. A task's date is the daily note it lives in. Done,
+List open tasks across the whole notes folder, newest due date first, one
+per line as `DUE-DATE  TEXT`. A `>2026-08-12` token on the line means the
+task is due that day; a daily-note task without one is due on its note's
+day. Tasks in other notes appear when they carry a `>date` token. Done,
 scheduled ([>]), and cancelled ([-]) tasks never appear.")]
     Tasks {
-        /// Only tasks on today's note
+        /// Only tasks due today
         #[arg(long, action = ArgAction::SetTrue, conflicts_with = "overdue")]
         today: bool,
-        /// Only tasks on notes from days before today
+        /// Only tasks due before today
         #[arg(long, action = ArgAction::SetTrue)]
         overdue: bool,
     },
@@ -366,7 +368,7 @@ fn cmd_note(root: &Path, title: &str, path_only: bool, json: bool) -> Result<(),
 
 fn task_json(root: &Path, task: &TaskRef) -> serde_json::Value {
     json!({
-        "date": task.date.format("%Y-%m-%d").to_string(),
+        "due": task.due.format("%Y-%m-%d").to_string(),
         "file": rel(root, &task.path),
         "line": task.line_idx + 1,
         "text": task_text(&task.line),
@@ -375,9 +377,9 @@ fn task_json(root: &Path, task: &TaskRef) -> serde_json::Value {
 
 fn cmd_tasks(root: &Path, query: TaskQuery, json: bool) -> Result<(), Failure> {
     let today = Local::now().date_naive();
-    let tasks: Vec<TaskRef> = open_tasks_in_dailies(root)
+    let tasks: Vec<TaskRef> = open_tasks_in_vault(root)
         .into_iter()
-        .filter(|t| query.matches(t.date, today))
+        .filter(|t| query.matches(t.due, today))
         .collect();
     if json {
         let body = json!({
@@ -387,7 +389,7 @@ fn cmd_tasks(root: &Path, query: TaskQuery, json: bool) -> Result<(), Failure> {
         println!("{body}");
     } else {
         for task in &tasks {
-            println!("{}  {}", task.date.format("%Y-%m-%d"), task_text(&task.line));
+            println!("{}  {}", task.due.format("%Y-%m-%d"), task_text(&task.line));
         }
         if tasks.is_empty() {
             eprintln!("kairn: no matching open tasks");
@@ -430,7 +432,7 @@ fn cmd_done(root: &Path, needle: &str, actor: &str, json: bool) -> Result<(), Fa
     if needle_trim.is_empty() {
         return Err(Failure::new(2, "give some words from the task's text"));
     }
-    let tasks = open_tasks_in_dailies(root);
+    let tasks = open_tasks_in_vault(root);
     let lower = needle_trim.to_lowercase();
     let matches: Vec<&TaskRef> = tasks
         .iter()
@@ -463,7 +465,7 @@ fn cmd_done(root: &Path, needle: &str, actor: &str, json: bool) -> Result<(), Fa
         several => {
             let listed: Vec<String> = several
                 .iter()
-                .map(|t| format!("  {}  {}", t.date.format("%Y-%m-%d"), task_text(&t.line)))
+                .map(|t| format!("  {}  {}", t.due.format("%Y-%m-%d"), task_text(&t.line)))
                 .collect();
             return Err(Failure::new(
                 EXIT_AMBIGUOUS,
@@ -491,7 +493,7 @@ fn cmd_done(root: &Path, needle: &str, actor: &str, json: bool) -> Result<(), Fa
     log_write(root, actor, "done", &task.path, text);
     if json {
         let body = json!({
-            "date": task.date.format("%Y-%m-%d").to_string(),
+            "due": task.due.format("%Y-%m-%d").to_string(),
             "file": rel(root, &task.path),
             "text": text,
         });

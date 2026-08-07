@@ -160,7 +160,7 @@ impl Workspace {
 
     pub fn tasks_for(&self, query: TaskQuery) -> impl Iterator<Item = &notes::TaskRef> {
         let today = Local::now().date_naive();
-        self.open_tasks.iter().filter(move |t| query.matches(t.date, today))
+        self.open_tasks.iter().filter(move |t| query.matches(t.due, today))
     }
 
     /// Open-task count for a view, computed once per reload rather than
@@ -184,18 +184,19 @@ impl Workspace {
         let scan = notes::VaultScan::new(&self.notes_root);
         let dailies = scan.read_dailies_cached(&mut self.daily_cache);
         self.dailies_skipped = scan.days.len() - dailies.len();
-        self.open_tasks = notes::open_tasks_in(&dailies);
+        let note_texts = scan.read_notes_cached(&mut self.note_cache);
+        self.open_tasks = notes::open_tasks_in(&dailies, &note_texts);
         self.notes_tree = notes::notes_tree(&self.notes_root, &self.notes_expanded);
         self.agent_activity = notes::recent_activity(&self.notes_root, 6);
         let today = Local::now().date_naive();
         self.task_counts = [TaskQuery::Today, TaskQuery::Open, TaskQuery::Overdue].map(|q| {
-            self.open_tasks.iter().filter(|t| q.matches(t.date, today)).count()
+            self.open_tasks.iter().filter(|t| q.matches(t.due, today)).count()
         });
         let monday = self.selected_day
             - Days::new(self.selected_day.weekday().num_days_from_monday() as u64);
         for (i, count) in self.week_open_counts.iter_mut().enumerate() {
             let day = monday + Days::new(i as u64);
-            *count = self.open_tasks.iter().filter(|t| t.date == day).count();
+            *count = self.open_tasks.iter().filter(|t| t.due == day).count();
         }
         let path = match &self.view {
             PaneView::Day => scan.days.get(&self.selected_day).cloned(),

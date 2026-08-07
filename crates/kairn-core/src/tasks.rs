@@ -6,14 +6,19 @@ use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
 
-use crate::parse::{Line, Span, TaskState, bracket_state, parse_line};
-use crate::vault::{DayText, VaultScan};
+use crate::parse::{Line, Span, SpanKind, TaskState, bracket_state, parse_line};
+use crate::vault::{DayText, NoteText, VaultScan};
 
-/// One open task found in a daily note, addressable for toggling.
+/// One open task found in a note, addressable for toggling.
 #[derive(Clone, Debug)]
 pub struct TaskRef {
     pub path: PathBuf,
-    pub date: NaiveDate,
+    /// When the task is due: its `>date` token, or for a daily-note task
+    /// without one, the daily's own date (NotePlan semantics).
+    pub due: NaiveDate,
+    /// The daily note's date when the task lives in one; `None` for tasks
+    /// from regular or period notes, whose home is a note, not a day.
+    pub file_date: Option<NaiveDate>,
     pub line_idx: usize,
     /// The raw line, passed back on toggle so a file that changed since the
     /// scan is never clobbered.
@@ -21,21 +26,39 @@ pub struct TaskRef {
     pub spans: Vec<Span>,
 }
 
-/// Every open task across the daily notes, newest day first.
-pub fn open_tasks_in_dailies(root: &Path) -> Vec<TaskRef> {
-    open_tasks_in(&VaultScan::new(root).read_dailies())
+/// The line's first `>YYYY-MM-DD` token as a date.
+pub fn due_token(spans: &[Span]) -> Option<NaiveDate> {
+    spans.iter().find_map(|(kind, s)| {
+        if *kind != SpanKind::DateRef {
+            return None;
+        }
+        NaiveDate::parse_from_str(s.strip_prefix('>')?, "%Y-%m-%d").ok()
+    })
 }
 
-/// [`open_tasks_in_dailies`] over dailies already read into memory, so one
-/// read of each file serves both this and the mention scan.
-pub fn open_tasks_in(dailies: &[DayText]) -> Vec<TaskRef> {
+/// Every open task across the whole vault: the daily notes, plus dated
+/// (`>date`) tasks from period and regular notes. Newest due date first.
+pub fn open_tasks_in_vault(root: &Path) -> Vec<TaskRef> {
+    let scan = VaultScan::new(root);
+    let dailies = scan.read_dailies();
+    let notes = scan.read_notes_cached(&mut Default::default());
+    open_tasks_in(&dailies, &notes)
+}
+
+/// [`open_tasks_in_vault`] over files already read into memory, so one read
+/// of each serves this and the mention scan. Daily tasks fall back to the
+/// daily's date when they carry no `>date` token; tasks in other notes join
+/// the list only when dated, so a reference note full of bullet-style task
+/// lines doesn't swamp the Open view with undated noise.
+pub fn open_tasks_in(dailies: &[DayText], notes: &[NoteText]) -> Vec<TaskRef> {
     let mut tasks = Vec::new();
     for day in dailies {
         for (line_idx, raw) in day.text.lines().enumerate() {
             if let Line::Task { state: TaskState::Open, spans } = parse_line(raw) {
                 tasks.push(TaskRef {
                     path: day.path.clone(),
-                    date: day.date,
+                    due: due_token(&spans).unwrap_or(day.date),
+                    file_date: Some(day.date),
                     line_idx,
                     line: raw.to_string(),
                     spans,
@@ -43,11 +66,28 @@ pub fn open_tasks_in(dailies: &[DayText]) -> Vec<TaskRef> {
             }
         }
     }
+    for note in notes {
+        for (line_idx, raw) in note.text.lines().enumerate() {
+            if let Line::Task { state: TaskState::Open, spans } = parse_line(raw)
+                && let Some(due) = due_token(&spans)
+            {
+                tasks.push(TaskRef {
+                    path: note.path.clone(),
+                    due,
+                    file_date: None,
+                    line_idx,
+                    line: raw.to_string(),
+                    spans,
+                });
+            }
+        }
+    }
+    tasks.sort_by(|a, b| b.due.cmp(&a.due).then_with(|| a.path.cmp(&b.path)));
     tasks
 }
 
 /// The filters the task views (and the CLI's `task list`) run over the open
-/// tasks. A task's date is the daily note it lives in.
+/// tasks, by due date.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TaskQuery {
     Today,
@@ -104,6 +144,40 @@ pub fn toggle_task_line(line: &str, now: &str) -> Option<String> {
     }
 }
 
+/// Set an open task line's due date: the first `>YYYY-MM-DD` token is
+/// rewritten in place, and a line with none gains ` >date` at the end
+/// (before trailing whitespace, which is content: markdown hard breaks).
+/// Only open tasks reschedule; anything else returns `None` untouched.
+pub fn reschedule_task_line(line: &str, due: NaiveDate) -> Option<String> {
+    let Line::Task { state: TaskState::Open, spans } = parse_line(line) else {
+        return None;
+    };
+    let token = format!(">{}", due.format("%Y-%m-%d"));
+    // Locate the first ISO date token by walking the spans, which cover
+    // the raw line from the content start byte for byte; replacing by
+    // offset can't hit a lookalike substring inside earlier plain text.
+    let mut offset = crate::parse::spans_start_col(line);
+    for (kind, s) in &spans {
+        if *kind == SpanKind::DateRef
+            && s.strip_prefix('>')
+                .is_some_and(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").is_ok())
+        {
+            if line[offset..offset + s.len()] == token[..] {
+                return None; // already due that day; nothing to write
+            }
+            let mut out = String::with_capacity(line.len() + 4);
+            out.push_str(&line[..offset]);
+            out.push_str(&token);
+            out.push_str(&line[offset + s.len()..]);
+            return Some(out);
+        }
+        offset += s.len();
+    }
+    let trimmed = line.trim_end();
+    let trailing = &line[trimmed.len()..];
+    Some(format!("{trimmed} {token}{trailing}"))
+}
+
 /// A `[c]`-shaped prefix whose state character isn't one Kairn knows
 /// (`[!]`, `[?]`…). Such lines render as-is and must not toggle: wrapping
 /// the whole body in a fresh bracket would corrupt them.
@@ -131,6 +205,92 @@ fn strip_trailing_done_stamp(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ScratchRoot;
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).expect("valid date")
+    }
+
+    #[test]
+    fn due_dates_from_tokens_and_file_dates() {
+        let root = ScratchRoot::new("due");
+        root.write(
+            "Calendar/20260805.md",
+            "* plain task\n* dated >2026-08-20\n* punctuated >2026-08-21.\n",
+        );
+        root.write(
+            "Notes/Project.md",
+            "* dated in note >2026-08-19\n* undated in note\n+ [ ] checklist >2026-08-18\n",
+        );
+
+        let tasks = open_tasks_in_vault(&root.0);
+        let due_of = |needle: &str| {
+            tasks
+                .iter()
+                .find(|t| t.line.contains(needle))
+                .map(|t| (t.due, t.file_date))
+        };
+        // Daily fallback: no token means due on the note's day.
+        assert_eq!(due_of("plain"), Some((d(2026, 8, 5), Some(d(2026, 8, 5)))));
+        // A token overrides the daily's date.
+        assert_eq!(due_of("dated >"), Some((d(2026, 8, 20), Some(d(2026, 8, 5)))));
+        // Trailing punctuation doesn't break the token.
+        assert_eq!(due_of("punctuated"), Some((d(2026, 8, 21), Some(d(2026, 8, 5)))));
+        // Note tasks join only when dated; the undated one stays out.
+        assert_eq!(due_of("dated in note"), Some((d(2026, 8, 19), None)));
+        assert_eq!(due_of("checklist"), Some((d(2026, 8, 18), None)));
+        assert_eq!(due_of("undated in note"), None);
+        assert_eq!(tasks.len(), 5);
+        // Newest due first.
+        let dues: Vec<NaiveDate> = tasks.iter().map(|t| t.due).collect();
+        let mut sorted = dues.clone();
+        sorted.sort_by(|a, b| b.cmp(a));
+        assert_eq!(dues, sorted);
+    }
+
+    #[test]
+    fn query_predicates_use_due_dates() {
+        let today = d(2026, 8, 7);
+        assert!(TaskQuery::Today.matches(today, today));
+        assert!(!TaskQuery::Today.matches(d(2026, 8, 8), today));
+        assert!(TaskQuery::Overdue.matches(d(2026, 8, 6), today));
+        assert!(!TaskQuery::Overdue.matches(today, today));
+        assert!(TaskQuery::Open.matches(d(2027, 1, 1), today));
+    }
+
+    #[test]
+    fn reschedule_rewrites_or_appends_the_token() {
+        let due = d(2026, 8, 20);
+        // No token: appended at the end, trailing spaces preserved after it.
+        assert_eq!(
+            reschedule_task_line("* call bank", due).as_deref(),
+            Some("* call bank >2026-08-20")
+        );
+        assert_eq!(
+            reschedule_task_line("- [ ] call bank  ", due).as_deref(),
+            Some("- [ ] call bank >2026-08-20  ")
+        );
+        // Existing token rewritten in place, position and punctuation kept.
+        assert_eq!(
+            reschedule_task_line("* pay >2026-08-09 then file", due).as_deref(),
+            Some("* pay >2026-08-20 then file")
+        );
+        assert_eq!(
+            reschedule_task_line("* pay >2026-08-09.", due).as_deref(),
+            Some("* pay >2026-08-20.")
+        );
+        // A wiki link containing a date-shaped substring is not the token.
+        assert_eq!(
+            reschedule_task_line("* see [[log >2026-08-09]] >2026-08-10", due).as_deref(),
+            Some("* see [[log >2026-08-09]] >2026-08-20")
+        );
+        // Already due that day: nothing to write.
+        assert_eq!(reschedule_task_line("* pay >2026-08-20", due), None);
+        // Only open tasks reschedule.
+        assert_eq!(reschedule_task_line("* [x] shipped @done(x)", due), None);
+        assert_eq!(reschedule_task_line("- just a bullet", due), None);
+        assert_eq!(reschedule_task_line("plain text", due), None);
+    }
 
     #[test]
     fn toggle_line_styles() {

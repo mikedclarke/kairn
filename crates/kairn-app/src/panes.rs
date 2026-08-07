@@ -249,7 +249,7 @@ impl Workspace {
                 };
                 // Open tasks from earlier days are still carried into this
                 // one; the count keeps the masthead honest about the load.
-                let carried = self.open_tasks.iter().filter(|task| task.date < date).count();
+                let carried = self.open_tasks.iter().filter(|task| task.due < date).count();
                 if carried > 0 {
                     subline.push_str(&format!(" · {carried} carried over"));
                 }
@@ -466,8 +466,23 @@ impl Workspace {
         let sel = t.sel;
         let dim = t.dim;
         for (i, task) in self.tasks_for(query).enumerate() {
-            let date = task.date;
-            let date_label = format!("{} {}", date.format("%-d"), date.format("%b"));
+            let due = task.due;
+            let date_label = format!("{} {}", due.format("%-d"), due.format("%b"));
+            // A task from a regular note names its home and opens that
+            // note on click; a daily task opens its day.
+            let source_note = task
+                .file_date
+                .is_none()
+                .then(|| task.path.clone())
+                .map(|path| {
+                    let stem = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    (path, stem)
+                });
+            let nav_note = source_note.as_ref().map(|(path, _)| path.clone());
             let spans = spans_el(t, &task.spans, t.text);
             let task = task.clone();
             let checkbox = div()
@@ -496,10 +511,22 @@ impl Workspace {
                     .cursor_pointer()
                     .hover(move |s| s.bg(sel))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_day(date, cx);
+                        match &nav_note {
+                            Some(path) => this.open_note(path.clone(), cx),
+                            None => this.select_day(due, cx),
+                        }
                     }))
                     .child(checkbox)
                     .child(div().flex_1().min_w(px(0.)).child(spans))
+                    .when_some(source_note, |d, (_, stem)| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(11.))
+                                .text_color(t.faint)
+                                .child(stem),
+                        )
+                    })
                     .child(
                         div()
                             .flex_none()

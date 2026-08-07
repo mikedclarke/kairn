@@ -329,6 +329,26 @@ pub fn move_line_on_disk(
     Ok(Some(target))
 }
 
+/// Set the due date of the open task at `line_idx`, rewriting (or adding)
+/// its `>date` token. Same relocation and staleness contract as
+/// [`toggle_task_on_disk`]; atomic write. Returns whether a change was
+/// applied — `false` also covers the task already being due that day.
+pub fn reschedule_task_on_disk(
+    path: &Path,
+    line_idx: usize,
+    expected: &str,
+    due: NaiveDate,
+) -> io::Result<bool> {
+    let text = fs::read_to_string(path)?;
+    let Some((new_text, _)) = edit_line_in_text(&text, line_idx, expected, |line| {
+        crate::tasks::reschedule_task_line(line, due)
+    }) else {
+        return Ok(false);
+    };
+    atomic_write(path, &new_text)?;
+    Ok(true)
+}
+
 /// Toggle a task in a note on disk. The file is re-read fresh so a change made
 /// since it was rendered is never clobbered: the single-line edit is re-applied
 /// against current content, and if the line no longer exists nothing is
@@ -371,6 +391,24 @@ mod tests {
             toggle_task_in_text("* one", 0, "* one", now).as_deref(),
             Some("* [x] one @done(2026-08-06 21:30)")
         );
+    }
+
+    #[test]
+    fn reschedule_on_disk_relocates_and_verifies() {
+        let root = ScratchRoot::new("resched");
+        let path = root.write("Calendar/20260805.md", "# Day\n* pay >2026-08-09\n* other\n");
+        let due = chrono::NaiveDate::from_ymd_opt(2026, 8, 20).expect("valid");
+
+        // Line moved since render: relocated by content and rewritten.
+        assert!(reschedule_task_on_disk(&path, 3, "* pay >2026-08-09", due).expect("io"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "# Day\n* pay >2026-08-20\n* other\n"
+        );
+        // The expected line is gone: nothing is written.
+        assert!(!reschedule_task_on_disk(&path, 1, "* pay >2026-08-09", due).expect("io"));
+        // Already due that day: reported as no change.
+        assert!(!reschedule_task_on_disk(&path, 1, "* pay >2026-08-20", due).expect("io"));
     }
 
     #[test]
