@@ -14,7 +14,7 @@ use gpui_component::resizable::{h_resizable, resizable_panel};
 use crate::notes::{self, Line, Span, SpanKind, TaskState};
 use crate::theme::{self, KairnTheme};
 use crate::workspace::{
-    LayoutMode, LineEditDown, LineEditUp, PaneView, TaskQuery, Workspace, chord, kbd, mod_symbol,
+    InputDown, InputUp, LayoutMode, PaneView, TaskQuery, Workspace, chord, kbd, mod_symbol,
 };
 
 /// Per-render stash of each note line's text layout, for click hit-testing.
@@ -309,10 +309,10 @@ impl Workspace {
         };
         div()
             .py(px(1.))
-            .on_action(cx.listener(|this, _: &LineEditUp, window, cx| {
+            .on_action(cx.listener(|this, _: &InputUp, window, cx| {
                 this.line_edit_vertical(-1, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &LineEditDown, window, cx| {
+            .on_action(cx.listener(|this, _: &InputDown, window, cx| {
                 this.line_edit_vertical(1, window, cx);
             }))
             .on_action(cx.listener(Self::on_line_edit_left))

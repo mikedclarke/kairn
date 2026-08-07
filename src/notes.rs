@@ -377,6 +377,46 @@ pub fn mentions_of(root: &Path, title: &str, exclude: Option<&Path>) -> Vec<Ment
     out
 }
 
+/// Score `needle` against `haystack` as a case-insensitive subsequence,
+/// quick-switcher style: `None` when the characters don't all appear in
+/// order, otherwise higher is better. Consecutive runs and matches at word
+/// starts score up; skipped characters and longer targets score down, so
+/// `kprd` ranks `kairn-prd` above a scattered match.
+pub fn fuzzy_score(needle: &str, haystack: &str) -> Option<i64> {
+    let n: Vec<char> = needle.to_lowercase().chars().collect();
+    let h: Vec<char> = haystack.to_lowercase().chars().collect();
+    if n.is_empty() {
+        return Some(0);
+    }
+    let mut score = 0i64;
+    let mut hi = 0usize;
+    let mut prev_match: Option<usize> = None;
+    for &nc in &n {
+        let start = hi;
+        while hi < h.len() && h[hi] != nc {
+            hi += 1;
+        }
+        if hi >= h.len() {
+            return None;
+        }
+        let consecutive = prev_match.is_some_and(|p| p + 1 == hi);
+        let word_start =
+            hi == 0 || matches!(h[hi - 1], ' ' | '-' | '_' | '/' | '.' | '(' | '[');
+        score += 4;
+        if consecutive {
+            score += 6;
+        }
+        if word_start {
+            score += 8;
+        }
+        score -= (hi - start).min(4) as i64;
+        prev_match = Some(hi);
+        hi += 1;
+    }
+    score -= (h.len() as i64 - n.len() as i64) / 4;
+    Some(score)
+}
+
 /// One switcher search result.
 #[derive(Clone, Debug)]
 pub struct SearchHit {
@@ -388,29 +428,34 @@ pub struct SearchHit {
     pub snippet: Option<String>,
 }
 
-/// Case-insensitive substring search over every note: title matches first
-/// (notes in tree order), then one body match per file (dailies newest
-/// first, then notes), capped at `limit`.
+/// Search over every note: fuzzy title matches first, best score wins
+/// (ties by name), then one plain-substring body match per file (dailies
+/// newest first, then notes), capped at `limit`.
 pub fn search_notes(root: &Path, query: &str, limit: usize) -> Vec<SearchHit> {
-    let q = query.trim().to_lowercase();
+    let trimmed = query.trim();
+    let q = trimmed.to_lowercase();
     if q.is_empty() {
         return Vec::new();
     }
     let files = notes_files(root);
-    let mut out: Vec<SearchHit> = Vec::new();
-    for (_, path) in &files {
-        if out.len() >= limit {
-            return out;
-        }
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-        if stem.to_lowercase().contains(&q) {
-            out.push(SearchHit {
+    let mut titled: Vec<(i64, SearchHit)> = files
+        .iter()
+        .filter_map(|(_, path)| {
+            let stem = path.file_stem().and_then(|s| s.to_str())?;
+            let score = fuzzy_score(trimmed, stem)?;
+            Some((score, SearchHit {
                 path: path.clone(),
                 date: None,
                 name: stem.to_string(),
                 snippet: None,
-            });
-        }
+            }))
+        })
+        .collect();
+    titled.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    let mut out: Vec<SearchHit> =
+        titled.into_iter().take(limit).map(|(_, hit)| hit).collect();
+    if out.len() >= limit {
+        return out;
     }
     let mut days: Vec<NaiveDate> = days_with_notes(root).into_iter().collect();
     days.sort_unstable_by(|a, b| b.cmp(a));
@@ -1192,6 +1237,37 @@ mod tests {
         // The note itself is excluded.
         root.write("Notes/Plan.md", "# Plan\nself link [[plan]]\n");
         assert_eq!(mentions_of(&root.0, "Plan", Some(&plan)).len(), 2);
+    }
+
+    #[test]
+    fn fuzzy_scoring() {
+        // In-order subsequences match, missing or out-of-order chars don't.
+        assert!(fuzzy_score("kprd", "kairn-prd").is_some());
+        assert_eq!(fuzzy_score("kprdx", "kairn-prd"), None);
+        assert_eq!(fuzzy_score("drp", "kairn-prd"), None);
+        // Case-insensitive.
+        assert!(fuzzy_score("ALPHA", "Alpha project").is_some());
+        // A consecutive run outranks the same chars scattered mid-word.
+        let tight = fuzzy_score("plan", "planning").expect("matches");
+        let scattered = fuzzy_score("plan", "pxlxaxnx").expect("matches");
+        assert!(tight > scattered);
+        // Word-start matches outrank mid-word ones.
+        let word_start = fuzzy_score("kp", "kairn prd").expect("matches");
+        let mid_word = fuzzy_score("kp", "akkkp").expect("matches");
+        assert!(word_start > mid_word);
+    }
+
+    #[test]
+    fn search_ranks_fuzzy_titles() {
+        let root = ScratchRoot::new("fuzzy");
+        root.write("Notes/kairn-prd.md", "spec\n");
+        root.write("Notes/kitchen plans and records.md", "stuff\n");
+
+        // Both titles contain k,p,r,d in order; the tight match ranks first.
+        let hits = search_notes(&root.0, "kprd", 10);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].name, "kairn-prd");
+        assert_eq!(hits[1].name, "kitchen plans and records");
     }
 
     #[test]

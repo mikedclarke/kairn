@@ -35,8 +35,8 @@ actions!(
         SaveNote,
         NewLocalSession,
         Quit,
-        LineEditUp,
-        LineEditDown,
+        InputUp,
+        InputDown,
         LineEditLeft,
         LineEditRight,
         LineEditBackspace,
@@ -91,12 +91,13 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(&p("8"), Session8, None),
         KeyBinding::new(&p("9"), Session9, None),
         KeyBinding::new("escape", CloseOverlay, Some("Overlay")),
-        // Cross-line movement for the in-place line editor. Bound in the
-        // Input context AFTER gpui-component's own bindings so they match
-        // first; anywhere but a line edit (or away from a line boundary) the
+        // Movement keys inside any Input, bound in the Input context AFTER
+        // gpui-component's own bindings so they match first. Whichever
+        // surface is active handles them (the line editor moves the edit
+        // across lines, the switcher moves its selection); anywhere else the
         // handler propagates and the input's normal binding runs instead.
-        KeyBinding::new("up", LineEditUp, Some("Input")),
-        KeyBinding::new("down", LineEditDown, Some("Input")),
+        KeyBinding::new("up", InputUp, Some("Input")),
+        KeyBinding::new("down", InputDown, Some("Input")),
         KeyBinding::new("left", LineEditLeft, Some("Input")),
         KeyBinding::new("right", LineEditRight, Some("Input")),
         KeyBinding::new("backspace", LineEditBackspace, Some("Input")),
@@ -185,6 +186,8 @@ pub struct Workspace {
     _switcher_sub: Option<gpui::Subscription>,
     /// Live results for the switcher's query.
     pub switcher_hits: Vec<notes::SearchHit>,
+    /// Index into `switcher_hits` the arrow keys have selected.
+    pub switcher_selected: usize,
     capture_open: bool,
     capture_input: Option<gpui::Entity<InputState>>,
     _capture_sub: Option<gpui::Subscription>,
@@ -270,6 +273,7 @@ impl Workspace {
             switcher_input: None,
             _switcher_sub: None,
             switcher_hits: Vec::new(),
+            switcher_selected: 0,
             capture_open: false,
             capture_input: None,
             _capture_sub: None,
@@ -411,6 +415,19 @@ impl Workspace {
             Some(date) => self.select_day(date, cx),
             None => self.open_note(mention.path.clone(), cx),
         }
+    }
+
+    /// Move the switcher's keyboard selection through the results. With no
+    /// results the arrows fall through to the input's cursor movement.
+    pub fn switcher_move(&mut self, delta: i64, cx: &mut Context<Self>) {
+        if self.switcher_hits.is_empty() {
+            cx.propagate();
+            return;
+        }
+        let last = (self.switcher_hits.len() - 1) as i64;
+        self.switcher_selected =
+            (self.switcher_selected as i64 + delta).clamp(0, last) as usize;
+        cx.notify();
     }
 
     /// Open a switcher search hit. The note pane must end up visible, so a
@@ -1263,10 +1280,16 @@ impl Workspace {
                             let query = state.read(cx).value().to_string();
                             this.switcher_hits =
                                 notes::search_notes(&this.notes_root, &query, 12);
+                            this.switcher_selected = 0;
                             cx.notify();
                         }
                         InputEvent::PressEnter { .. } => {
-                            if let Some(hit) = this.switcher_hits.first().cloned() {
+                            let selected = this
+                                .switcher_hits
+                                .get(this.switcher_selected)
+                                .or_else(|| this.switcher_hits.first())
+                                .cloned();
+                            if let Some(hit) = selected {
                                 this.open_search_hit(&hit, window, cx);
                             }
                         }
@@ -1277,6 +1300,7 @@ impl Workspace {
             input.update(cx, |state, cx| state.focus(window, cx));
             self.switcher_input = Some(input);
             self.switcher_hits = Vec::new();
+            self.switcher_selected = 0;
             self.switcher_open = true;
             self.picker_open = false;
             cx.notify();
@@ -1631,6 +1655,10 @@ impl Workspace {
         let mut card = div()
             .w(px(600.))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            // Arrow keys from the focused search input land here and move the
+            // selection; with no results they fall through to the input.
+            .on_action(cx.listener(|this, _: &InputUp, _, cx| this.switcher_move(-1, cx)))
+            .on_action(cx.listener(|this, _: &InputDown, _, cx| this.switcher_move(1, cx)))
             .rounded(px(12.))
             .border_1()
             .border_color(t.border)
@@ -1680,6 +1708,7 @@ impl Workspace {
                 );
             }
             let hits = self.switcher_hits.clone();
+            let selected = self.switcher_selected;
             for (i, hit) in hits.into_iter().enumerate() {
                 let icon = if hit.date.is_some() { "◷" } else { "≡" };
                 let snippet: Option<String> = hit.snippet.as_ref().map(|s| {
@@ -1691,6 +1720,7 @@ impl Workspace {
                 });
                 card = card.child(
                     switcher_item(t, ("switcher-hit", i), cx)
+                        .when(i == selected, |d| d.bg(t.sel))
                         .child(div().w(px(14.)).text_color(t.faint).child(icon))
                         .child(div().flex_none().text_color(t.text).child(hit.name.clone()))
                         .child(
@@ -1716,7 +1746,8 @@ impl Workspace {
                     .border_color(t.border)
                     .text_size(px(11.))
                     .text_color(t.faint)
-                    .child("⏎ open top result")
+                    .child("↑↓ select")
+                    .child("⏎ open")
                     .child("esc close"),
             );
             return Some(switcher_backdrop(self, t, cx).child(card));
