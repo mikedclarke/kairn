@@ -91,7 +91,7 @@ impl Workspace {
             format!("⌥{m}⏎ writing"),
         ];
         let _ = cx;
-        h_flex()
+        let mut bar = h_flex()
             .h(px(26.))
             .flex_none()
             .px(px(14.))
@@ -117,8 +117,27 @@ impl Workspace {
                         if self.sessions.len() == 1 { "" } else { "s" }
                     )),
             )
-            .child(format!("{running} running"))
-            .child(
+            .child(format!("{running} running"));
+        // Quiet unless something is genuinely wrong; each of these is a
+        // rare state the user must know about, not chrome churn.
+        if self._notes_watcher.is_none() && !self.root_missing {
+            bar = bar.child(div().text_color(t.amber).child("file watching off"));
+        }
+        if self.dailies_skipped > 0 {
+            bar = bar.child(
+                div()
+                    .text_color(t.amber)
+                    .child(format!("{} unreadable day notes", self.dailies_skipped)),
+            );
+        }
+        if self.settings.degraded {
+            bar = bar.child(
+                div()
+                    .text_color(t.amber)
+                    .child("settings on defaults after a corrupt file; apply Settings to fix"),
+            );
+        }
+        bar.child(
                 h_flex()
                     .flex_1()
                     .justify_end()

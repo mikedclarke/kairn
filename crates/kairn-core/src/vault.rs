@@ -193,12 +193,27 @@ pub fn notes_tree(root: &Path, expanded: &HashSet<PathBuf>) -> Vec<NoteEntry> {
     rows
 }
 
+/// Depth backstop for the `Notes/` walks. Symlinked directories are never
+/// followed (a cycle would otherwise recurse until the stack blows before
+/// the window even opens), so this only guards against absurdly deep trees.
+const MAX_TREE_DEPTH: usize = 24;
+
+/// Whether a directory entry is a real directory, without following
+/// symlinks: a symlinked dir is treated as an opaque file so cycles can't
+/// recurse.
+fn is_real_dir(entry: &fs::DirEntry) -> bool {
+    entry.file_type().is_ok_and(|t| t.is_dir())
+}
+
 fn push_tree_level(
     dir: &Path,
     depth: usize,
     expanded: &HashSet<PathBuf>,
     rows: &mut Vec<NoteEntry>,
 ) {
+    if depth > MAX_TREE_DEPTH {
+        return;
+    }
     let Ok(entries) = fs::read_dir(dir) else { return };
     let mut items: Vec<(bool, bool, String, PathBuf)> = Vec::new();
     for entry in entries.flatten() {
@@ -209,7 +224,7 @@ fn push_tree_level(
         if name.starts_with('.') {
             continue;
         }
-        let is_dir = path.is_dir();
+        let is_dir = is_real_dir(&entry);
         if !is_dir {
             let ext = path.extension().and_then(|x| x.to_str());
             if !matches!(ext, Some("md") | Some("txt")) {
@@ -239,15 +254,19 @@ fn push_tree_level(
 /// concerned.
 pub(crate) fn notes_files(root: &Path) -> Vec<(usize, PathBuf)> {
     fn walk(dir: &Path, depth: usize, out: &mut Vec<(usize, PathBuf)>) {
+        if depth > MAX_TREE_DEPTH {
+            return;
+        }
         let Ok(entries) = fs::read_dir(dir) else { return };
-        let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-        paths.sort();
-        for path in paths {
+        let mut items: Vec<(PathBuf, bool)> =
+            entries.flatten().map(|e| (e.path(), is_real_dir(&e))).collect();
+        items.sort();
+        for (path, is_dir) in items {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
             if name.starts_with('.') || name == "@Trash" {
                 continue;
             }
-            if path.is_dir() {
+            if is_dir {
                 walk(&path, depth + 1, out);
             } else if matches!(
                 path.extension().and_then(|x| x.to_str()),
@@ -456,6 +475,25 @@ mod tests {
         // The copy itself has no copies, and unrelated days are untouched.
         assert!(conflict_copies(&copy).is_empty());
         assert!(conflict_copies(&root.0.join("Calendar/20260807.md")).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_cycles_do_not_recurse() {
+        let root = ScratchRoot::new("symlink");
+        root.write("Notes/deep/Real.md", "# real\n");
+        // A cycle: Notes/deep/loop -> Notes. Following it would recurse
+        // until the stack blew, before the window even opened.
+        std::os::unix::fs::symlink(root.0.join("Notes"), root.0.join("Notes/deep/loop"))
+            .expect("symlink");
+
+        let expanded: HashSet<PathBuf> =
+            [root.0.join("Notes/deep"), root.0.join("Notes/deep/loop")].into();
+        // Both walks terminate; the symlinked dir is not descended into.
+        let rows = notes_tree(&root.0, &expanded);
+        assert!(rows.iter().any(|r| r.name == "Real"));
+        let hits = search_notes(&root.0, "real", 10);
+        assert_eq!(hits.len(), 1);
     }
 
     #[test]

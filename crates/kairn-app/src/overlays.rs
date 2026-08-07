@@ -126,6 +126,11 @@ impl Workspace {
             Some(Overlay::Capture { input, .. }) => input.read(cx).value().to_string(),
             _ => return,
         };
+        if self.root_missing {
+            window.push_notification("Notes folder unavailable; nothing was captured.", cx);
+            self.close_overlays(window, cx);
+            return;
+        }
         let today = Local::now().date_naive();
         match notes::capture(&self.notes_root, today, &text) {
             Ok(Some(path)) => {

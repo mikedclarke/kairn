@@ -73,6 +73,39 @@ impl Workspace {
         writing: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        // A configured notes folder that isn't there blocks the pane:
+        // rendering an empty vault (and writing into a fresh one at the
+        // mount point) would look exactly like data loss.
+        if self.root_missing {
+            return div()
+                .size_full()
+                .min_w(px(0.))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(8.))
+                .bg(t.bg)
+                .child(
+                    div()
+                        .text_size(px(15.))
+                        .text_color(t.text)
+                        .child("Notes folder unavailable"),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(t.faint)
+                        .child(self.notes_root.display().to_string()),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(t.dim)
+                        .child("Check the drive, or choose a folder in Settings."),
+                );
+        }
+
         let pane = div()
             .size_full()
             .min_w(px(0.))
@@ -232,7 +265,14 @@ impl Workspace {
 
         match &self.doc_lines {
             None => {
-                if editing_idx == Some(0) {
+                if let Some(err) = &self.doc_error {
+                    note = note.child(
+                        div()
+                            .mt(px(10.))
+                            .text_color(t.faint)
+                            .child(format!("Couldn't read this note: {err}")),
+                    );
+                } else if editing_idx == Some(0) {
                     note = note.child(self.render_line_editor(cx));
                 } else {
                     note = note.child(

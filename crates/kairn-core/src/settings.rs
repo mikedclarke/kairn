@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,12 @@ pub struct Settings {
     pub notes_root: Option<String>,
     #[serde(default)]
     pub ssh_hosts: Vec<SshHost>,
+    /// Set when the settings file existed but couldn't be parsed. While
+    /// degraded, [`Settings::save`] refuses to run: auto-saving defaults
+    /// over a corrupt file is how SSH hosts and the notes root get wiped.
+    /// An explicit settings-dialog apply clears it.
+    #[serde(skip)]
+    pub degraded: bool,
 }
 
 fn default_theme() -> String {
@@ -47,6 +53,7 @@ impl Default for Settings {
             theme: default_theme(),
             notes_root: None,
             ssh_hosts: Vec::new(),
+            degraded: false,
         }
     }
 }
@@ -76,13 +83,24 @@ impl Settings {
     }
 
     pub fn load() -> Self {
-        let path = config_path();
-        match fs::read_to_string(&path) {
+        Self::load_from(&config_path())
+    }
+
+    pub fn load_from(path: &Path) -> Self {
+        match fs::read_to_string(path) {
             Ok(text) => match serde_json::from_str(&text) {
                 Ok(settings) => settings,
                 Err(e) => {
-                    eprintln!("kairn: ignoring malformed {}: {e}", path.display());
-                    Self::default()
+                    // Keep the evidence and refuse to auto-save until the
+                    // user acts: overwriting now would destroy their SSH
+                    // hosts and notes-root with defaults.
+                    eprintln!("kairn: malformed {}: {e}", path.display());
+                    let backup = path.with_extension("json.corrupt");
+                    match fs::rename(path, &backup) {
+                        Ok(()) => eprintln!("kairn: kept the file as {}", backup.display()),
+                        Err(e) => eprintln!("kairn: could not back it up: {e}"),
+                    }
+                    Self { degraded: true, ..Self::default() }
                 }
             },
             Err(_) => Self::default(),
@@ -90,12 +108,66 @@ impl Settings {
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = config_path();
+        self.save_to(&config_path())
+    }
+
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        if self.degraded {
+            anyhow::bail!(
+                "settings are running on defaults after a corrupt file; \
+                 apply Settings once to start saving again"
+            );
+        }
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).context("creating config directory")?;
         }
         let text = serde_json::to_string_pretty(self)?;
-        fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+        // Atomic: a crash mid-write must never leave a half-written file,
+        // which is exactly how settings corruption happens.
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
+        fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("kairn-settings-{name}-{nanos}"))
+    }
+
+    #[test]
+    fn corrupt_settings_back_up_and_block_saving() {
+        let dir = scratch("corrupt");
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("settings.json");
+        fs::write(&path, "{ not json").expect("write");
+
+        let settings = Settings::load_from(&path);
+        assert!(settings.degraded);
+        // The corrupt original is preserved, not silently replaced.
+        assert!(!path.exists());
+        let backup = path.with_extension("json.corrupt");
+        assert_eq!(fs::read_to_string(&backup).expect("read"), "{ not json");
+        // Saving while degraded is refused, so nothing can clobber it.
+        assert!(settings.save_to(&path).is_err());
+        assert!(!path.exists());
+
+        // An explicit user apply clears the flag and saving round-trips.
+        let mut settings = settings;
+        settings.degraded = false;
+        settings.theme = "light".into();
+        settings.save_to(&path).expect("save");
+        let reloaded = Settings::load_from(&path);
+        assert!(!reloaded.degraded);
+        assert_eq!(reloaded.theme, "light");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -104,10 +104,13 @@ impl Workspace {
     /// Re-read the pane's document and everything the sidebar derives from
     /// the notes: calendar indicators, open-task counts, the Notes tree.
     pub fn reload_notes(&mut self) {
+        self.root_missing = self.settings.notes_root.as_deref().is_some_and(|r| !r.is_empty())
+            && !self.notes_root.exists();
         // One walk of Calendar/ and Notes/ and one read of each daily,
         // shared by the task scan and the mention scan below.
         let scan = notes::VaultScan::new(&self.notes_root);
         let dailies = scan.read_dailies();
+        self.dailies_skipped = scan.days.len() - dailies.len();
         self.open_tasks = notes::open_tasks_in(&dailies);
         self.notes_tree = notes::notes_tree(&self.notes_root, &self.notes_expanded);
         let today = Local::now().date_naive();
@@ -125,7 +128,17 @@ impl Workspace {
             PaneView::Note(p) => Some(p.clone()),
             PaneView::Tasks(_) => None,
         };
-        let text = path.as_deref().and_then(|p| std::fs::read_to_string(p).ok());
+        let (text, doc_error) = match path.as_deref() {
+            None => (None, None),
+            Some(p) => match std::fs::read_to_string(p) {
+                Ok(t) => (Some(t), None),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
+                // The file is there but unreadable: say so instead of
+                // rendering a convincing "no note for this day yet".
+                Err(e) => (None, Some(e.to_string())),
+            },
+        };
+        self.doc_error = doc_error;
         self.doc_lines = text.as_deref().map(notes::parse);
         self.doc_text = text;
         // Linked mentions for the pane's document: a day is referenced by its
@@ -238,7 +251,7 @@ impl Workspace {
         use notify::Watcher as _;
 
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<()>();
-        let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        let handler = move |res: notify::Result<notify::Event>| {
             let Ok(event) = res else { return };
             let relevant = event.paths.is_empty()
                 || event.paths.iter().any(|p| {
@@ -251,7 +264,13 @@ impl Workspace {
             if relevant {
                 let _ = tx.unbounded_send(());
             }
-        })
+        };
+        // Never follow symlinks: one link into a big tree exhausts inotify
+        // watches on Linux and the watcher dies.
+        let watcher = notify::RecommendedWatcher::new(
+            handler,
+            notify::Config::default().with_follow_symlinks(false),
+        )
         .and_then(|mut w| {
             w.watch(&root, notify::RecursiveMode::Recursive)?;
             Ok(w)
@@ -294,20 +313,28 @@ impl Workspace {
     ) {
         self.settings.ssh_hosts = hosts;
         self.settings.notes_root = notes_root;
+        // Applying settings is the explicit user action that ends the
+        // degraded no-save state after a corrupt settings.json.
+        self.settings.degraded = false;
         if let Err(e) = self.settings.save() {
             eprintln!("kairn: failed to save settings: {e}");
             window.push_notification("Could not write settings.json, see stderr.", cx);
         }
         let root = self.settings.notes_root();
-        if root != self.notes_root {
-            self.notes_root = root;
+        self.root_missing = self.settings.notes_root.as_deref().is_some_and(|r| !r.is_empty())
+            && !root.exists();
+        self.notes_root = root;
+        if !self.root_missing {
             notes::ensure_layout(&self.notes_root);
-            let (watcher, task) =
-                Self::watch_notes(self.notes_root.clone(), self.self_writes.clone(), cx);
-            self._notes_watcher = watcher;
-            self._notes_watch_task = task;
-            self.reload_notes();
         }
+        // Re-arm the watcher on every apply, root change or not: it may
+        // have died (root renamed or deleted, inotify exhaustion) and this
+        // is the user's retry lever.
+        let (watcher, task) =
+            Self::watch_notes(self.notes_root.clone(), self.self_writes.clone(), cx);
+        self._notes_watcher = watcher;
+        self._notes_watch_task = task;
+        self.reload_notes();
         cx.notify();
     }
 }

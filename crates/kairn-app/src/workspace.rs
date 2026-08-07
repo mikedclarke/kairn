@@ -82,6 +82,16 @@ pub struct Workspace {
     pub mentions: Vec<notes::Mention>,
     /// Syncthing conflict copies sitting next to the pane's document.
     pub conflicts: Vec<PathBuf>,
+    /// Read error for the pane's document: the file exists but couldn't be
+    /// read (permissions, invalid UTF-8). Rendered instead of pretending
+    /// there is no note.
+    pub doc_error: Option<String>,
+    /// Daily notes that exist but couldn't be read this reload.
+    pub dailies_skipped: usize,
+    /// The configured notes folder doesn't exist (unmounted drive, moved
+    /// path): the note pane blocks instead of showing a convincing empty
+    /// vault, and nothing writes into the void.
+    pub root_missing: bool,
     /// Daily-note file per date, for calendar indicators and lookups.
     pub note_days: HashMap<NaiveDate, PathBuf>,
     /// Every open task across the daily notes, newest first.
@@ -132,7 +142,14 @@ impl Workspace {
         });
 
         let notes_root = settings.notes_root();
-        notes::ensure_layout(&notes_root);
+        // A configured folder that isn't there means an unmounted drive or
+        // a moved path: creating a fresh empty vault at that spot would be
+        // worse than stopping. The default ~/kairn is always created.
+        let root_missing = settings.notes_root.as_deref().is_some_and(|r| !r.is_empty())
+            && !notes_root.exists();
+        if !root_missing {
+            notes::ensure_layout(&notes_root);
+        }
         let self_writes = crate::vault_state::SelfWrites::default();
         let (notes_watcher, notes_watch_task) =
             Self::watch_notes(notes_root.clone(), self_writes.clone(), cx);
@@ -168,6 +185,9 @@ impl Workspace {
             doc_path: None,
             mentions: Vec::new(),
             conflicts: Vec::new(),
+            doc_error: None,
+            dailies_skipped: 0,
+            root_missing,
             note_days: HashMap::new(),
             open_tasks: Vec::new(),
             notes_tree: Vec::new(),

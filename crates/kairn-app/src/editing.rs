@@ -71,7 +71,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if matches!(self.view, PaneView::Tasks(_)) {
+        if matches!(self.view, PaneView::Tasks(_)) || self.root_missing {
             return;
         }
         self.commit_line_edit(true, cx);
