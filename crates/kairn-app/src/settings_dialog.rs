@@ -148,6 +148,11 @@ impl SettingsEditor {
             .upgrade()
             .map(|ws| ws.read(cx).settings.daily_forward)
             .unwrap_or(true);
+        let week_strip = self
+            .workspace
+            .upgrade()
+            .map(|ws| ws.read(cx).settings.week_strip.clone())
+            .unwrap_or_else(|| "always".to_string());
         let resolved = self
             .workspace
             .upgrade()
@@ -170,6 +175,16 @@ impl SettingsEditor {
             btn.on_click(cx.listener(move |this, _, _, cx| {
                 let _ = this.workspace.update(cx, |ws, cx| {
                     ws.set_daily_forward(forward, cx);
+                });
+                cx.notify();
+            }))
+        };
+        let strip_button = |id: &'static str, label: &'static str, mode: &'static str| {
+            let btn = Button::new(id).label(label);
+            let btn = if mode == week_strip { btn.primary() } else { btn.outline() };
+            btn.on_click(cx.listener(move |this, _, _, cx| {
+                let _ = this.workspace.update(cx, |ws, cx| {
+                    ws.set_week_strip(mode, cx);
                 });
                 cx.notify();
             }))
@@ -197,6 +212,14 @@ impl SettingsEditor {
                     .gap_2()
                     .child(daily_button("daily-forward", "Today + next 2 days", true))
                     .child(daily_button("daily-back", "Today + previous 2 days", false)),
+            )
+            .child(Self::section("Week strip above notes"))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(strip_button("strip-always", "Always", "always"))
+                    .child(strip_button("strip-daily", "Daily notes only", "daily"))
+                    .child(strip_button("strip-off", "Hidden", "off")),
             )
     }
 

@@ -8,7 +8,7 @@ use gpui_component::h_flex;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 
 use kairn_core::{Span, SpanKind, task_priority};
-use crate::theme::{self, KairnTheme};
+use crate::theme::KairnTheme;
 use crate::workspace::{LayoutMode, PaneView, TaskQuery, Workspace, chord};
 
 impl Workspace {
@@ -97,13 +97,26 @@ impl Workspace {
                 );
         }
 
-        let pane = div()
+        // The week strip shows per the setting: everywhere, only over daily
+        // notes, or never.
+        let strip_on = match self.settings.week_strip.as_str() {
+            "off" => false,
+            "daily" => matches!(self.view, PaneView::Day),
+            _ => true,
+        };
+        let mut pane = div()
             .size_full()
             .min_w(px(0.))
             .flex()
             .flex_col()
-            .bg(t.bg)
-            .child(self.render_week_strip(t, cx));
+            .bg(t.bg);
+        if strip_on {
+            pane = pane.child(self.render_week_strip(t, cx));
+        } else {
+            // No strip, no drop targets: stale cell bounds from a previous
+            // frame must not catch a task drag released up there.
+            self.week_strip_bounds.borrow_mut().clear();
+        }
 
         // The single-buffer editor scrolls this container to keep the caret
         // visible, so it needs the handle the container tracks.
@@ -598,8 +611,7 @@ fn note_frame(
         .mb(px(2.))
         .child(
             div()
-                .font_family(theme::serif_font())
-                .text_size(px(27.))
+                .text_size(px(21.))
                 .font_weight(gpui::FontWeight::BOLD)
                 .child(masthead),
         );

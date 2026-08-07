@@ -42,6 +42,10 @@ pub struct Settings {
     /// Sidebar sections the user has collapsed, by their header labels.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sidebar_collapsed: Vec<String>,
+    /// The 7-day week strip over the note pane: "always", "daily" (only on
+    /// daily notes), or "off". Unknown values read as "always".
+    #[serde(default = "default_week_strip")]
+    pub week_strip: String,
     /// Set when the settings file existed but couldn't be parsed. While
     /// degraded, [`Settings::save`] refuses to run: auto-saving defaults
     /// over a corrupt file is how SSH hosts and the notes root get wiped.
@@ -58,6 +62,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_week_strip() -> String {
+    "always".to_string()
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -66,6 +74,7 @@ impl Default for Settings {
             ssh_hosts: Vec::new(),
             daily_forward: true,
             sidebar_collapsed: Vec::new(),
+            week_strip: default_week_strip(),
             degraded: false,
         }
     }

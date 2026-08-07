@@ -1261,8 +1261,8 @@ impl gpui::EntityInputHandler for NoteEditor {
 // --- shaping ---------------------------------------------------------------
 
 /// Per-kind metrics: body 13px at 1.58 line height, headings on the
-/// standard markdown scale (`#` biggest, deeper levels smaller, serif for
-/// the top two), task/bullet indents from the glyph column.
+/// standard markdown scale (`#` biggest, deeper levels smaller),
+/// task/bullet indents from the glyph column.
 struct KindStyle {
     size: Pixels,
     line_height: Pixels,
@@ -1271,7 +1271,6 @@ struct KindStyle {
     indent: Pixels,
     color: Hsla,
     weight: FontWeight,
-    serif: bool,
 }
 
 fn kind_style(line: &Line, t: &KairnTheme) -> (KindStyle, Glyph) {
@@ -1283,7 +1282,6 @@ fn kind_style(line: &Line, t: &KairnTheme) -> (KindStyle, Glyph) {
         indent: px(0.),
         color,
         weight: FontWeight::NORMAL,
-        serif: false,
     };
     match line {
         Line::Heading { level, .. } => {
@@ -1298,12 +1296,8 @@ fn kind_style(line: &Line, t: &KairnTheme) -> (KindStyle, Glyph) {
                 ..body(t.text)
             };
             let style = match level {
-                1 => KindStyle {
-                    weight: FontWeight::BOLD,
-                    serif: true,
-                    ..heading(20., 28., 18., 6.)
-                },
-                2 => KindStyle { serif: true, ..heading(17., 24., 16., 5.) },
+                1 => KindStyle { weight: FontWeight::BOLD, ..heading(20., 28., 18., 6.) },
+                2 => heading(17., 24., 16., 5.),
                 3 => heading(15., 22., 14., 4.),
                 4 => heading(13.5, 21., 12., 3.),
                 _ => KindStyle { color: t.dim, ..heading(13., 20.5, 10., 2.) },
@@ -1412,9 +1406,6 @@ fn shape_entry(
 
     let base_font = {
         let mut f = window.text_style().font();
-        if style.serif {
-            f.family = theme::serif_font().to_string().into();
-        }
         f.weight = style.weight;
         f
     };
@@ -1862,6 +1853,16 @@ impl Element for NoteEditorElement {
             }
 
             if let Some(wrapped) = &slot.entry.wrapped {
+                // Backgrounds (==highlights==) are a separate pass in gpui:
+                // `paint` draws only glyphs and decorations.
+                let _ = wrapped.paint_background(
+                    text_origin,
+                    slot.entry.line_height,
+                    gpui::TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
                 let _ = wrapped.paint(
                     text_origin,
                     slot.entry.line_height,

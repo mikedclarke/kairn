@@ -174,7 +174,6 @@ pub fn apply(mode: Mode, window: Option<&mut Window>, cx: &mut App) {
 }
 
 static MONO_FONT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-static SERIF_FONT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Resolve the app's fonts against the families actually installed, once at
 /// startup. Asking for a family that isn't there makes gpui fall back per
@@ -212,27 +211,11 @@ pub fn resolve_fonts(cx: &App) {
         "Mono",
         "monospace",
     );
-    let serif = pick(
-        &[
-            "Georgia",
-            "Charter",
-            "DejaVu Serif",
-            "Noto Serif",
-            "Liberation Serif",
-        ],
-        "Serif",
-        "serif",
-    );
     let _ = MONO_FONT.set(mono);
-    let _ = SERIF_FONT.set(serif);
 }
 
 pub fn mono_font() -> &'static str {
     MONO_FONT.get().map(String::as_str).unwrap_or("monospace")
-}
-
-pub fn serif_font() -> &'static str {
-    SERIF_FONT.get().map(String::as_str).unwrap_or("serif")
 }
 
 /// Terminal colors: sage-tinted ANSI ramp; the terminal stays dark in both

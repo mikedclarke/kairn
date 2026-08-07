@@ -348,6 +348,18 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Set week-strip visibility: "always", "daily", or "off".
+    pub fn set_week_strip(&mut self, mode: &str, cx: &mut Context<Self>) {
+        if self.settings.week_strip == mode {
+            return;
+        }
+        self.settings.week_strip = mode.to_string();
+        if let Err(e) = self.settings.save() {
+            eprintln!("kairn: failed to save settings: {e}");
+        }
+        cx.notify();
+    }
+
     /// Point the sidebar Daily section forward (today + next two days) or
     /// back (today + previous two).
     pub fn set_daily_forward(&mut self, forward: bool, cx: &mut Context<Self>) {
