@@ -186,6 +186,7 @@ impl Workspace {
         self.dailies_skipped = scan.days.len() - dailies.len();
         self.open_tasks = notes::open_tasks_in(&dailies);
         self.notes_tree = notes::notes_tree(&self.notes_root, &self.notes_expanded);
+        self.agent_activity = notes::recent_activity(&self.notes_root, 6);
         let today = Local::now().date_naive();
         self.task_counts = [TaskQuery::Today, TaskQuery::Open, TaskQuery::Overdue].map(|q| {
             self.open_tasks.iter().filter(|t| q.matches(t.date, today)).count()
@@ -344,7 +345,11 @@ impl Workspace {
             let Ok(event) = res else { return };
             let relevant = event.paths.is_empty()
                 || event.paths.iter().any(|p| {
-                    !p.components().any(|c| c.as_os_str() == ".kairn")
+                    // The activity log is the one `.kairn/` file the UI
+                    // shows live: CLI writes must surface without a restart.
+                    let watched_in_kairn = p.file_name().is_some_and(|n| n == "activity.jsonl");
+                    (watched_in_kairn
+                        || !p.components().any(|c| c.as_os_str() == ".kairn"))
                         && !p
                             .file_name()
                             .is_some_and(|n| n.to_string_lossy().contains(".kairn-tmp"))

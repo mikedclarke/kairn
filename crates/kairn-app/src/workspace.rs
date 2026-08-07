@@ -96,6 +96,9 @@ pub struct Workspace {
     /// Open-task counts for the Today/Open/Overdue views, from the last
     /// reload; renders read these instead of re-scanning per frame.
     pub(crate) task_counts: [usize; 3],
+    /// Recent entries from `.kairn/activity.jsonl`, newest first: what
+    /// agents did to the notes via the CLI, for the sidebar's Agents feed.
+    pub agent_activity: Vec<notes::ActivityEntry>,
     /// Recent writes by this instance, for watcher self-event suppression.
     pub(crate) self_writes: crate::vault_state::SelfWrites,
     /// Daily-note text carried across reloads; unchanged files skip the read.
@@ -186,6 +189,7 @@ impl Workspace {
             notes_expanded: HashSet::new(),
             week_open_counts: [0; 7],
             task_counts: [0; 3],
+            agent_activity: Vec::new(),
             self_writes,
             daily_cache: notes::DailyCache::default(),
             _activity_timer: activity_timer,

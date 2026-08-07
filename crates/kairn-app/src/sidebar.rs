@@ -171,17 +171,71 @@ impl Workspace {
                 ),
         );
 
-        // Agents: an honest empty state until the Phase E activity log
-        // exists. Fabricated rows in a calm UI are worse than nothing.
+        // Agents: recent CLI writes from the vault's activity log, quiet
+        // read-only rows. The empty state stays honest when there are none.
         side = side.child(sechead(t, "Agents", None));
-        side = side.child(
-            div()
-                .px(px(14.))
-                .pb(px(16.))
-                .text_size(px(11.5))
-                .text_color(t.faint)
-                .child("No agent activity yet"),
-        );
+        if self.agent_activity.is_empty() {
+            side = side.child(
+                div()
+                    .px(px(14.))
+                    .pb(px(16.))
+                    .text_size(px(11.5))
+                    .text_color(t.faint)
+                    .child("No agent activity yet"),
+            );
+        }
+        for entry in &self.agent_activity {
+            let verb = match entry.action.as_str() {
+                "add" => "added",
+                "done" => "completed",
+                "capture" => "captured",
+                other => other,
+            };
+            side = side.child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(px(8.))
+                    .px(px(14.))
+                    .py(px(3.))
+                    .text_size(px(11.5))
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family(theme::mono_font())
+                            .text_size(px(10.5))
+                            .text_color(t.faint)
+                            .child(activity_time(&entry.ts, today)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .gap(px(4.))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_color(t.text)
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .child(entry.actor.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_color(t.dim)
+                                    .child(format!("{verb} {:?}", entry.detail)),
+                            ),
+                    ),
+            );
+        }
+        if !self.agent_activity.is_empty() {
+            side = side.child(div().pb(px(12.)));
+        }
 
         // Pinned footer: the always-visible way into Settings.
         let hover_bg = t.hover;
@@ -371,6 +425,18 @@ fn nav_item(t: &KairnTheme, id: impl Into<ElementId>) -> gpui::Stateful<gpui::Di
         .text_color(t.dim)
         .cursor_default()
         .hover(move |s| s.bg(hover_bg).text_color(hover_text))
+}
+
+/// Activity timestamps (`YYYY-MM-DD HH:MM:SS`, local time) shown the way
+/// the feed reads: the clock time for today's entries, the day for older
+/// ones, the raw string if it isn't in the log's format.
+fn activity_time(ts: &str, today: NaiveDate) -> SharedString {
+    let parsed = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S");
+    match parsed {
+        Ok(dt) if dt.date() == today => dt.format("%H:%M").to_string().into(),
+        Ok(dt) => dt.format("%-d %b").to_string().into(),
+        Err(_) => ts.to_string().into(),
+    }
 }
 
 fn cal_nav(t: &KairnTheme, id: &'static str, glyph: &'static str) -> gpui::Stateful<gpui::Div> {
