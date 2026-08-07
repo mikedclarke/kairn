@@ -333,6 +333,99 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Move a note to `Notes/@Trash/` (NotePlan's soft delete; nothing is
+    /// ever hard-deleted). Pending edits are flushed first so they travel
+    /// with the file. If the trashed note is on screen, the pane drops back
+    /// to the day view.
+    pub fn trash_note_at(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_note_editor(cx);
+        match notes::trash_note(&self.notes_root, path) {
+            Ok(_) => {
+                if self.view == PaneView::Note(path.to_path_buf()) {
+                    self.view = PaneView::Day;
+                }
+            }
+            Err(e) => window.push_notification(format!("Could not delete note: {e}"), cx),
+        }
+        self.reload_notes(cx);
+        cx.notify();
+    }
+
+    /// Rename a note in place (extension preserved, never overwrites). An
+    /// open note stays open under its new name.
+    pub fn rename_note_at(
+        &mut self,
+        path: &Path,
+        new_stem: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.flush_note_editor(cx);
+        match notes::rename_note(path, new_stem) {
+            Ok(new_path) => {
+                if self.view == PaneView::Note(path.to_path_buf()) {
+                    self.view = PaneView::Note(new_path);
+                }
+            }
+            Err(e) => window.push_notification(format!("Could not rename note: {e}"), cx),
+        }
+        self.reload_notes(cx);
+        cx.notify();
+    }
+
+    /// Create a note in a folder of the Notes tree and open it. An existing
+    /// note of that name is opened untouched (same posture as wiki links).
+    pub fn create_note_in(
+        &mut self,
+        dir: &Path,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match notes::new_note_in(dir, name) {
+            Ok(path) => {
+                self.note_self_write(&path);
+                // Expand the folder so the new note is visible in the tree.
+                if dir != self.notes_root.join("Notes") {
+                    self.notes_expanded.insert(dir.to_path_buf());
+                }
+                self.open_note(path, cx);
+            }
+            Err(e) => window.push_notification(format!("Could not create note: {e}"), cx),
+        }
+    }
+
+    /// Rename prompt for a note row: a one-field dialog prefilled with the
+    /// current name.
+    pub fn prompt_rename_note(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let initial = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        crate::name_dialog::open(
+            "Rename note",
+            "Rename",
+            Some(initial),
+            window,
+            cx,
+            move |ws, name, window, cx| ws.rename_note_at(&path, name, window, cx),
+        );
+    }
+
+    /// New-note prompt for a folder row (or the Notes section header, which
+    /// creates at the top level).
+    pub fn prompt_new_note(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        crate::name_dialog::open(
+            "New note",
+            "Create",
+            None,
+            window,
+            cx,
+            move |ws, name, window, cx| ws.create_note_in(&dir, name, window, cx),
+        );
+    }
+
     /// Flush pending editor changes now instead of waiting for the autosave.
     pub(crate) fn on_save_note(
         &mut self,

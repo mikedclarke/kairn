@@ -31,7 +31,7 @@ pub struct Session {
     pub busy: bool,
     pub view: Entity<TerminalView>,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    _child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+    child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     shell_pid: Option<u32>,
 }
 
@@ -58,6 +58,15 @@ impl Session {
         } else {
             format!("{} · {}", self.display_name, self.title).into()
         }
+    }
+
+    /// Force-quit the session's process. The PTY reader then sees EOF and the
+    /// exit callback removes the session from the workspace, the same path an
+    /// ordinary `exit` takes.
+    pub fn terminate(&self) {
+        let mut child = self.child.lock();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -175,7 +184,7 @@ pub fn spawn(
         title: SharedString::default(),
         view,
         master,
-        _child: child,
+        child,
         shell_pid,
     })
 }

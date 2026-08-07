@@ -268,6 +268,14 @@ impl Workspace {
         }
     }
 
+    /// Close a session from the sidebar menu: kill its process and let the
+    /// exit callback (the same path `exit` takes) remove it and fix focus.
+    pub fn close_session(&mut self, idx: usize) {
+        if let Some(session) = self.sessions.get(idx) {
+            session.terminate();
+        }
+    }
+
     pub fn set_session_title(&mut self, id: u64, title: SharedString, cx: &mut Context<Self>) {
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id)
             && session.title != title {

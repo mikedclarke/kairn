@@ -1,5 +1,6 @@
 mod chrome;
 mod keymap;
+mod name_dialog;
 mod note_editor;
 mod overlays;
 mod panes;

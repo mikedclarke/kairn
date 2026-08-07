@@ -37,6 +37,23 @@ Without these, `open_dialog` / `push_notification` silently do nothing.
 - Read with `state.read(cx).value()`. Change events via
   `cx.subscribe_in(&state, window, ...)` on `InputEvent::Change`.
 
+## Context menus
+
+- `gpui_component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem}`; no
+  extra init beyond `gpui_component::init`.
+- `.context_menu(|menu, window, cx| menu.item(...))` (from `ContextMenuExt`,
+  available on any `ParentElement + Styled` element) wraps the element; a
+  right press inside its bounds opens the menu at the pointer.
+- Items: `menu.item(PopupMenuItem::new("Label").disabled(bool)
+  .on_click(|_, window, cx| ...))` and `menu.separator()`. The click handler
+  is `Fn(&ClickEvent, &mut Window, &mut App)`; closure-based items need no
+  gpui action types.
+- The builder closure runs on each open, but in a `window.defer` one frame
+  after the right press. Anything position-dependent (e.g. "what's under
+  the pointer") must be captured by the wrapped element's own
+  `on_mouse_down(MouseButton::Right, ...)` listener, which fires before the
+  deferred build; the builder itself never sees the click position.
+
 ## Resizable panels
 
 - `h_resizable(id)` / `v_resizable(id)` with `resizable_panel().size(px)

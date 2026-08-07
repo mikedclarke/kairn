@@ -24,6 +24,7 @@ use gpui::{
     ScrollHandle, SharedString, StrikethroughStyle, Style, Styled as _, Task, TextRun,
     UTF16Selection, UnderlineStyle, Window, WrappedLine, div, fill, point, px, size,
 };
+use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
 use kairn_core as notes;
 use notes::{Line, NoteBuffer, SpanKind, TaskState};
 
@@ -75,6 +76,9 @@ pub struct NoteEditor {
     /// The clickable span under the pointer, underlined so links read as
     /// links: the line's start offset and the span's display-char range.
     hovered_link: Option<(usize, Range<usize>)>,
+    /// The link under the last right-click, captured on mouse down so the
+    /// context menu (built a frame later) can offer to open it.
+    menu_link: Option<notes::LinkTarget>,
     focus_handle: FocusHandle,
     pub scroll_handle: ScrollHandle,
     /// Focus as of the last frame; edge-detected in prepaint (the blink
@@ -193,6 +197,7 @@ impl NoteEditor {
             glyph_drag: None,
             ime_marked: None,
             hovered_link: None,
+            menu_link: None,
             focus_handle: cx.focus_handle(),
             scroll_handle: ScrollHandle::new(),
             focused: false,
@@ -518,12 +523,26 @@ impl NoteEditor {
     }
 
     fn on_copy(&mut self, _: &EditorCopy, _: &mut Window, cx: &mut Context<Self>) {
+        self.copy(cx);
+    }
+
+    fn on_cut(&mut self, _: &EditorCut, _: &mut Window, cx: &mut Context<Self>) {
+        self.cut(cx);
+    }
+
+    /// Whether a non-empty selection exists (the context menu greys Cut and
+    /// Copy without one).
+    pub fn has_selection(&self) -> bool {
+        self.selection().is_some()
+    }
+
+    pub fn copy(&mut self, cx: &mut Context<Self>) {
         if let Some(sel) = self.selection() {
             cx.write_to_clipboard(ClipboardItem::new_string(self.text()[sel].to_string()));
         }
     }
 
-    fn on_cut(&mut self, _: &EditorCut, _: &mut Window, cx: &mut Context<Self>) {
+    pub fn cut(&mut self, cx: &mut Context<Self>) {
         let Some(sel) = self.selection() else { return };
         cx.write_to_clipboard(ClipboardItem::new_string(self.text()[sel].to_string()));
         self.delete_selection();
@@ -580,6 +599,10 @@ impl NoteEditor {
     }
 
     fn on_paste(&mut self, _: &EditorPaste, _: &mut Window, cx: &mut Context<Self>) {
+        self.paste(cx);
+    }
+
+    pub fn paste(&mut self, cx: &mut Context<Self>) {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
@@ -591,7 +614,74 @@ impl NoteEditor {
         self.after_edit(cx);
     }
 
+    /// Follow a link target: the shared path behind a left-click on a link
+    /// and the context menu's Open item.
+    pub fn open_link(&mut self, target: notes::LinkTarget, cx: &mut Context<Self>) {
+        match target {
+            notes::LinkTarget::Wiki(title) => {
+                cx.emit(NoteEditorEvent::OpenWikiLink(
+                    notes::wiki_link_title(&title).to_string(),
+                ));
+            }
+            notes::LinkTarget::Date(text) => {
+                if let Some(date) = text
+                    .strip_prefix('>')
+                    .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+                {
+                    cx.emit(NoteEditorEvent::OpenDate(date));
+                }
+            }
+            notes::LinkTarget::Url(url) => cx.emit(NoteEditorEvent::OpenUrl(url)),
+        }
+    }
+
+    /// The link under a window position, if any: the same slot walk the
+    /// left-click hit-test does, minus everything that isn't a link.
+    fn link_at(&self, pos: Point<Pixels>) -> Option<notes::LinkTarget> {
+        let layout = self.layout.borrow();
+        let layout = layout.as_ref()?;
+        for slot in &layout.slots {
+            let top = layout.bounds.origin.y + slot.y;
+            if pos.y < top || pos.y >= top + slot.height {
+                continue;
+            }
+            // The active line shows raw markdown; links only resolve on
+            // styled lines, matching the left-click behaviour.
+            if slot.entry.active {
+                return None;
+            }
+            let raw_line = &self.text()[slot.raw_start..slot.raw_start + slot.raw_len];
+            let origin = slot.text_origin_in(&layout.bounds);
+            let local = point(pos.x - origin.x, pos.y - origin.y);
+            let display_ix = slot
+                .entry
+                .wrapped
+                .as_ref()?
+                .index_for_position(local, slot.entry.line_height)
+                .ok()?;
+            let display_chars = slot
+                .entry
+                .display
+                .get(..display_ix)
+                .map_or(0, |s| s.chars().count());
+            return notes::link_target_at_display_char(raw_line, display_chars);
+        }
+        None
+    }
+
     // --- mouse -------------------------------------------------------------
+
+    /// Right mouse down: remember what sits under the pointer so the context
+    /// menu (built by the wrapper a frame later) can offer to open it.
+    fn on_right_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.menu_link = self.link_at(event.position);
+        cx.notify();
+    }
 
     fn on_mouse_down(
         &mut self,
@@ -672,22 +762,7 @@ impl NoteEditor {
                     target: None,
                 });
             }
-            Click::Nav(notes::LinkTarget::Wiki(title)) => {
-                cx.emit(NoteEditorEvent::OpenWikiLink(
-                    notes::wiki_link_title(&title).to_string(),
-                ));
-            }
-            Click::Nav(notes::LinkTarget::Date(text)) => {
-                if let Some(date) = text
-                    .strip_prefix('>')
-                    .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
-                {
-                    cx.emit(NoteEditorEvent::OpenDate(date));
-                }
-            }
-            Click::Nav(notes::LinkTarget::Url(url)) => {
-                cx.emit(NoteEditorEvent::OpenUrl(url));
-            }
+            Click::Nav(target) => self.open_link(target, cx),
             Click::Cursor(target) => {
                 let target = target.min(self.text().len());
                 window.focus(&self.focus_handle);
@@ -1085,6 +1160,7 @@ impl Focusable for NoteEditor {
 
 impl Render for NoteEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let editor = cx.entity().downgrade();
         div()
             .key_context("NoteEditor")
             .track_focus(&self.focus_handle)
@@ -1093,6 +1169,7 @@ impl Render for NoteEditor {
             // short note lands in the editor and appends.
             .pb(px(140.))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))
             .on_action(cx.listener(Self::on_enter))
             .on_action(cx.listener(Self::on_backspace))
             .on_action(cx.listener(Self::on_delete))
@@ -1111,6 +1188,51 @@ impl Render for NoteEditor {
             .on_action(cx.listener(Self::on_select_up))
             .on_action(cx.listener(Self::on_select_down))
             .child(NoteEditorElement { editor: cx.entity().clone() })
+            .context_menu(move |menu, _, cx| {
+                let Some(strong) = editor.upgrade() else { return menu };
+                let (link, has_selection) = {
+                    let ed = strong.read(cx);
+                    (ed.menu_link.clone(), ed.has_selection())
+                };
+                let mut menu = menu;
+                if let Some(target) = link {
+                    let label = match &target {
+                        notes::LinkTarget::Wiki(_) => "Open note",
+                        notes::LinkTarget::Date(_) => "Open day",
+                        notes::LinkTarget::Url(_) => "Open link",
+                    };
+                    let ed = strong.clone();
+                    menu = menu
+                        .item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                            let target = target.clone();
+                            ed.update(cx, |ed, cx| ed.open_link(target, cx));
+                        }))
+                        .separator();
+                }
+                let ed = strong.clone();
+                menu = menu.item(
+                    PopupMenuItem::new("Cut").disabled(!has_selection).on_click(
+                        move |_, window, cx| {
+                            ed.update(cx, |ed, cx| ed.cut(cx));
+                            window.focus(&ed.read(cx).focus_handle);
+                        },
+                    ),
+                );
+                let ed = strong.clone();
+                menu = menu.item(
+                    PopupMenuItem::new("Copy").disabled(!has_selection).on_click(
+                        move |_, window, cx| {
+                            ed.update(cx, |ed, cx| ed.copy(cx));
+                            window.focus(&ed.read(cx).focus_handle);
+                        },
+                    ),
+                );
+                let ed = strong.clone();
+                menu.item(PopupMenuItem::new("Paste").on_click(move |_, window, cx| {
+                    ed.update(cx, |ed, cx| ed.paste(cx));
+                    window.focus(&ed.read(cx).focus_handle);
+                }))
+            })
     }
 }
 

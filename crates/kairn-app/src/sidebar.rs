@@ -4,10 +4,18 @@ use gpui::{
     Context, ElementId, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, SharedString, StatefulInteractiveElement, Styled, div, point, px,
 };
+use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
 
 use crate::session::SessionKind;
 use crate::theme::{self, KairnTheme};
 use crate::workspace::{PaneView, TaskQuery, Workspace, chord, kbd};
+
+/// The file manager by its platform name, for context-menu labels.
+const REVEAL_LABEL: &str = if cfg!(target_os = "macos") {
+    "Reveal in Finder"
+} else {
+    "Show in file manager"
+};
 
 impl Workspace {
     pub fn render_sidebar(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -78,12 +86,23 @@ impl Workspace {
             }
         }
 
-        // Notes: the real tree of the Notes/ folder.
+        // Notes: the real tree of the Notes/ folder. The section header's
+        // menu creates at the top level.
         let collapsed = self.section_collapsed("Notes");
+        let notes_dir = self.notes_root.join("Notes");
+        let ws = cx.weak_entity();
         side = side.child(
-            sechead(t, "sec-notes", "Notes", None, collapsed).on_click(cx.listener(
-                |this, _, _, cx| this.toggle_section("Notes", cx),
-            )),
+            sechead(t, "sec-notes", "Notes", None, collapsed)
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_section("Notes", cx)))
+                .context_menu(move |menu, _, _| {
+                    let ws = ws.clone();
+                    let dir = notes_dir.clone();
+                    menu.item(PopupMenuItem::new("New note…").on_click(move |_, window, cx| {
+                        let _ = ws.update(cx, |this, cx| {
+                            this.prompt_new_note(dir.clone(), window, cx);
+                        });
+                    }))
+                }),
         );
         if !collapsed {
             if self.notes_tree.is_empty() {
@@ -100,6 +119,8 @@ impl Workspace {
                 if entry.special {
                     row = row.text_color(t.faint);
                 }
+                let ws = cx.weak_entity();
+                let menu_path = entry.path.clone();
                 if entry.is_dir {
                     let open = self.notes_expanded_contains(&entry.path);
                     row = row
@@ -116,6 +137,20 @@ impl Workspace {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.toggle_notes_folder(path.clone(), cx);
                         }));
+                    side = side.child(row.context_menu(move |menu, _, _| {
+                        let dir = menu_path.clone();
+                        let reveal = menu_path.clone();
+                        let ws = ws.clone();
+                        menu.item(PopupMenuItem::new("New note…").on_click(move |_, window, cx| {
+                            let _ = ws.update(cx, |this, cx| {
+                                this.prompt_new_note(dir.clone(), window, cx);
+                            });
+                        }))
+                        .separator()
+                        .item(PopupMenuItem::new(REVEAL_LABEL).on_click(move |_, _, cx| {
+                            cx.reveal_path(&reveal);
+                        }))
+                    }));
                 } else {
                     let selected = self.view == PaneView::Note(entry.path.clone());
                     row = row
@@ -134,8 +169,28 @@ impl Workspace {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.open_note(path.clone(), cx);
                         }));
+                    side = side.child(row.context_menu(move |menu, _, _| {
+                        let rename = menu_path.clone();
+                        let trash = menu_path.clone();
+                        let reveal = menu_path.clone();
+                        let ws_rename = ws.clone();
+                        let ws_trash = ws.clone();
+                        menu.item(PopupMenuItem::new("Rename…").on_click(move |_, window, cx| {
+                            let _ = ws_rename.update(cx, |this, cx| {
+                                this.prompt_rename_note(rename.clone(), window, cx);
+                            });
+                        }))
+                        .item(PopupMenuItem::new("Delete note").on_click(move |_, window, cx| {
+                            let _ = ws_trash.update(cx, |this, cx| {
+                                this.trash_note_at(&trash, window, cx);
+                            });
+                        }))
+                        .separator()
+                        .item(PopupMenuItem::new(REVEAL_LABEL).on_click(move |_, _, cx| {
+                            cx.reveal_path(&reveal);
+                        }))
+                    }));
                 }
-                side = side.child(row);
             }
         }
 
@@ -193,9 +248,18 @@ impl Workspace {
                             .child(chord(&(i + 1).to_string())),
                     );
                 }
-                side = side.child(row.on_click(cx.listener(move |this, _, window, cx| {
-                    this.activate_session(i, window, cx);
-                })));
+                let ws = cx.weak_entity();
+                side = side.child(
+                    row.on_click(cx.listener(move |this, _, window, cx| {
+                        this.activate_session(i, window, cx);
+                    }))
+                    .context_menu(move |menu, _, _| {
+                        let ws = ws.clone();
+                        menu.item(PopupMenuItem::new("Close session").on_click(move |_, _, cx| {
+                            let _ = ws.update(cx, |this, _| this.close_session(i));
+                        }))
+                    }),
+                );
             }
             side = side.child(
                 nav_item(t, "new-session")

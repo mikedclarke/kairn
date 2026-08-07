@@ -100,6 +100,85 @@ pub fn write_note(path: &Path, content: &str) -> io::Result<()> {
     atomic_write(path, content)
 }
 
+/// A file stem the user typed for a new or renamed note, checked before it
+/// touches the filesystem: non-empty, no path separators, and not dot- or
+/// `@`-prefixed (hidden files and NotePlan's special folders).
+fn checked_stem(stem: &str) -> io::Result<&str> {
+    let stem = stem.trim();
+    let bad = stem.is_empty()
+        || stem.contains(['/', '\\'])
+        || stem.starts_with('.')
+        || stem.starts_with('@');
+    if bad {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "note names can't be empty or start with '.' or '@', and can't contain '/'",
+        ));
+    }
+    Ok(stem)
+}
+
+/// Move a note into the vault's trash folder (`Notes/@Trash/`), NotePlan's
+/// soft-delete convention; nothing here ever hard-deletes. A name collision
+/// in the trash gets a numbered suffix. Returns where the note ended up.
+pub fn trash_note(root: &Path, path: &Path) -> io::Result<PathBuf> {
+    let trash = root.join("Notes").join("@Trash");
+    if path.starts_with(&trash) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "note is already in the trash",
+        ));
+    }
+    fs::create_dir_all(&trash)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
+    let stem = path.file_stem().unwrap_or(name).to_string_lossy().into_owned();
+    let ext = path.extension().map(|e| e.to_string_lossy().into_owned());
+    let mut dest = trash.join(name);
+    let mut n = 2;
+    while dest.exists() {
+        let candidate = match &ext {
+            Some(ext) => format!("{stem} {n}.{ext}"),
+            None => format!("{stem} {n}"),
+        };
+        dest = trash.join(candidate);
+        n += 1;
+    }
+    fs::rename(path, &dest)?;
+    Ok(dest)
+}
+
+/// Rename a note in place: same folder, extension preserved. Never
+/// overwrites — a stem that already names a sibling file is an error.
+/// Returns the new path.
+pub fn rename_note(path: &Path, new_stem: &str) -> io::Result<PathBuf> {
+    let new_stem = checked_stem(new_stem)?;
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("md");
+    let dest = path.with_file_name(format!("{new_stem}.{ext}"));
+    if dest == path {
+        return Ok(dest);
+    }
+    if dest.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("a note named \"{new_stem}\" already exists here"),
+        ));
+    }
+    fs::rename(path, &dest)?;
+    Ok(dest)
+}
+
+/// Create a note named by the user inside `dir`, seeded with a title
+/// heading. An existing note of that name is left untouched and returned
+/// as-is (same posture as wiki-link creation). Returns the note's path.
+pub fn new_note_in(dir: &Path, name: &str) -> io::Result<PathBuf> {
+    let name = checked_stem(name)?;
+    let path = dir.join(format!("{name}.md"));
+    create_note_if_absent(&path, &format!("# {name}\n"))?;
+    Ok(path)
+}
+
 fn atomic_write(path: &Path, content: &str) -> io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -391,6 +470,63 @@ mod tests {
             toggle_task_in_text("* one", 0, "* one", now).as_deref(),
             Some("* [x] one @done(2026-08-06 21:30)")
         );
+    }
+
+    #[test]
+    fn trash_note_moves_and_numbers_collisions() {
+        let root = ScratchRoot::new("trash");
+        let a = root.write("Notes/Ideas.md", "# Ideas\nfirst\n");
+        let dest = trash_note(&root.0, &a).expect("trash");
+        assert_eq!(dest, root.0.join("Notes/@Trash/Ideas.md"));
+        assert!(!a.exists());
+        assert_eq!(fs::read_to_string(&dest).expect("read"), "# Ideas\nfirst\n");
+
+        // A second note of the same name lands beside it, numbered.
+        let b = root.write("Notes/Projects/Ideas.md", "# Ideas\nsecond\n");
+        let dest2 = trash_note(&root.0, &b).expect("trash");
+        assert_eq!(dest2, root.0.join("Notes/@Trash/Ideas 2.md"));
+        assert_eq!(fs::read_to_string(&dest).expect("read"), "# Ideas\nfirst\n");
+
+        // Trashing from the trash is refused.
+        assert!(trash_note(&root.0, &dest).is_err());
+    }
+
+    #[test]
+    fn rename_note_preserves_extension_and_refuses_overwrite() {
+        let root = ScratchRoot::new("rename");
+        let a = root.write("Notes/Old.txt", "# Old\n");
+        let dest = rename_note(&a, "New").expect("rename");
+        assert_eq!(dest, root.0.join("Notes/New.txt"));
+        assert!(!a.exists());
+
+        // The target name is taken: nothing moves.
+        let b = root.write("Notes/Other.txt", "other\n");
+        assert!(rename_note(&b, "New").is_err());
+        assert!(b.exists());
+
+        // Bad stems are refused before touching the disk.
+        for bad in ["", "  ", "a/b", ".hidden", "@Trash"] {
+            assert!(rename_note(&dest, bad).is_err(), "stem {bad:?} should fail");
+        }
+        // Renaming to the same name is a quiet no-op.
+        assert_eq!(rename_note(&dest, "New").expect("noop"), dest);
+    }
+
+    #[test]
+    fn new_note_in_seeds_title_and_keeps_existing() {
+        let root = ScratchRoot::new("newnote");
+        let dir = root.0.join("Notes");
+        let path = new_note_in(&dir, " Meeting Notes ").expect("create");
+        assert_eq!(path, dir.join("Meeting Notes.md"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "# Meeting Notes\n"
+        );
+        // Creating again never overwrites what's there.
+        fs::write(&path, "real content\n").expect("write");
+        let again = new_note_in(&dir, "Meeting Notes").expect("existing");
+        assert_eq!(again, path);
+        assert_eq!(fs::read_to_string(&path).expect("read"), "real content\n");
     }
 
     #[test]
