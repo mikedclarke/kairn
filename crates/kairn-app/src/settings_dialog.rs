@@ -347,6 +347,13 @@ impl SettingsEditor {
             .child(div().text_size(px(11.)).opacity(0.55).child(
                 "The pill row of timed lines (09:00 standup) at the top of a daily note.",
             ))
+            .child(Self::section("About"))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .opacity(0.55)
+                    .child(concat!("Kairn ", env!("CARGO_PKG_VERSION"))),
+            )
     }
 
     fn render_theme(&self, cx: &mut Context<Self>) -> gpui::Div {

@@ -12,10 +12,6 @@ same fact twice; no em dashes. Rewrite to this standard before releasing.
 
 <!-- New user-visible capabilities. -->
 
-- Terminal mouse support for TUI apps: clicks, drags, and all three buttons are forwarded to applications that use the mouse (herdr, htop, lazygit).
-- Paste into the terminal with the platform paste chord, with bracketed paste for apps that request it.
-- Terminals report window focus changes to applications that ask for them.
-
 ## Improved
 
 <!-- Refinements to existing workflows, reliability, performance, or UX. -->
