@@ -15,7 +15,7 @@ use gpui_component::resizable::{h_resizable, resizable_panel};
 use kairn_core::{self as notes, Line, Span, SpanKind, TaskState};
 use crate::theme::{self, KairnTheme};
 use crate::workspace::{
-    InputDown, InputUp, LayoutMode, PaneView, TaskQuery, Workspace, chord, kbd, mod_symbol,
+    InputDown, InputUp, LayoutMode, PaneView, TaskQuery, Workspace, chord, chord_alt, kbd,
 };
 
 /// Per-render stash of each note line's text layout, for click hit-testing.
@@ -150,15 +150,19 @@ impl Workspace {
             let is_today = day == today;
             let is_selected = day == selected;
             let dots = self.week_open_counts[i as usize].min(4);
+            // Open tasks on a past day are overdue: those dots run hot.
+            let dot_color = if is_selected {
+                t.on_amber.opacity(0.6)
+            } else if day < today {
+                t.amber
+            } else {
+                t.faint
+            };
 
             let mut dots_row = div().h(px(5.)).mt(px(1.)).flex().gap(px(2.)).justify_center();
             for _ in 0..dots {
                 dots_row = dots_row.child(
-                    div()
-                        .w(px(3.5))
-                        .h(px(3.5))
-                        .rounded_full()
-                        .bg(if is_selected { t.on_amber.opacity(0.6) } else { t.faint }),
+                    div().w(px(3.5)).h(px(3.5)).rounded_full().bg(dot_color),
                 );
             }
 
@@ -245,10 +249,16 @@ impl Workspace {
                     -1 => Some("yesterday"),
                     _ => None,
                 };
-                let subline = match relative_label {
+                let mut subline = match relative_label {
                     Some(label) => format!("Week {} · {}", date.iso_week().week(), label),
                     None => format!("Week {}", date.iso_week().week()),
                 };
+                // Open tasks from earlier days are still carried into this
+                // one; the count keeps the masthead honest about the load.
+                let carried = self.open_tasks.iter().filter(|task| task.date < date).count();
+                if carried > 0 {
+                    subline.push_str(&format!(" · {carried} carried over"));
+                }
                 (masthead, subline, "No note for this day yet.")
             }
         };
@@ -325,7 +335,7 @@ impl Workspace {
                 .items_center()
                 .text_size(px(11.5))
                 .text_color(t.faint)
-                .child(kbd(t, format!("⌥{}⏎", mod_symbol())))
+                .child(kbd(t, chord_alt("⏎")))
                 .child("writing mode · click any line to edit in place"),
         )
         .into_any_element()

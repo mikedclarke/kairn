@@ -6,7 +6,7 @@ use gpui::{
 };
 use gpui_component::{TitleBar, h_flex};
 
-use crate::keymap::{Capture, ToggleSidebar, ToggleSwitcher, ToggleThemeMode, chord, mod_symbol};
+use crate::keymap::{Capture, ToggleSidebar, ToggleSwitcher, ToggleThemeMode, chord, chord_alt, chord_shift};
 use crate::theme::KairnTheme;
 use crate::ui::kbd;
 use crate::workspace::Workspace;
@@ -37,7 +37,7 @@ impl Workspace {
             h_flex()
                 .gap(px(6.))
                 .child("Capture")
-                .child(kbd(t, format!("{}⇧K", mod_symbol()))),
+                .child(kbd(t, chord_shift("K"))),
         );
         let capture_btn = capture_btn.on_click(cx.listener(|this, _, window, cx| {
             this.on_capture(&Capture, window, cx);
@@ -82,13 +82,13 @@ impl Workspace {
 
     pub(crate) fn render_statusbar(&self, t: &KairnTheme, cx: &App) -> impl IntoElement {
         let running = self.sessions.iter().filter(|s| s.busy).count();
-        let m = mod_symbol();
         let hints = [
-            format!("{m}\\ sidebar"),
-            format!("{m}1–9 sessions"),
+            format!("{} sidebar", chord("\\")),
+            format!("{} sessions", chord("1–9")),
             format!("{} jump", chord("J")),
-            format!("⇧{m}⏎ terminal"),
-            format!("⌥{m}⏎ writing"),
+            format!("{} capture", chord_shift("K")),
+            format!("{} terminal", chord_shift("⏎")),
+            format!("{} writing", chord_alt("⏎")),
         ];
         let _ = cx;
         let mut bar = h_flex()

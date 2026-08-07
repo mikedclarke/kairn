@@ -14,7 +14,7 @@ use gpui_component::WindowExt;
 use kairn_core as notes;
 use kairn_core::TaskQuery;
 
-use crate::workspace::{PaneView, Workspace};
+use crate::workspace::{LayoutMode, PaneView, Workspace};
 
 /// Paths this instance just wrote, with when and a hash of what was
 /// written: the file watcher uses it to skip reload storms caused by our
@@ -51,10 +51,20 @@ impl Workspace {
         }
     }
 
+    /// Anything that shows a note must actually show it: a full-screen
+    /// terminal drops back to the split. Every opener funnels through the
+    /// three methods below, so this is the one demotion point.
+    fn show_note_pane(&mut self) {
+        if self.layout == LayoutMode::TerminalFull {
+            self.layout = LayoutMode::Split;
+        }
+    }
+
     pub fn select_day(&mut self, day: NaiveDate, cx: &mut Context<Self>) {
         self.commit_line_edit(true, cx);
         self.selected_day = day;
         self.view = PaneView::Day;
+        self.show_note_pane();
         self.reload_notes();
         cx.notify();
     }
@@ -62,6 +72,7 @@ impl Workspace {
     pub fn open_note(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.commit_line_edit(true, cx);
         self.view = PaneView::Note(path);
+        self.show_note_pane();
         self.reload_notes();
         cx.notify();
     }
@@ -69,6 +80,7 @@ impl Workspace {
     pub fn open_task_view(&mut self, query: TaskQuery, cx: &mut Context<Self>) {
         self.commit_line_edit(true, cx);
         self.view = PaneView::Tasks(query);
+        self.show_note_pane();
         self.reload_notes();
         cx.notify();
     }

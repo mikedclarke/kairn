@@ -15,7 +15,9 @@ use gpui_component::{
 use chrono::Local;
 use kairn_core as notes;
 
-use crate::keymap::{Capture, CloseOverlay, InputDown, InputUp, OpenSettings, ToggleSwitcher};
+use crate::keymap::{
+    Capture, CloseOverlay, InputDown, InputUp, OpenSettings, ToggleSwitcher, chord,
+};
 use crate::session::SessionKind;
 use crate::theme::KairnTheme;
 use crate::ui::{picker_item, picker_rule, switcher_item, switcher_section};
@@ -73,9 +75,6 @@ impl Workspace {
         match hit.date {
             Some(date) => self.select_day(date, cx),
             None => self.open_note(hit.path.clone(), cx),
-        }
-        if self.layout == LayoutMode::TerminalFull {
-            self.layout = LayoutMode::Split;
         }
         self.close_overlays(window, cx);
     }
@@ -265,15 +264,48 @@ impl Workspace {
                                 });
                             }));
                         }
-                        InputEvent::PressEnter { .. } => {
-                            let hit = match &this.overlay {
-                                Some(Overlay::Switcher { hits, selected, .. }) => {
-                                    hits.get(*selected).or_else(|| hits.first()).cloned()
-                                }
-                                _ => None,
+                        InputEvent::PressEnter { secondary } => {
+                            let query = state.read(cx).value().trim().to_string();
+                            let (hit, moved) = match &this.overlay {
+                                Some(Overlay::Switcher { hits, selected, .. }) => (
+                                    hits.get(*selected).or_else(|| hits.first()).cloned(),
+                                    *selected > 0,
+                                ),
+                                _ => (None, false),
                             };
+                            // A date-shaped query jumps straight to that day
+                            // (unless the user arrowed onto a result).
+                            if !moved
+                                && let Some(date) = notes::parse_day_query(
+                                    &query,
+                                    Local::now().date_naive(),
+                                )
+                            {
+                                this.select_day(date, cx);
+                                if *secondary {
+                                    this.layout = LayoutMode::Split;
+                                }
+                                this.close_overlays(window, cx);
+                                return;
+                            }
                             if let Some(hit) = hit {
                                 this.open_search_hit(&hit, window, cx);
+                                // Secondary Enter opens beside the terminal,
+                                // whatever layout we came from.
+                                if *secondary {
+                                    this.layout = LayoutMode::Split;
+                                }
+                                return;
+                            }
+                            // No note hit: the first session whose label
+                            // matches wins, so "her" still reaches "herdr".
+                            if !query.is_empty()
+                                && let Some(i) = this.sessions.iter().position(|s| {
+                                    notes::fuzzy_score(&query, &s.label()).is_some()
+                                })
+                            {
+                                this.activate_session(i, window, cx);
+                                this.close_overlays(window, cx);
                             }
                         }
                         _ => {}
@@ -455,6 +487,59 @@ impl Workspace {
 
         // A live query swaps the jump lists for search results.
         if !query.is_empty() {
+            if let Some(date) = notes::parse_day_query(&query, Local::now().date_naive()) {
+                let label = format!(
+                    "{}, {} {} {}",
+                    date.format("%A"),
+                    date.format("%-d"),
+                    date.format("%B"),
+                    date.format("%Y"),
+                );
+                card = card.child(switcher_section(t, "Days")).child(
+                    switcher_item(t, "switcher-date-jump", cx)
+                        .child(div().w(px(14.)).text_color(t.faint).child("◷"))
+                        .child(div().flex_1().child(label))
+                        .child(div().text_size(px(11.)).text_color(t.faint).child("jump to day"))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.select_day(date, cx);
+                            this.close_overlays(window, cx);
+                        })),
+                );
+            }
+            // Sessions stay reachable with a query, per the mockup.
+            let session_hits: Vec<usize> = self
+                .sessions
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| notes::fuzzy_score(&query, &s.label()).is_some())
+                .map(|(i, _)| i)
+                .collect();
+            if !session_hits.is_empty() {
+                card = card.child(switcher_section(t, "Sessions"));
+                for i in session_hits {
+                    let session = &self.sessions[i];
+                    let busy = session.busy;
+                    card = card.child(
+                        switcher_item(t, ("switcher-session-hit", i), cx)
+                            .child(
+                                div()
+                                    .w(px(7.))
+                                    .h(px(7.))
+                                    .rounded_full()
+                                    .when_else(
+                                        busy,
+                                        |d| d.bg(t.accent),
+                                        |d| d.border_1().border_color(t.faint),
+                                    ),
+                            )
+                            .child(div().flex_1().child(session.label()))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.activate_session(i, window, cx);
+                                this.close_overlays(window, cx);
+                            })),
+                    );
+                }
+            }
             card = card.child(switcher_section(t, "Notes & days"));
             if hits.is_empty() {
                 card = card.child(
@@ -505,6 +590,7 @@ impl Workspace {
                     .text_color(t.faint)
                     .child("↑↓ select")
                     .child("⏎ open")
+                    .child(format!("{} open in split", chord("⏎")))
                     .child("esc close"),
             );
             return Some(switcher_backdrop(self, t, cx).child(card));

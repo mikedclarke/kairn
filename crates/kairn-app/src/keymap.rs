@@ -86,16 +86,43 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
-pub fn mod_symbol() -> &'static str {
-    if cfg!(target_os = "macos") { "⌘" } else { "Ctrl+" }
-}
+// Every keybinding hint in the app goes through the chord family below, so
+// labels stay platform-correct: mac glyphs on macOS, plain modifier words on
+// Linux (where letter chords ride Ctrl+Shift, matching `init`).
 
-/// Display label for a primary-modifier letter chord, matching `init`:
-/// ⌘ on macOS, Ctrl+⇧ on Linux.
+/// Primary chord: `⌘J` / `Ctrl+Shift+J`, `⌘1` / `Ctrl+1`.
 pub fn chord(key: &str) -> String {
     if cfg!(target_os = "macos") {
         format!("⌘{key}")
+    } else if key.chars().count() == 1 && key.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+    {
+        format!("Ctrl+Shift+{}", key.to_uppercase())
     } else {
-        format!("Ctrl+⇧{key}")
+        format!("Ctrl+{}", linux_key(key))
+    }
+}
+
+/// Primary+Shift chord: `⇧⌘⏎` / `Ctrl+Shift+Enter`.
+pub fn chord_shift(key: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("⇧⌘{key}")
+    } else {
+        format!("Ctrl+Shift+{}", linux_key(key))
+    }
+}
+
+/// Primary+Alt chord: `⌥⌘⏎` / `Ctrl+Alt+Enter`.
+pub fn chord_alt(key: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("⌥⌘{key}")
+    } else {
+        format!("Ctrl+Alt+{}", linux_key(key))
+    }
+}
+
+fn linux_key(key: &str) -> String {
+    match key {
+        "⏎" => "Enter".to_string(),
+        k => k.to_uppercase(),
     }
 }

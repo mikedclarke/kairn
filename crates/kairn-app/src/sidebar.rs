@@ -7,7 +7,7 @@ use gpui::{
 
 use crate::session::SessionKind;
 use crate::theme::{self, KairnTheme};
-use crate::workspace::{PaneView, TaskQuery, Workspace, kbd, mod_symbol};
+use crate::workspace::{PaneView, TaskQuery, Workspace, chord, kbd};
 
 impl Workspace {
     pub fn render_sidebar(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -152,7 +152,7 @@ impl Workspace {
                         .font_family(theme::mono_font())
                         .text_size(px(10.5))
                         .text_color(t.faint)
-                        .child(format!("{}{}", mod_symbol(), i + 1)),
+                        .child(chord(&(i + 1).to_string())),
                 );
             }
             side = side.child(row.on_click(cx.listener(move |this, _, window, cx| {
@@ -171,42 +171,17 @@ impl Workspace {
                 ),
         );
 
-        // Agents feed: stub until the agent layer exists (Phase E).
-        let feed: [(&str, &str, &str); 3] = [
-            ("08:41", "pm", "appended 2 items to Today"),
-            ("08:12", "research", "updated knowledge/gpui-notes.md"),
-            ("07:55", "build", "linux build green"),
-        ];
+        // Agents: an honest empty state until the Phase E activity log
+        // exists. Fabricated rows in a calm UI are worse than nothing.
         side = side.child(sechead(t, "Agents", None));
-        let mut feed_box = div().px(px(14.)).pb(px(16.)).flex().flex_col().gap(px(7.));
-        for (time, agent, text) in feed {
-            feed_box = feed_box.child(
-                div()
-                    .flex()
-                    .gap(px(8.))
-                    .text_size(px(11.5))
-                    .text_color(t.dim)
-                    .child(div().w(px(34.)).flex_none().text_color(t.faint).child(time))
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_wrap()
-                                    .gap(px(4.))
-                                    .child(
-                                        div()
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .text_color(t.accent)
-                                            .child(agent),
-                                    )
-                                    .child(div().child(text)),
-                            ),
-                    ),
-            );
-        }
-        side = side.child(feed_box);
+        side = side.child(
+            div()
+                .px(px(14.))
+                .pb(px(16.))
+                .text_size(px(11.5))
+                .text_color(t.faint)
+                .child("No agent activity yet"),
+        );
 
         // Pinned footer: the always-visible way into Settings.
         let hover_bg = t.hover;
@@ -226,7 +201,7 @@ impl Workspace {
             .hover(move |s| s.bg(hover_bg).text_color(hover_text))
             .child(div().text_size(px(13.)).child("⚙"))
             .child(div().flex_1().child("Settings"))
-            .child(kbd(t, format!("{},", mod_symbol())))
+            .child(kbd(t, chord(",")))
             .on_click(cx.listener(|this, _, window, cx| {
                 this.open_settings(window, cx);
             }));

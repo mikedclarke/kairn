@@ -321,6 +321,32 @@ pub fn fuzzy_score(needle: &str, haystack: &str) -> Option<i64> {
     Some(score)
 }
 
+/// A day typed as a search query: ISO (`2026-08-12`) or a human month-day
+/// like `aug 12`, `12 Aug`, or `August 12 2027`; a missing year means this
+/// year. `None` when the query isn't date-shaped.
+pub fn parse_day_query(query: &str, today: NaiveDate) -> Option<NaiveDate> {
+    const FORMATS: [&str; 4] = ["%d %b %Y", "%b %d %Y", "%d %B %Y", "%B %d %Y"];
+    let q = query.trim();
+    if q.is_empty() {
+        return None;
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(q, "%Y-%m-%d") {
+        return Some(date);
+    }
+    for fmt in FORMATS {
+        if let Ok(date) = NaiveDate::parse_from_str(q, fmt) {
+            return Some(date);
+        }
+    }
+    let with_year = format!("{q} {}", today.format("%Y"));
+    for fmt in FORMATS {
+        if let Ok(date) = NaiveDate::parse_from_str(&with_year, fmt) {
+            return Some(date);
+        }
+    }
+    None
+}
+
 /// One switcher search result.
 #[derive(Clone, Debug)]
 pub struct SearchHit {
@@ -475,6 +501,18 @@ mod tests {
         // The copy itself has no copies, and unrelated days are untouched.
         assert!(conflict_copies(&copy).is_empty());
         assert!(conflict_copies(&root.0.join("Calendar/20260807.md")).is_empty());
+    }
+
+    #[test]
+    fn day_queries_parse() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 7).expect("valid");
+        let d = |y, m, day| NaiveDate::from_ymd_opt(y, m, day).expect("valid");
+        assert_eq!(parse_day_query("2026-08-12", today), Some(d(2026, 8, 12)));
+        assert_eq!(parse_day_query("aug 12", today), Some(d(2026, 8, 12)));
+        assert_eq!(parse_day_query("12 Aug", today), Some(d(2026, 8, 12)));
+        assert_eq!(parse_day_query("August 12 2027", today), Some(d(2027, 8, 12)));
+        assert_eq!(parse_day_query("kairn", today), None);
+        assert_eq!(parse_day_query("", today), None);
     }
 
     #[cfg(unix)]
