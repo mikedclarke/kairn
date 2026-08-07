@@ -7,12 +7,14 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     h_flex,
     input::{Input, InputState},
+    select::{SearchableVec, Select, SelectState},
     v_flex,
 };
 
 use kairn_core::settings::SshHost;
+use kairn_core::themes::ThemeEntry;
 use crate::keymap::keybind_list;
-use crate::theme::{self, KairnThemeExt as _, Mode};
+use crate::theme::KairnThemeExt as _;
 use crate::ui::kbd;
 use crate::workspace::Workspace;
 
@@ -20,19 +22,27 @@ use crate::workspace::Workspace;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     General,
+    Theme,
     Templates,
     Ssh,
     Keybinds,
 }
 
 impl Tab {
-    const ALL: [(Tab, &'static str); 4] = [
+    const ALL: [(Tab, &'static str); 5] = [
         (Tab::General, "General"),
+        (Tab::Theme, "Theme"),
         (Tab::Templates, "Templates"),
         (Tab::Ssh, "SSH hosts"),
         (Tab::Keybinds, "Keybinds"),
     ];
 }
+
+type FontSelect = Entity<SelectState<SearchableVec<String>>>;
+
+/// The sentinel first entry of every font picker: no override stored, the
+/// built-in choice applies.
+const DEFAULT_FONT: &str = "Default";
 
 pub struct SettingsEditor {
     workspace: WeakEntity<Workspace>,
@@ -45,6 +55,18 @@ pub struct SettingsEditor {
     template_body: Entity<InputState>,
     /// Pending apply rule; lands with Save like the body.
     template_rule: String,
+    /// Pending theme id ("dark"/"light" or a theme-file stem); lands with
+    /// Save, so browsing choices never repaints the app behind the dialog.
+    theme_choice: String,
+    /// Theme files found in `.kairn/themes/` at open.
+    themes: Vec<ThemeEntry>,
+    ui_font: FontSelect,
+    editor_font: FontSelect,
+    mono_font: FontSelect,
+    editor_size: Entity<InputState>,
+    /// Font settings as loaded, kept so a font that isn't installed on this
+    /// machine (empty picker selection) survives a Save untouched.
+    fonts_loaded: (Option<String>, Option<String>, Option<String>, Option<f32>),
 }
 
 struct HostRow {
@@ -109,9 +131,42 @@ impl SettingsEditor {
             InputState::new(window, cx)
                 .multi_line(true)
                 .rows(10)
-                .placeholder("## Tasks\n* ")
+                // Single line only: a newline inside a placeholder panics
+                // gpui's Mac text layout (docs/vendor NOTES).
+                .placeholder("Markdown seeded into each new daily note")
                 .default_value(template_loaded.clone())
         });
+
+        let themes = kairn_core::themes::list_themes(&ws.notes_root);
+        // Installed families for the pickers; macOS dot-prefixed system
+        // internals stay out.
+        let mut families: Vec<String> = cx.text_system().all_font_names();
+        families.retain(|f| !f.starts_with('.'));
+        families.sort();
+        families.dedup();
+        let mut font_select = |current: &Option<String>, cx: &mut Context<Self>| -> FontSelect {
+            let mut items = Vec::with_capacity(families.len() + 1);
+            items.push(DEFAULT_FONT.to_string());
+            items.extend(families.iter().cloned());
+            let selected = current.clone().unwrap_or_else(|| DEFAULT_FONT.to_string());
+            cx.new(|cx| {
+                let mut state =
+                    SelectState::new(SearchableVec::new(items), None, window, cx).searchable(true);
+                state.set_selected_value(&selected, window, cx);
+                state
+            })
+        };
+        let ui_font = font_select(&ws.settings.ui_font, cx);
+        let editor_font = font_select(&ws.settings.editor_font, cx);
+        let mono_font = font_select(&ws.settings.mono_font, cx);
+        let editor_size = cx.new(|cx| {
+            let state = InputState::new(window, cx).placeholder("13");
+            match ws.settings.editor_font_size {
+                Some(s) => state.default_value(fmt_size(s)),
+                None => state,
+            }
+        });
+
         Self {
             workspace,
             tab: Tab::General,
@@ -120,6 +175,18 @@ impl SettingsEditor {
             template_loaded,
             template_body,
             template_rule: ws.settings.daily_template_rule.clone(),
+            theme_choice: ws.settings.theme.clone(),
+            themes,
+            ui_font,
+            editor_font,
+            mono_font,
+            editor_size,
+            fonts_loaded: (
+                ws.settings.ui_font.clone(),
+                ws.settings.editor_font.clone(),
+                ws.settings.mono_font.clone(),
+                ws.settings.editor_font_size,
+            ),
         }
     }
 
@@ -146,11 +213,37 @@ impl SettingsEditor {
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let raw = self.notes_root.read(cx).value().trim().to_string();
         let body = self.template_body.read(cx).value().to_string();
+        let font_of = |sel: &FontSelect, loaded: &Option<String>| match sel
+            .read(cx)
+            .selected_value()
+        {
+            Some(v) if v == DEFAULT_FONT => None,
+            Some(v) => Some(v.clone()),
+            // A configured family that isn't installed here selects nothing;
+            // keep it rather than silently dropping the other machine's font.
+            None => loaded.clone(),
+        };
+        let size_raw = self.editor_size.read(cx).value().trim().to_string();
+        let editor_font_size = if size_raw.is_empty() {
+            None
+        } else {
+            match size_raw.parse::<f32>() {
+                Ok(s) if (9.0..=32.0).contains(&s) => Some(s),
+                // Nonsense input falls back to what was loaded, not to a
+                // surprise reset.
+                _ => self.fonts_loaded.3,
+            }
+        };
         let patch = crate::vault_state::SettingsPatch {
             notes_root: (!raw.is_empty()).then_some(raw),
             hosts: self.collect_hosts(cx),
             daily_template_rule: self.template_rule.clone(),
             template_body: (body != self.template_loaded).then_some(body),
+            theme: self.theme_choice.clone(),
+            ui_font: font_of(&self.ui_font, &self.fonts_loaded.0),
+            editor_font: font_of(&self.editor_font, &self.fonts_loaded.1),
+            mono_font: font_of(&self.mono_font, &self.fonts_loaded.2),
+            editor_font_size,
         };
         let _ = self.workspace.update(cx, |ws, cx| {
             ws.apply_settings(patch, window, cx);
@@ -168,11 +261,6 @@ impl SettingsEditor {
     }
 
     fn render_general(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let mode = self
-            .workspace
-            .upgrade()
-            .map(|ws| ws.read(cx).mode())
-            .unwrap_or(Mode::Dark);
         let daily_forward = self
             .workspace
             .upgrade()
@@ -194,16 +282,6 @@ impl SettingsEditor {
             .map(|ws| ws.read(cx).notes_root.display().to_string())
             .unwrap_or_default();
 
-        let theme_button = |id: &'static str, label: &'static str, m: Mode| {
-            let btn = Button::new(id).label(label);
-            let btn = if m == mode { btn.primary() } else { btn.outline() };
-            btn.on_click(cx.listener(move |this, _, window, cx| {
-                let _ = this.workspace.update(cx, |ws, cx| {
-                    ws.set_theme(m, window, cx);
-                });
-                cx.notify();
-            }))
-        };
         let daily_button = |id: &'static str, label: &'static str, forward: bool| {
             let btn = Button::new(id).label(label);
             let btn = if forward == daily_forward { btn.primary() } else { btn.outline() };
@@ -244,13 +322,6 @@ impl SettingsEditor {
                 "Currently {resolved}. A NotePlan-style folder works as-is; Calendar/, \
                  Notes/ and .kairn/ are created if missing."
             )))
-            .child(Self::section("Theme"))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(theme_button("theme-dark", "Dark", Mode::Dark))
-                    .child(theme_button("theme-light", "Light", Mode::Light)),
-            )
             .child(Self::section("Sidebar daily list"))
             .child(
                 h_flex()
@@ -278,6 +349,67 @@ impl SettingsEditor {
             ))
     }
 
+    fn render_theme(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let mut choices: Vec<(String, String)> = vec![
+            ("dark".to_string(), "Dark".to_string()),
+            ("light".to_string(), "Light".to_string()),
+        ];
+        choices.extend(self.themes.iter().map(|t| (t.id.clone(), t.name.clone())));
+        let mut theme_row = h_flex().gap_2().flex_wrap();
+        for (i, (id, name)) in choices.into_iter().enumerate() {
+            let btn = Button::new(("theme-choice", i)).label(name);
+            let btn = if id == self.theme_choice { btn.primary() } else { btn.outline() };
+            theme_row = theme_row.child(btn.on_click(cx.listener(move |this, _, _, cx| {
+                this.theme_choice = id.clone();
+                cx.notify();
+            })));
+        }
+
+        let label = |text: &'static str| {
+            div().w(px(120.)).flex_none().text_size(px(12.5)).child(text)
+        };
+        let font_row = |text: &'static str, sel: &FontSelect| {
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(label(text))
+                .child(div().flex_1().child(Select::new(sel)))
+        };
+
+        v_flex()
+            .gap_2()
+            .w_full()
+            .child(Self::section("Theme"))
+            .child(theme_row)
+            .child(div().text_size(px(11.)).opacity(0.55).child(
+                "Dark and Light are built in. Custom themes are JSON files in \
+                 .kairn/themes/ inside your notes folder; any colours, fonts, and \
+                 terminal shades they leave out fall back to the built-ins.",
+            ))
+            .child(Self::section("Fonts"))
+            .child(font_row("Interface", &self.ui_font))
+            .child(font_row("Notes editor", &self.editor_font))
+            .child(font_row("Terminal & mono", &self.mono_font))
+            .child(div().text_size(px(11.)).opacity(0.55).child(
+                "Default keeps the built-in choice: the system font for the \
+                 interface, the interface font for notes, and an auto-detected \
+                 mono for the terminal.",
+            ))
+            .child(Self::section("Editor text size"))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().w(px(70.)).flex_none().child(Input::new(&self.editor_size)))
+                    .child(div().text_size(px(11.)).opacity(0.55).child(
+                        "In pixels; headings scale with it. Default 13.",
+                    )),
+            )
+            .child(div().text_size(px(11.)).opacity(0.55).child(
+                "Changes apply when you save.",
+            ))
+    }
+
     fn render_templates(&self, cx: &mut Context<Self>) -> gpui::Div {
         let rule_button = |id: &'static str, label: &'static str, rule: &'static str| {
             let btn = Button::new(id).label(label);
@@ -294,7 +426,7 @@ impl SettingsEditor {
             .child(Self::section("Daily template"))
             .child(
                 div()
-                    .font_family(theme::mono_font())
+                    .font_family(cx.kairn().mono_font.clone())
                     .text_size(px(12.))
                     .child(Input::new(&self.template_body).h(px(230.))),
             )
@@ -382,6 +514,7 @@ impl Render for SettingsEditor {
 
         let content = match self.tab {
             Tab::General => self.render_general(cx),
+            Tab::Theme => self.render_theme(cx),
             Tab::Templates => self.render_templates(cx),
             Tab::Ssh => self.render_ssh(cx),
             Tab::Keybinds => self.render_keybinds(cx),
@@ -414,6 +547,15 @@ impl Render for SettingsEditor {
                             })),
                     ),
             )
+    }
+}
+
+/// A size for the input field: "13", not "13.0", but "14.5" stays exact.
+fn fmt_size(s: f32) -> String {
+    if s.fract() == 0.0 {
+        format!("{}", s as i32)
+    } else {
+        format!("{s}")
     }
 }
 

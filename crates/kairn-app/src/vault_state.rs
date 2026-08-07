@@ -538,6 +538,11 @@ impl Workspace {
         self.settings.ssh_hosts = patch.hosts;
         self.settings.notes_root = patch.notes_root;
         self.settings.daily_template_rule = patch.daily_template_rule;
+        self.settings.theme = patch.theme;
+        self.settings.ui_font = patch.ui_font;
+        self.settings.editor_font = patch.editor_font;
+        self.settings.mono_font = patch.mono_font;
+        self.settings.editor_font_size = patch.editor_font_size;
         // Applying settings is the explicit user action that ends the
         // degraded no-save state after a corrupt settings.json.
         self.settings.degraded = false;
@@ -573,6 +578,10 @@ impl Workspace {
                 }
             }
         }
+        // Re-resolve the theme every apply: the choice, the fonts, or the
+        // notes root (where theme files live) may all have changed.
+        crate::theme::apply(&self.settings, &self.notes_root, Some(window), cx);
+        self.retheme_sessions(cx);
         self.reload_notes(cx);
         cx.notify();
     }
@@ -585,4 +594,10 @@ pub struct SettingsPatch {
     pub daily_template_rule: String,
     /// The daily template body, only when the dialog changed it.
     pub template_body: Option<String>,
+    /// Theme id: "dark", "light", or a `.kairn/themes` file stem.
+    pub theme: String,
+    pub ui_font: Option<String>,
+    pub editor_font: Option<String>,
+    pub mono_font: Option<String>,
+    pub editor_font_size: Option<f32>,
 }

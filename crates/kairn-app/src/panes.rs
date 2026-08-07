@@ -109,7 +109,10 @@ impl Workspace {
             .min_w(px(0.))
             .flex()
             .flex_col()
-            .bg(t.bg);
+            .bg(t.bg)
+            // The notes font: everything in the pane (masthead, editor,
+            // mentions) follows it; unset inherits the UI font.
+            .when_some(t.editor_font.clone(), |d, f| d.font_family(f));
         if strip_on {
             pane = pane.child(self.render_week_strip(t, cx));
         } else {
@@ -376,7 +379,7 @@ impl Workspace {
                 .border_1()
                 .border_color(if current { t.accent } else { t.border })
                 .bg(t.panel)
-                .font_family(crate::theme::mono_font())
+                .font_family(t.mono_font.clone())
                 .text_size(px(10.5))
                 .text_color(if current { t.text } else { t.dim })
                 .child(
@@ -666,6 +669,7 @@ fn note_frame(
             div()
                 .text_size(px(21.))
                 .font_weight(gpui::FontWeight::BOLD)
+                .text_color(t.heading)
                 .child(masthead),
         );
     if let Some(badge) = badge {

@@ -5,11 +5,11 @@ use gpui::{
     Styled, div, px,
 };
 
-use crate::theme::{self, KairnTheme};
+use crate::theme::KairnTheme;
 
 pub fn kbd(t: &KairnTheme, label: impl Into<SharedString>) -> gpui::Div {
     div()
-        .font_family(theme::mono_font())
+        .font_family(t.mono_font.clone())
         .text_size(px(10.5))
         .text_color(t.faint)
         .border_1()

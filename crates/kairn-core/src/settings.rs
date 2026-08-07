@@ -53,6 +53,18 @@ pub struct Settings {
     /// "off". Unknown values read as "always".
     #[serde(default = "default_template_rule")]
     pub daily_template_rule: String,
+    /// Font overrides on top of the active theme. UI chrome (unset keeps
+    /// the system font), the notes editor (unset follows the UI font), and
+    /// the terminal/mono font (unset keeps the auto-resolved mono).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_font: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_font: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mono_font: Option<String>,
+    /// Editor body size in px; headings scale with it. Unset means 13.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_font_size: Option<f32>,
     /// Set when the settings file existed but couldn't be parsed. While
     /// degraded, [`Settings::save`] refuses to run: auto-saving defaults
     /// over a corrupt file is how SSH hosts and the notes root get wiped.
@@ -88,6 +100,10 @@ impl Default for Settings {
             week_strip: default_week_strip(),
             day_timeline: true,
             daily_template_rule: default_template_rule(),
+            ui_font: None,
+            editor_font: None,
+            mono_font: None,
+            editor_font_size: None,
             degraded: false,
         }
     }

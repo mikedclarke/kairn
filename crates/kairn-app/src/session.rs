@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use kairn_core::settings::SshHost;
-use crate::theme::{self, Mode};
+use crate::theme::KairnThemeExt as _;
 use crate::workspace::Workspace;
 
 pub const TERM_FONT_SIZE: f32 = 13.0;
@@ -95,10 +95,13 @@ fn shell_command(kind: &SessionKind) -> (CommandBuilder, SharedString) {
 pub fn spawn(
     id: u64,
     kind: SessionKind,
-    mode: Mode,
     workspace: WeakEntity<Workspace>,
     cx: &mut Context<Workspace>,
 ) -> Result<Session> {
+    let (term_colors, mono_font) = {
+        let t = cx.kairn();
+        (t.term_colors.clone(), t.mono_font.to_string())
+    };
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -129,7 +132,7 @@ pub fn spawn(
     let child = Arc::new(Mutex::new(child));
 
     let config = TerminalConfig {
-        font_family: theme::mono_font().into(),
+        font_family: mono_font,
         font_size: px(TERM_FONT_SIZE),
         cols: 80,
         rows: 24,
@@ -141,7 +144,7 @@ pub fn spawn(
             bottom: px(12.0),
             left: px(14.0),
         },
-        colors: theme::terminal_palette(mode),
+        colors: term_colors,
     };
 
     let resize_master = master.clone();

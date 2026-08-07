@@ -5,7 +5,8 @@ use std::time::Duration;
 use chrono::{Local, NaiveDate};
 use gpui::{
     Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, Render, SharedString, Styled, Task, Window, div, px,
+    ParentElement, Render, SharedString, Styled, Task, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::Root;
 use kairn_core as notes;
@@ -227,10 +228,6 @@ impl Workspace {
         this
     }
 
-    pub fn mode(&self) -> Mode {
-        Mode::from_str(&self.settings.theme)
-    }
-
     // ----- sessions -----
 
     pub fn spawn_session(
@@ -242,7 +239,7 @@ impl Workspace {
         let id = self.next_session_id;
         self.next_session_id += 1;
         let weak = cx.weak_entity();
-        match spawn(id, kind, self.mode(), weak, cx) {
+        match spawn(id, kind, weak, cx) {
             Ok(session) => {
                 self.sessions.push(session);
                 self.activate_session(self.sessions.len() - 1, window, cx);
@@ -401,23 +398,40 @@ impl Workspace {
     }
 
     pub(crate) fn on_toggle_theme(&mut self, _: &ToggleThemeMode, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_theme(self.mode().toggled(), window, cx);
+        // With a custom theme active, the toggle jumps to the built-in of
+        // the opposite mode: a predictable escape hatch, not a cycle.
+        let name = match cx.kairn().mode {
+            Mode::Dark => "light",
+            Mode::Light => "dark",
+        };
+        self.set_theme(name, window, cx);
     }
 
-    pub fn set_theme(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
-        self.settings.theme = mode.as_str().to_string();
+    pub fn set_theme(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.theme = name.to_string();
         if let Err(e) = self.settings.save() {
             eprintln!("kairn: failed to save settings: {e}");
         }
-        theme::apply(mode, Some(window), cx);
+        theme::apply(&self.settings, &self.notes_root, Some(window), cx);
+        self.retheme_sessions(cx);
+        cx.notify();
+    }
+
+    /// Push the active theme's terminal palette and mono font into every
+    /// live session.
+    pub(crate) fn retheme_sessions(&self, cx: &mut Context<Self>) {
+        let (colors, font) = {
+            let t = cx.kairn();
+            (t.term_colors.clone(), t.mono_font.to_string())
+        };
         for session in &self.sessions {
             session.view.update(cx, |view, cx| {
                 let mut config = view.config().clone();
-                config.colors = theme::terminal_palette(mode);
+                config.colors = colors.clone();
+                config.font_family = font.clone();
                 view.update_config(config, cx);
             });
         }
-        cx.notify();
     }
 
     pub(crate) fn on_open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
@@ -495,6 +509,7 @@ impl Render for Workspace {
             .bg(t.bg)
             .text_color(t.text)
             .text_size(px(13.))
+            .when_some(t.ui_font.clone(), |d, f| d.font_family(f))
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_toggle_terminal_full))
             .on_action(cx.listener(Self::on_toggle_writing))

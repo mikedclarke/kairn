@@ -1,6 +1,10 @@
-use gpui::{App, Global, Hsla, Window, rgb, rgba};
+use std::path::Path;
+
+use gpui::{App, Global, Hsla, SharedString, Window, rgb, rgba};
 use gpui_component::theme::{Theme, ThemeMode};
 use gpui_terminal::ColorPalette;
+use kairn_core::settings::Settings;
+use kairn_core::themes::{ThemeSpec, ThemeTerminal, parse_hex_color};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -9,24 +13,10 @@ pub enum Mode {
 }
 
 impl Mode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Mode::Dark => "dark",
-            Mode::Light => "light",
-        }
-    }
-
     pub fn from_str(s: &str) -> Self {
         match s {
             "light" => Mode::Light,
             _ => Mode::Dark,
-        }
-    }
-
-    pub fn toggled(self) -> Self {
-        match self {
-            Mode::Dark => Mode::Light,
-            Mode::Light => Mode::Dark,
         }
     }
 }
@@ -39,7 +29,9 @@ fn ca(hex: u32) -> Hsla {
     rgba(hex).into()
 }
 
-/// The sage/amber palette from the locked design spec, one struct per mode.
+/// The active look: colors, fonts, and the terminal palette. The built-in
+/// pair is the sage/amber palette from the locked design spec; theme files
+/// (`.kairn/themes/*.json`) override any subset of it.
 #[derive(Clone)]
 pub struct KairnTheme {
     pub mode: Mode,
@@ -57,10 +49,29 @@ pub struct KairnTheme {
     pub red: Hsla,
     pub term_bg: Hsla,
     pub sel: Hsla,
+    /// `==highlight==` background, alpha included.
+    pub highlight: Hsla,
+    /// Heading and note-title text.
+    pub heading: Hsla,
+    /// UI chrome family; `None` keeps the system font.
+    pub ui_font: Option<SharedString>,
+    /// Notes editor family; `None` follows the UI font.
+    pub editor_font: Option<SharedString>,
+    /// Terminal and mono family.
+    pub mono_font: SharedString,
+    /// Editor body size in px; headings scale with it.
+    pub editor_size: f32,
+    pub term_colors: ColorPalette,
 }
+
+/// The default editor body size the metrics in the note editor are drawn
+/// against; `editor_size / EDITOR_BASE_SIZE` scales them.
+pub const EDITOR_BASE_SIZE: f32 = 13.0;
 
 impl KairnTheme {
     pub fn dark() -> Self {
+        let amber = c(0xd9a75c);
+        let text = c(0xdadcd1);
         Self {
             mode: Mode::Dark,
             bg: c(0x1a1b15),
@@ -68,19 +79,28 @@ impl KairnTheme {
             panel2: c(0x262920),
             hover: c(0x2c2f25),
             border: c(0x31352a),
-            text: c(0xdadcd1),
+            text,
             dim: c(0x90957f),
             faint: c(0x5f6355),
             accent: c(0xa8b48d),
-            amber: c(0xd9a75c),
+            amber,
             on_amber: c(0x1a1a14),
             red: c(0xc97b6d),
             term_bg: c(0x14150f),
             sel: ca(0xa8b48d26),
+            highlight: amber.opacity(0.28),
+            heading: text,
+            ui_font: None,
+            editor_font: None,
+            mono_font: auto_mono().into(),
+            editor_size: EDITOR_BASE_SIZE,
+            term_colors: terminal_palette(&ThemeTerminal::default(), (0x14, 0x15, 0x0f)),
         }
     }
 
     pub fn light() -> Self {
+        let amber = c(0xae7c2c);
+        let text = c(0x2c2e26);
         Self {
             mode: Mode::Light,
             bg: c(0xf4f4ea),
@@ -88,15 +108,24 @@ impl KairnTheme {
             panel2: c(0xe3e4d6),
             hover: c(0xdcded0),
             border: c(0xd4d6c5),
-            text: c(0x2c2e26),
+            text,
             dim: c(0x6e7263),
             faint: c(0x9ba18b),
             accent: c(0x5f7247),
-            amber: c(0xae7c2c),
+            amber,
             on_amber: c(0x1a1a14),
             red: c(0xa8574a),
+            // The terminal stays dark in both modes per the design spec;
+            // only its background shade follows.
             term_bg: c(0x22231c),
             sel: ca(0x5f724721),
+            highlight: amber.opacity(0.28),
+            heading: text,
+            ui_font: None,
+            editor_font: None,
+            mono_font: auto_mono().into(),
+            editor_size: EDITOR_BASE_SIZE,
+            term_colors: terminal_palette(&ThemeTerminal::default(), (0x22, 0x23, 0x1c)),
         }
     }
 
@@ -105,6 +134,60 @@ impl KairnTheme {
             Mode::Dark => Self::dark(),
             Mode::Light => Self::light(),
         }
+    }
+
+    /// A theme file layered over the built-in palette for its mode.
+    pub fn from_spec(spec: &ThemeSpec) -> Self {
+        fn set(dst: &mut Hsla, src: &Option<String>) {
+            if let Some(v) = src.as_deref().and_then(parse_hex_color) {
+                *dst = rgba(u32::from_be_bytes(v)).into();
+            }
+        }
+        let mut t = Self::for_mode(Mode::from_str(&spec.mode));
+        let colors = &spec.colors;
+        set(&mut t.bg, &colors.bg);
+        set(&mut t.panel, &colors.panel);
+        set(&mut t.panel2, &colors.panel2);
+        set(&mut t.hover, &colors.hover);
+        set(&mut t.border, &colors.border);
+        set(&mut t.text, &colors.text);
+        set(&mut t.dim, &colors.dim);
+        set(&mut t.faint, &colors.faint);
+        set(&mut t.accent, &colors.accent);
+        set(&mut t.amber, &colors.amber);
+        set(&mut t.on_amber, &colors.on_amber);
+        set(&mut t.red, &colors.red);
+        set(&mut t.term_bg, &colors.term_bg);
+        set(&mut t.sel, &colors.sel);
+        // The derived defaults follow their sources when the file moves
+        // amber or text but doesn't pin highlight/heading explicitly.
+        t.highlight = t.amber.opacity(0.28);
+        t.heading = t.text;
+        set(&mut t.highlight, &colors.highlight);
+        set(&mut t.heading, &colors.heading);
+        if let Some(f) = &spec.fonts.ui {
+            t.ui_font = Some(f.clone().into());
+        }
+        if let Some(f) = &spec.fonts.editor {
+            t.editor_font = Some(f.clone().into());
+        }
+        if let Some(f) = &spec.fonts.mono {
+            t.mono_font = f.clone().into();
+        }
+        if let Some(s) = spec.fonts.editor_size {
+            t.editor_size = s.clamp(9., 32.);
+        }
+        let term_bg = colors
+            .term_bg
+            .as_deref()
+            .and_then(parse_hex_color)
+            .map(|[r, g, b, _]| (r, g, b))
+            .unwrap_or(match t.mode {
+                Mode::Dark => (0x14, 0x15, 0x0f),
+                Mode::Light => (0x22, 0x23, 0x1c),
+            });
+        t.term_colors = terminal_palette(&spec.terminal, term_bg);
+        t
     }
 }
 
@@ -122,10 +205,31 @@ impl KairnThemeExt for App {
     }
 }
 
-/// Install the palette globally and skin gpui-component's widgets (dialogs,
-/// inputs, buttons) to match, so the few stock components don't look foreign.
-pub fn apply(mode: Mode, window: Option<&mut Window>, cx: &mut App) {
-    let t = KairnTheme::for_mode(mode);
+/// Resolve the configured theme — a built-in name or a `.kairn/themes`
+/// file id — with the settings' font overrides on top, install it as the
+/// active palette, and skin gpui-component's widgets (dialogs, inputs,
+/// buttons) to match, so the few stock components don't look foreign.
+pub fn apply(settings: &Settings, notes_root: &Path, window: Option<&mut Window>, cx: &mut App) {
+    let mut t = match settings.theme.as_str() {
+        "light" => KairnTheme::light(),
+        "dark" => KairnTheme::dark(),
+        id => match kairn_core::themes::load_theme(notes_root, id) {
+            Some(spec) => KairnTheme::from_spec(&spec),
+            None => KairnTheme::dark(),
+        },
+    };
+    if let Some(f) = &settings.ui_font {
+        t.ui_font = Some(f.clone().into());
+    }
+    if let Some(f) = &settings.editor_font {
+        t.editor_font = Some(f.clone().into());
+    }
+    if let Some(f) = &settings.mono_font {
+        t.mono_font = f.clone().into();
+    }
+    if let Some(s) = settings.editor_font_size {
+        t.editor_size = s.clamp(9., 32.);
+    }
 
     Theme::change(
         match t.mode {
@@ -137,6 +241,11 @@ pub fn apply(mode: Mode, window: Option<&mut Window>, cx: &mut App) {
     );
 
     let theme = cx.global_mut::<Theme>();
+    theme.font_family = t
+        .ui_font
+        .clone()
+        .unwrap_or_else(|| ".SystemUIFont".into());
+    theme.mono_font_family = t.mono_font.clone();
     let colors = &mut theme.colors;
     colors.background = t.panel2;
     colors.foreground = t.text;
@@ -175,10 +284,10 @@ pub fn apply(mode: Mode, window: Option<&mut Window>, cx: &mut App) {
 
 static MONO_FONT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// Resolve the app's fonts against the families actually installed, once at
-/// startup. Asking for a family that isn't there makes gpui fall back per
-/// glyph with mismatched advance widths — on Linux the terminal renders with
-/// broken letter spacing rather than failing loudly.
+/// Resolve the fallback mono font against the families actually installed,
+/// once at startup. Asking for a family that isn't there makes gpui fall
+/// back per glyph with mismatched advance widths — on Linux the terminal
+/// renders with broken letter spacing rather than failing loudly.
 pub fn resolve_fonts(cx: &App) {
     let installed: std::collections::HashSet<String> =
         cx.text_system().all_font_names().into_iter().collect();
@@ -214,36 +323,59 @@ pub fn resolve_fonts(cx: &App) {
     let _ = MONO_FONT.set(mono);
 }
 
-pub fn mono_font() -> &'static str {
+/// The auto-resolved mono family: what themes and settings fall back to.
+pub fn auto_mono() -> &'static str {
     MONO_FONT.get().map(String::as_str).unwrap_or("monospace")
 }
 
-/// Terminal colors: sage-tinted ANSI ramp; the terminal stays dark in both
-/// app themes (per the design spec), only its background shade follows.
-pub fn terminal_palette(mode: Mode) -> ColorPalette {
-    let (bg_r, bg_g, bg_b) = match mode {
-        Mode::Dark => (0x14, 0x15, 0x0f),
-        Mode::Light => (0x22, 0x23, 0x1c),
+/// Terminal colors: the sage-tinted ANSI ramp with any theme-file
+/// overrides on top. The stock ramp's background is the theme's terminal
+/// background, so the terminal follows the theme even without overrides.
+fn terminal_palette(spec: &ThemeTerminal, bg: (u8, u8, u8)) -> ColorPalette {
+    let over = |o: &Option<String>, d: (u8, u8, u8)| {
+        o.as_deref()
+            .and_then(parse_hex_color)
+            .map(|[r, g, b, _]| (r, g, b))
+            .unwrap_or(d)
     };
+    let background = over(&spec.background, bg);
+    let foreground = over(&spec.foreground, (0xc9, 0xcc, 0xbf));
+    let cursor = over(&spec.cursor, (0xa8, 0xb4, 0x8d));
+    let black = over(&spec.black, (0x10, 0x10, 0x10));
+    let red = over(&spec.red, (0xc9, 0x7b, 0x6d));
+    let green = over(&spec.green, (0xa8, 0xb4, 0x8d));
+    let yellow = over(&spec.yellow, (0xd9, 0xa7, 0x5c));
+    let blue = over(&spec.blue, (0xa3, 0xb8, 0xef));
+    let magenta = over(&spec.magenta, (0xe6, 0xa3, 0xdc));
+    let cyan = over(&spec.cyan, (0x50, 0xca, 0xcd));
+    let white = over(&spec.white, (0xb0, 0xb0, 0xb0));
+    let bright_black = over(&spec.bright_black, (0x5d, 0x61, 0x56));
+    let bright_red = over(&spec.bright_red, (0xf2, 0xb4, 0xb0));
+    let bright_green = over(&spec.bright_green, (0xbc, 0xc8, 0xa0));
+    let bright_yellow = over(&spec.bright_yellow, (0xe8, 0xc0, 0x84));
+    let bright_blue = over(&spec.bright_blue, (0xb8, 0xc8, 0xf4));
+    let bright_magenta = over(&spec.bright_magenta, (0xf2, 0xb8, 0xe8));
+    let bright_cyan = over(&spec.bright_cyan, (0x74, 0xd8, 0xdc));
+    let bright_white = over(&spec.bright_white, (0xe0, 0xe0, 0xe0));
     ColorPalette::builder()
-        .background(bg_r, bg_g, bg_b)
-        .foreground(0xc9, 0xcc, 0xbf)
-        .cursor(0xa8, 0xb4, 0x8d)
-        .black(0x10, 0x10, 0x10)
-        .red(0xc9, 0x7b, 0x6d)
-        .green(0xa8, 0xb4, 0x8d)
-        .yellow(0xd9, 0xa7, 0x5c)
-        .blue(0xa3, 0xb8, 0xef)
-        .magenta(0xe6, 0xa3, 0xdc)
-        .cyan(0x50, 0xca, 0xcd)
-        .white(0xb0, 0xb0, 0xb0)
-        .bright_black(0x5d, 0x61, 0x56)
-        .bright_red(0xf2, 0xb4, 0xb0)
-        .bright_green(0xbc, 0xc8, 0xa0)
-        .bright_yellow(0xe8, 0xc0, 0x84)
-        .bright_blue(0xb8, 0xc8, 0xf4)
-        .bright_magenta(0xf2, 0xb8, 0xe8)
-        .bright_cyan(0x74, 0xd8, 0xdc)
-        .bright_white(0xe0, 0xe0, 0xe0)
+        .background(background.0, background.1, background.2)
+        .foreground(foreground.0, foreground.1, foreground.2)
+        .cursor(cursor.0, cursor.1, cursor.2)
+        .black(black.0, black.1, black.2)
+        .red(red.0, red.1, red.2)
+        .green(green.0, green.1, green.2)
+        .yellow(yellow.0, yellow.1, yellow.2)
+        .blue(blue.0, blue.1, blue.2)
+        .magenta(magenta.0, magenta.1, magenta.2)
+        .cyan(cyan.0, cyan.1, cyan.2)
+        .white(white.0, white.1, white.2)
+        .bright_black(bright_black.0, bright_black.1, bright_black.2)
+        .bright_red(bright_red.0, bright_red.1, bright_red.2)
+        .bright_green(bright_green.0, bright_green.1, bright_green.2)
+        .bright_yellow(bright_yellow.0, bright_yellow.1, bright_yellow.2)
+        .bright_blue(bright_blue.0, bright_blue.1, bright_blue.2)
+        .bright_magenta(bright_magenta.0, bright_magenta.1, bright_magenta.2)
+        .bright_cyan(bright_cyan.0, bright_cyan.1, bright_cyan.2)
+        .bright_white(bright_white.0, bright_white.1, bright_white.2)
         .build()
 }

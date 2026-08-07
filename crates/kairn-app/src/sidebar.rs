@@ -7,7 +7,7 @@ use gpui::{
 use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
 
 use crate::session::SessionKind;
-use crate::theme::{self, KairnTheme};
+use crate::theme::KairnTheme;
 use crate::workspace::{PaneView, TaskQuery, Workspace, chord, kbd};
 
 /// The file manager by its platform name, for context-menu labels.
@@ -242,7 +242,7 @@ impl Workspace {
                 if i < 9 {
                     row = row.child(
                         div()
-                            .font_family(theme::mono_font())
+                            .font_family(t.mono_font.clone())
                             .text_size(px(10.5))
                             .text_color(t.faint)
                             .child(chord(&(i + 1).to_string())),
@@ -311,7 +311,7 @@ impl Workspace {
                         .child(
                             div()
                                 .flex_none()
-                                .font_family(theme::mono_font())
+                                .font_family(t.mono_font.clone())
                                 .text_size(px(10.5))
                                 .text_color(t.faint)
                                 .child(activity_time(&entry.ts, today)),

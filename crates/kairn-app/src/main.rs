@@ -17,7 +17,6 @@ use gpui_component::{Root, TitleBar};
 use gpui_component_assets::Assets;
 use kairn_core::settings::Settings;
 
-use crate::theme::Mode;
 use crate::workspace::Workspace;
 
 fn main() {
@@ -29,7 +28,7 @@ fn main() {
         theme::resolve_fonts(cx);
 
         let settings = Settings::load();
-        theme::apply(Mode::from_str(&settings.theme), None, cx);
+        theme::apply(&settings, &settings.notes_root(), None, cx);
 
         let mut titlebar = TitleBar::title_bar_options();
         titlebar.title = Some("Kairn".into());

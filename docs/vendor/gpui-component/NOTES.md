@@ -36,6 +36,30 @@ Without these, `open_dialog` / `push_notification` silently do nothing.
   an `Entity<InputState>`; render with `Input::new(&state)`.
 - Read with `state.read(cx).value()`. Change events via
   `cx.subscribe_in(&state, window, ...)` on `InputEvent::Change`.
+- Multi-line: `InputState::new(...).multi_line(true).rows(n)` (default 2
+  rows); the rendered height can be forced with `Input::new(&state).h(px)`
+  (multi-line only). `auto_grow(min, max)` and `code_editor(lang)` also
+  exist. `Input` implements `Styled`, so `.font_family(...)` on a wrapper
+  or the element styles the text.
+- **Placeholders must be single-line.** A `\n` inside `placeholder(...)`
+  panics gpui 0.2.2's Mac text layout the moment the empty input renders
+  ("end byte index N is out of bounds for string of length M" in
+  `text_system.rs`): the placeholder paints per-line but is laid out
+  against the full string's byte length.
+
+## Select (dropdown)
+
+- State: `SelectState::new(delegate, selected_index, window, cx)` held as
+  `Entity<SelectState<D>>`; `Vec<T>` and `SearchableVec<T>` (search box in
+  the menu via `.searchable(true)`) are delegates for `T: SelectItem`
+  (`String`, `SharedString`, `&'static str` provided; `Value = Self`).
+- Select by value: `state.set_selected_value(&value, window, cx)` (needs
+  `Value: PartialEq`); a value not in the list selects nothing and the
+  trigger shows the placeholder.
+- Read: `state.read(cx).selected_value() -> Option<&Value>`.
+- Render: `Select::new(&state)` (+ `.placeholder(...)`, `.menu_width(...)`,
+  `.cleanable(...)`). Works inside dialogs; the menu renders on the popover
+  layer.
 
 ## Context menus
 

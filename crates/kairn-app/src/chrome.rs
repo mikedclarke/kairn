@@ -7,7 +7,7 @@ use gpui::{
 use gpui_component::{TitleBar, h_flex};
 
 use crate::keymap::{ToggleSidebar, ToggleSwitcher, chord};
-use crate::theme::{self, KairnTheme};
+use crate::theme::KairnTheme;
 use crate::ui::kbd;
 use crate::workspace::Workspace;
 
@@ -36,7 +36,7 @@ impl Workspace {
         // Open/close the terminal pane, so it isn't always stuck on screen.
         let terminal_open = self.layout.shows_terminal();
         let terminal_btn = titlebar_button(t, "terminal-btn", cx)
-            .font_family(theme::mono_font())
+            .font_family(t.mono_font.clone())
             .text_color(if terminal_open { t.accent } else { t.dim })
             .child(">_")
             .on_click(cx.listener(|this, _, window, cx| {

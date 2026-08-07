@@ -1396,9 +1396,13 @@ struct KindStyle {
 }
 
 fn kind_style(line: &Line, t: &KairnTheme) -> (KindStyle, Glyph) {
+    // The metrics below are drawn against the default 13px body; a themed
+    // editor size scales text and line heights together, leaving the
+    // paddings and indents (glyph column geometry) alone.
+    let scale = t.editor_size / crate::theme::EDITOR_BASE_SIZE;
     let body = |color| KindStyle {
-        size: px(13.),
-        line_height: px(20.5),
+        size: px(13. * scale),
+        line_height: px(20.5 * scale),
         pad_top: px(1.),
         pad_bottom: px(1.),
         indent: px(0.),
@@ -1410,12 +1414,12 @@ fn kind_style(line: &Line, t: &KairnTheme) -> (KindStyle, Glyph) {
             // Standard markdown scale: `#` biggest down to `#####` smallest,
             // deeper levels treated as 5. Sizes sit against the 13px body.
             let heading = |size: f32, lh: f32, pad_top: f32, pad_bottom: f32| KindStyle {
-                size: px(size),
-                line_height: px(lh),
+                size: px(size * scale),
+                line_height: px(lh * scale),
                 pad_top: px(pad_top),
                 pad_bottom: px(pad_bottom),
                 weight: FontWeight::SEMIBOLD,
-                ..body(t.text)
+                ..body(t.heading)
             };
             let style = match level {
                 1 => KindStyle { weight: FontWeight::BOLD, ..heading(20., 28., 18., 6.) },
@@ -1473,7 +1477,7 @@ fn span_style(kind: SpanKind, base: Hsla, t: &KairnTheme) -> (Hsla, Option<Hsla>
         }
         SpanKind::Tag | SpanKind::DateRef => (t.amber, None, FontWeight::NORMAL, FontStyle::Normal),
         SpanKind::Mention => (t.faint, None, FontWeight::NORMAL, FontStyle::Normal),
-        SpanKind::Highlight => (t.text, Some(t.amber.opacity(0.28)), FontWeight::NORMAL, FontStyle::Normal),
+        SpanKind::Highlight => (t.text, Some(t.highlight), FontWeight::NORMAL, FontStyle::Normal),
         SpanKind::Bold => (base, None, FontWeight::BOLD, FontStyle::Normal),
         SpanKind::Italic => (base, None, FontWeight::NORMAL, FontStyle::Italic),
         SpanKind::Hidden => (t.faint, None, FontWeight::NORMAL, FontStyle::Normal),
