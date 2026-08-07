@@ -10,3 +10,8 @@ default-members = ["crates/kairn-app"]
 # deps at opt-level 0 costs hundreds of milliseconds on a power-limited machine.
 [profile.dev.package."*"]
 opt-level = 2
+
+# The wildcard above excludes workspace members, and the vendored terminal
+# renderer is per-frame hot-path code: keep it optimised in dev builds too.
+[profile.dev.package.gpui-terminal]
+opt-level = 2
