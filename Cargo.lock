@@ -3177,7 +3177,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "kairn"
+name = "kairn-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -3187,9 +3187,18 @@ dependencies = [
  "gpui-component",
  "gpui-component-assets",
  "gpui-terminal",
+ "kairn-core",
  "notify 8.2.0",
  "parking_lot",
  "portable-pty",
+]
+
+[[package]]
+name = "kairn-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
  "serde",
  "serde_json",
 ]

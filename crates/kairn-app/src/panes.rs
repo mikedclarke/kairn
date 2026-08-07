@@ -12,7 +12,7 @@ use gpui_component::h_flex;
 use gpui_component::input::Input;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 
-use crate::notes::{self, Line, Span, SpanKind, TaskState};
+use kairn_core::{self as notes, Line, Span, SpanKind, TaskState};
 use crate::theme::{self, KairnTheme};
 use crate::workspace::{
     InputDown, InputUp, LayoutMode, PaneView, TaskQuery, Workspace, chord, kbd, mod_symbol,

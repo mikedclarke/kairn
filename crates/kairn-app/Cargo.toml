@@ -1,0 +1,24 @@
+[package]
+name = "kairn-app"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "kairn"
+path = "src/main.rs"
+
+[dependencies]
+kairn-core = { path = "../kairn-core" }
+gpui = "0.2.2"
+# Pre-1.0 ecosystem: gpui-component pinned exactly (it must resolve to the same gpui
+# as gpui-terminal); gpui-terminal pinned to an exact rev (post-0.1.0 cell sizing and
+# rendering fixes).
+gpui-component = "=0.5.1"
+gpui-component-assets = "=0.5.1"
+gpui-terminal = { git = "https://github.com/zortax/gpui-terminal", rev = "51f0292938876c8da3de03f0139088591e3be518" }
+portable-pty = "0.9"
+notify = "8"
+futures = "0.3"
+anyhow = "1"
+parking_lot = "0.12"
+chrono = "0.4"

@@ -16,9 +16,10 @@ use gpui_component::{
     input::{Input, InputEvent, InputState, Position},
 };
 
-use crate::notes;
+use kairn_core as notes;
 use crate::session::{Session, SessionKind, spawn};
-use crate::settings::Settings;
+pub use kairn_core::TaskQuery;
+use kairn_core::settings::Settings;
 use crate::theme::{self, KairnTheme, KairnThemeExt, Mode};
 
 actions!(
@@ -137,13 +138,6 @@ pub enum PaneView {
     Tasks(TaskQuery),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TaskQuery {
-    Today,
-    Open,
-    Overdue,
-}
-
 /// An in-place edit of one rendered line: the raw markdown in a single-line
 /// input sitting where the styled line was.
 pub struct LineEdit {
@@ -154,24 +148,6 @@ pub struct LineEdit {
     appending: bool,
     pub input: gpui::Entity<InputState>,
     path: PathBuf,
-}
-
-impl TaskQuery {
-    pub fn matches(self, date: NaiveDate, today: NaiveDate) -> bool {
-        match self {
-            TaskQuery::Today => date == today,
-            TaskQuery::Open => true,
-            TaskQuery::Overdue => date < today,
-        }
-    }
-
-    pub fn title(self) -> &'static str {
-        match self {
-            TaskQuery::Today => "Today's tasks",
-            TaskQuery::Open => "Open tasks",
-            TaskQuery::Overdue => "Overdue tasks",
-        }
-    }
 }
 
 pub struct Workspace {
@@ -1091,15 +1067,16 @@ impl Workspace {
         let text = self
             .capture_input
             .as_ref()
-            .map(|i| i.read(cx).value().trim().to_string())
+            .map(|i| i.read(cx).value().to_string())
             .unwrap_or_default();
-        if !text.is_empty() {
-            let today = Local::now().date_naive();
-            if let Err(e) = notes::append_to_day(&self.notes_root, today, &text) {
+        let today = Local::now().date_naive();
+        match notes::capture(&self.notes_root, today, &text) {
+            Ok(Some(_)) => self.reload_notes(),
+            Ok(None) => {}
+            Err(e) => {
                 eprintln!("kairn: capture failed: {e}");
                 window.push_notification("Could not write today's note, see stderr.", cx);
             }
-            self.reload_notes();
         }
         self.close_overlays(window, cx);
     }
@@ -1285,7 +1262,7 @@ impl Workspace {
     pub fn apply_settings(
         &mut self,
         notes_root: Option<String>,
-        hosts: Vec<crate::settings::SshHost>,
+        hosts: Vec<kairn_core::settings::SshHost>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {

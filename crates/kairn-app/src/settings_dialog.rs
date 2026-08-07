@@ -10,7 +10,7 @@ use gpui_component::{
     v_flex,
 };
 
-use crate::settings::SshHost;
+use kairn_core::settings::SshHost;
 use crate::theme::Mode;
 use crate::workspace::Workspace;
 

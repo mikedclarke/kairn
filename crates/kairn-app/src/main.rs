@@ -1,7 +1,5 @@
-mod notes;
 mod panes;
 mod session;
-mod settings;
 mod settings_dialog;
 mod sidebar;
 mod theme;
@@ -10,8 +8,8 @@ mod workspace;
 use gpui::{AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
 use gpui_component::{Root, TitleBar};
 use gpui_component_assets::Assets;
+use kairn_core::settings::Settings;
 
-use crate::settings::Settings;
 use crate::theme::Mode;
 use crate::workspace::Workspace;
 

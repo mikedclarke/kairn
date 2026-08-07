@@ -7,7 +7,7 @@ use gpui_terminal::{TerminalConfig, TerminalView};
 use parking_lot::Mutex;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
-use crate::settings::SshHost;
+use kairn_core::settings::SshHost;
 use crate::theme::{self, Mode};
 use crate::workspace::Workspace;
 
