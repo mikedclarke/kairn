@@ -23,6 +23,7 @@ pub mod parse;
 pub mod settings;
 pub mod tasks;
 pub mod template;
+pub mod timeline;
 pub mod vault;
 pub mod write;
 
@@ -33,6 +34,7 @@ pub use merge::*;
 pub use parse::*;
 pub use tasks::*;
 pub use template::*;
+pub use timeline::*;
 pub use vault::*;
 pub use write::*;
 

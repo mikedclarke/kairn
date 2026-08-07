@@ -106,6 +106,9 @@ pub struct Workspace {
     pub(crate) notes_expanded: HashSet<PathBuf>,
     /// Open-task counts for Monday..Sunday of the selected day's week.
     pub week_open_counts: [usize; 7],
+    /// Time-blocked lines of the selected day's note, for the timeline pill
+    /// row; empty for other views. Recomputed on reload, not per frame.
+    pub day_timeline: Vec<notes::TimeBlock>,
     /// Open-task counts for the Today/Open/Overdue views, from the last
     /// reload; renders read these instead of re-scanning per frame.
     pub(crate) task_counts: [usize; 3],
@@ -208,6 +211,7 @@ impl Workspace {
             notes_tree: Vec::new(),
             notes_expanded: HashSet::new(),
             week_open_counts: [0; 7],
+            day_timeline: Vec::new(),
             task_counts: [0; 3],
             agent_activity: Vec::new(),
             self_writes,

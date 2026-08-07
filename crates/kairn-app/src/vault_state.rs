@@ -258,6 +258,10 @@ impl Workspace {
             text
         };
         self.doc_text = text;
+        self.day_timeline = match (&self.view, &self.doc_text) {
+            (PaneView::Day, Some(text)) => notes::time_blocks(text),
+            _ => Vec::new(),
+        };
         // Linked mentions for the pane's document: a day is referenced by its
         // ISO date ([[2026-08-07]] and >2026-08-07 alike), a note by its stem.
         let title = match &self.view {
