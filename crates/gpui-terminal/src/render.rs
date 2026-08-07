@@ -71,8 +71,35 @@ use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::Color;
 use gpui::{
     App, Bounds, Edges, Font, FontFeatures, FontStyle, FontWeight, Hsla, Pixels, Point,
-    SharedString, Size, TextRun, UnderlineStyle, Window, px, quad, transparent_black,
+    ShapedLine, SharedString, Size, TextRun, UnderlineStyle, Window, px, quad,
+    transparent_black,
 };
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+
+/// Cache of shaped text runs keyed by content and style. Shaping is the
+/// dominant per-frame cost of painting a terminal, and a TUI frame repeats
+/// almost all of its runs from the previous frame, so caching turns steady-
+/// state repaints into pure draw calls.
+struct ShapeCache {
+    /// Font the cached lines were shaped with; changing it clears the cache.
+    font_sig: (String, i32),
+    map: HashMap<u64, ShapedLine>,
+}
+
+impl ShapeCache {
+    /// Runs are small; this bound only guards against pathological output
+    /// (e.g. streaming random styled text) growing the map without limit.
+    const CAPACITY: usize = 8192;
+
+    fn new() -> Self {
+        Self {
+            font_sig: (String::new(), 0),
+            map: HashMap::new(),
+        }
+    }
+}
 
 /// A batched run of text with consistent styling.
 ///
@@ -185,6 +212,9 @@ pub struct TerminalRenderer {
 
     /// Color palette for resolving terminal colors
     pub palette: ColorPalette,
+
+    /// Shaped-run cache shared across the clones made per frame
+    shaped_cache: Arc<parking_lot::Mutex<ShapeCache>>,
 }
 
 impl TerminalRenderer {
@@ -228,7 +258,75 @@ impl TerminalRenderer {
             cell_height,
             line_height_multiplier,
             palette,
+            shaped_cache: Arc::new(parking_lot::Mutex::new(ShapeCache::new())),
         }
+    }
+
+    /// The shaped line for a styled run, from cache when its content and
+    /// style were shaped before.
+    fn shaped_run(&self, run: &BatchedTextRun, text: &str, window: &mut Window) -> ShapedLine {
+        let font_sig = (
+            self.font_family.clone(),
+            (f32::from(self.font_size) * 100.0) as i32,
+        );
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        run.fg_color.h.to_bits().hash(&mut hasher);
+        run.fg_color.s.to_bits().hash(&mut hasher);
+        run.fg_color.l.to_bits().hash(&mut hasher);
+        run.fg_color.a.to_bits().hash(&mut hasher);
+        (run.bold, run.italic, run.underline).hash(&mut hasher);
+        let key = hasher.finish();
+
+        let mut cache = self.shaped_cache.lock();
+        if cache.font_sig != font_sig {
+            cache.map.clear();
+            cache.font_sig = font_sig;
+        }
+        if let Some(shaped) = cache.map.get(&key) {
+            return shaped.clone();
+        }
+
+        let font = Font {
+            family: self.font_family.clone().into(),
+            features: FontFeatures::default(),
+            fallbacks: None,
+            weight: if run.bold {
+                FontWeight::BOLD
+            } else {
+                FontWeight::NORMAL
+            },
+            style: if run.italic {
+                FontStyle::Italic
+            } else {
+                FontStyle::Normal
+            },
+        };
+        let text_run = TextRun {
+            len: text.len(),
+            font,
+            color: run.fg_color,
+            background_color: None,
+            underline: if run.underline {
+                Some(UnderlineStyle {
+                    thickness: px(1.0),
+                    color: Some(run.fg_color),
+                    wavy: false,
+                })
+            } else {
+                None
+            },
+            strikethrough: None,
+        };
+        let text: SharedString = text.to_string().into();
+        let shaped = window
+            .text_system()
+            .shape_line(text, self.font_size, &[text_run], None);
+        if cache.map.len() >= ShapeCache::CAPACITY {
+            cache.map.clear();
+        }
+        cache.map.insert(key, shaped.clone());
+        shaped
     }
 
     /// Measure cell dimensions based on actual font metrics.
@@ -503,34 +601,121 @@ impl TerminalRenderer {
                 })
                 .collect();
 
-            // Layout the row for backgrounds
-            let (backgrounds, _) = self.layout_row(line_idx, cells.iter().cloned(), colors);
+            // Layout the row for backgrounds and batched text runs
+            let (backgrounds, text_runs) =
+                self.layout_row(line_idx, cells.iter().cloned(), colors);
+
+            let fill = |window: &mut Window, b: Bounds<Pixels>, color: Hsla| {
+                window.paint_quad(quad(
+                    b,
+                    px(0.0),
+                    color,
+                    Edges::<Pixels>::default(),
+                    transparent_black(),
+                    Default::default(),
+                ));
+            };
 
             // Paint backgrounds
-            for bg_rect in backgrounds {
+            let row_y = origin.y + self.cell_height * (line_idx as f32);
+            for bg_rect in &backgrounds {
                 // Skip if it's the default background color
                 if bg_rect.color == default_bg {
                     continue;
                 }
 
                 let x = origin.x + self.cell_width * (bg_rect.start_col as f32);
-                let y = origin.y + self.cell_height * (bg_rect.row as f32);
                 let width = self.cell_width * ((bg_rect.end_col - bg_rect.start_col) as f32);
-                let height = self.cell_height;
 
-                let rect_bounds = Bounds {
-                    origin: Point { x, y },
-                    size: Size { width, height },
-                };
-
-                window.paint_quad(quad(
-                    rect_bounds,
-                    px(0.0),
+                fill(
+                    window,
+                    Bounds {
+                        origin: Point { x, y: row_y },
+                        size: Size { width, height: self.cell_height },
+                    },
                     bg_rect.color,
-                    Edges::<Pixels>::default(),
-                    transparent_black(),
-                    Default::default(),
-                ));
+                );
+            }
+
+            // Extend edge-cell backgrounds into the padding and the
+            // partial-cell remainder, so a full-screen TUI reaches the pane
+            // edges instead of sitting in a letterboxed grid.
+            let content_right = origin.x + self.cell_width * (num_cols as f32);
+            let bounds_right = bounds.origin.x + bounds.size.width;
+            let bounds_bottom = bounds.origin.y + bounds.size.height;
+            if let Some(first) = backgrounds.first()
+                && first.color != default_bg
+            {
+                fill(
+                    window,
+                    Bounds {
+                        origin: Point { x: bounds.origin.x, y: row_y },
+                        size: Size {
+                            width: origin.x - bounds.origin.x,
+                            height: self.cell_height,
+                        },
+                    },
+                    first.color,
+                );
+            }
+            if let Some(last) = backgrounds.last()
+                && last.color != default_bg
+            {
+                fill(
+                    window,
+                    Bounds {
+                        origin: Point { x: content_right, y: row_y },
+                        size: Size {
+                            width: bounds_right - content_right,
+                            height: self.cell_height,
+                        },
+                    },
+                    last.color,
+                );
+            }
+            let top_row = line_idx == 0;
+            let bottom_row = line_idx + 1 == num_lines;
+            if top_row || bottom_row {
+                for bg_rect in &backgrounds {
+                    if bg_rect.color == default_bg {
+                        continue;
+                    }
+                    let mut x = origin.x + self.cell_width * (bg_rect.start_col as f32);
+                    let mut right = origin.x + self.cell_width * (bg_rect.end_col as f32);
+                    if bg_rect.start_col == 0 {
+                        x = bounds.origin.x;
+                    }
+                    if bg_rect.end_col == num_cols {
+                        right = bounds_right;
+                    }
+                    if top_row {
+                        fill(
+                            window,
+                            Bounds {
+                                origin: Point { x, y: bounds.origin.y },
+                                size: Size {
+                                    width: right - x,
+                                    height: origin.y - bounds.origin.y,
+                                },
+                            },
+                            bg_rect.color,
+                        );
+                    }
+                    if bottom_row {
+                        let bottom = row_y + self.cell_height;
+                        fill(
+                            window,
+                            Bounds {
+                                origin: Point { x, y: bottom },
+                                size: Size {
+                                    width: right - x,
+                                    height: bounds_bottom - bottom,
+                                },
+                            },
+                            bg_rect.color,
+                        );
+                    }
+                }
             }
 
             // Calculate vertical offset to center text in cell
@@ -648,72 +833,30 @@ impl TerminalRenderer {
                 }
             }
 
-            // Third pass: draw regular text characters
-            for (col_idx, cell) in cells_vec.iter() {
-                let ch = cell.c;
-
-                // Skip empty cells and box-drawing (already handled)
-                if ch == ' ' || ch == '\0' || box_drawing::is_box_drawing_char(ch) {
+            // Third pass: draw the row's text as its batched styled runs,
+            // shaped through the cache. Shaping per character per frame is
+            // what made full-screen TUIs unusable on low-power machines.
+            // Box-drawing characters keep their cells as spaces (they were
+            // painted as quads above), and all-blank runs skip entirely.
+            for run in &text_runs {
+                let display: String = run
+                    .text
+                    .chars()
+                    .map(|c| {
+                        if c == '\0' || box_drawing::is_box_drawing_char(c) {
+                            ' '
+                        } else {
+                            c
+                        }
+                    })
+                    .collect();
+                if display.trim().is_empty() {
                     continue;
                 }
-
-                let x = origin.x + self.cell_width * (*col_idx as f32);
-                let fg_color = self.palette.resolve(cell.fg, colors);
-
-                // For regular text, apply vertical offset for centering
+                let shaped = self.shaped_run(run, &display, window);
+                let x = origin.x + self.cell_width * (run.start_col as f32);
                 let y = y_base + vertical_offset;
-
-                // Get cell flags for styling
-                let flags = cell.flags;
-                let bold = flags.contains(alacritty_terminal::term::cell::Flags::BOLD);
-                let italic = flags.contains(alacritty_terminal::term::cell::Flags::ITALIC);
-                let underline = flags.contains(alacritty_terminal::term::cell::Flags::UNDERLINE);
-
-                // Create font with styling
-                let font = Font {
-                    family: self.font_family.clone().into(),
-                    features: FontFeatures::default(),
-                    fallbacks: None,
-                    weight: if bold {
-                        FontWeight::BOLD
-                    } else {
-                        FontWeight::NORMAL
-                    },
-                    style: if italic {
-                        FontStyle::Italic
-                    } else {
-                        FontStyle::Normal
-                    },
-                };
-
-                // Create text run for this single character
-                let char_str = ch.to_string();
-                let text_run = TextRun {
-                    len: char_str.len(),
-                    font,
-                    color: fg_color,
-                    background_color: None,
-                    underline: if underline {
-                        Some(UnderlineStyle {
-                            thickness: px(1.0),
-                            color: Some(fg_color),
-                            wavy: false,
-                        })
-                    } else {
-                        None
-                    },
-                    strikethrough: None,
-                };
-
-                // Shape and paint the character
-                let text: SharedString = char_str.into();
-                let shaped_line =
-                    window
-                        .text_system()
-                        .shape_line(text, self.font_size, &[text_run], None);
-
-                // Paint at exact cell position (ignore errors)
-                let _ = shaped_line.paint(Point { x, y }, self.cell_height, window, _cx);
+                shaped.paint(Point { x, y }, self.cell_height, window, _cx).ok();
             }
         }
 

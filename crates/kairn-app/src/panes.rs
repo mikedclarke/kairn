@@ -484,13 +484,14 @@ impl Workspace {
             .on_action(cx.listener(Self::on_line_edit_backspace))
             .on_action(cx.listener(Self::on_line_edit_delete))
             // Strip the input's own metrics so the raw line sits exactly
-            // where the rendered line was: same size, leading, and left edge.
+            // where the rendered line was: same size, leading, and left
+            // edge. Height stays automatic — the input grows with wrapped
+            // paragraphs.
             .child(
                 Input::new(&le.input)
                     .appearance(false)
                     .w_full()
                     .p_0()
-                    .h(px(21.))
                     .text_size(px(13.))
                     .line_height(relative(1.58)),
             )
@@ -794,7 +795,7 @@ fn render_line(
             .gap(px(9.))
             .py(px(2.5))
             .child(div().text_color(t.faint).child("–"))
-            .child(div().flex_1().min_w(px(0.)).child(spans_line(t, spans, t.dim, idx, layouts)))
+            .child(div().flex_1().min_w(px(0.)).child(spans_line(t, spans, t.text, idx, layouts)))
             .into_any_element(),
         Line::Quote { spans } => div()
             .my(px(4.))
@@ -805,9 +806,11 @@ fn render_line(
             .into_any_element(),
         Line::Rule => div().my(px(14.)).h(px(1.)).bg(t.border).into_any_element(),
         Line::Blank => div().h(px(8.)).into_any_element(),
+        // Body text renders in the same color and size the editor uses, so
+        // leaving an edit never dims or restyles what was just typed.
         Line::Text { spans } => div()
             .py(px(1.))
-            .child(spans_line(t, spans, t.dim, idx, layouts))
+            .child(spans_line(t, spans, t.text, idx, layouts))
             .into_any_element(),
     }
 }

@@ -100,7 +100,11 @@ impl Workspace {
             (line_count, String::new(), true)
         };
 
-        let input = cx.new(|cx| InputState::new(window, cx));
+        // Auto-grow so a wrapped paragraph is edited in full view instead of
+        // scrolling horizontally through a single-line box. The note's line
+        // model is untouched: Enter still commits/splits (the literal
+        // newline the input inserts is consumed by the Enter handler).
+        let input = cx.new(|cx| InputState::new(window, cx).auto_grow(1, 40));
         input.update(cx, |s, cx| {
             // set_value puts the cursor at the end on single-line inputs.
             s.set_value(expected.clone(), window, cx);
@@ -122,6 +126,14 @@ impl Workspace {
                 }
                 match ev {
                     InputEvent::Change => {
+                        // A newline can only arrive via paste (Enter is
+                        // handled below before it lands): commit it as a
+                        // real line split instead of autosaving a value the
+                        // single-line model can't track.
+                        if state.read(cx).value().contains('\n') {
+                            this.commit_line_edit(true, cx);
+                            return;
+                        }
                         this._autosave = Some(cx.spawn(async move |this, cx| {
                             cx.background_executor()
                                 .timer(Duration::from_millis(800))
@@ -178,30 +190,37 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Enter inside a line edit: NotePlan behaviour. At the end of a line
-    /// with content it commits and continues the list on a new line below; a
-    /// bare list marker clears itself instead; mid-line it splits at the
-    /// cursor, the remainder keeping the list style.
+    /// Enter inside a line edit: NotePlan behaviour. The auto-grow input has
+    /// already inserted a literal newline at the cursor; consume it and
+    /// apply the line model: at the end of a line with content it commits
+    /// and continues the list on a new line below; a bare list marker
+    /// clears itself instead; mid-line it splits at the cursor, the
+    /// remainder keeping the list style.
     fn on_line_edit_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(le) = self.line_edit.take() else { return };
         self._autosave = None;
-        let value = le.input.read(cx).value().to_string();
+        let raw = le.input.read(cx).value().to_string();
+        let (head, tail) = match raw.find('\n') {
+            Some(i) => (raw[..i].to_string(), raw[i + 1..].to_string()),
+            None => (raw, String::new()),
+        };
+        let value = format!("{head}{tail}");
         // A split inside the list marker or task bracket would corrupt the
         // line; the earliest split point is the start of the content.
-        let cursor = le.input.read(cx).cursor().max(notes::content_start_col(&value));
-        let (combined, next_col) = if cursor < value.len() {
-            let (head, tail) = value.split_at(cursor);
+        let split = head.len().max(notes::content_start_col(&value)).min(value.len());
+        let (head, tail) = value.split_at(split);
+        let (combined, next_col) = if !tail.is_empty() {
             let prefix = notes::continuation_prefix(head);
             (format!("{head}\n{prefix}{tail}"), Some(prefix.chars().count()))
         } else {
-            let prefix = notes::continuation_prefix(&value);
-            if !value.is_empty() && prefix == value {
+            let prefix = notes::continuation_prefix(head);
+            if !head.is_empty() && prefix == head {
                 le.input.update(cx, |s, cx| s.set_value("", window, cx));
                 self.line_edit = Some(le);
                 self.commit_line_edit(false, cx);
                 return;
             }
-            (format!("{value}\n{prefix}"), None)
+            (format!("{head}\n{prefix}"), None)
         };
         let written = if le.appending {
             notes::append_line(&le.path, &combined).map(Some)
