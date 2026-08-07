@@ -153,6 +153,11 @@ impl SettingsEditor {
             .upgrade()
             .map(|ws| ws.read(cx).settings.week_strip.clone())
             .unwrap_or_else(|| "always".to_string());
+        let day_timeline = self
+            .workspace
+            .upgrade()
+            .map(|ws| ws.read(cx).settings.day_timeline)
+            .unwrap_or(true);
         let resolved = self
             .workspace
             .upgrade()
@@ -189,6 +194,16 @@ impl SettingsEditor {
                 cx.notify();
             }))
         };
+        let timeline_button = |id: &'static str, label: &'static str, on: bool| {
+            let btn = Button::new(id).label(label);
+            let btn = if on == day_timeline { btn.primary() } else { btn.outline() };
+            btn.on_click(cx.listener(move |this, _, _, cx| {
+                let _ = this.workspace.update(cx, |ws, cx| {
+                    ws.set_day_timeline(on, cx);
+                });
+                cx.notify();
+            }))
+        };
 
         v_flex()
             .gap_2()
@@ -221,6 +236,16 @@ impl SettingsEditor {
                     .child(strip_button("strip-daily", "Daily notes only", "daily"))
                     .child(strip_button("strip-off", "Hidden", "off")),
             )
+            .child(Self::section("Day timeline"))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(timeline_button("timeline-on", "Shown", true))
+                    .child(timeline_button("timeline-off", "Hidden", false)),
+            )
+            .child(div().text_size(px(11.)).opacity(0.55).child(
+                "The pill row of timed lines (09:00 standup) at the top of a daily note.",
+            ))
     }
 
     fn render_ssh(&self, cx: &mut Context<Self>) -> gpui::Div {

@@ -46,6 +46,9 @@ pub struct Settings {
     /// daily notes), or "off". Unknown values read as "always".
     #[serde(default = "default_week_strip")]
     pub week_strip: String,
+    /// The timeline pill row of time-blocked lines on the daily note.
+    #[serde(default = "default_true")]
+    pub day_timeline: bool,
     /// Set when the settings file existed but couldn't be parsed. While
     /// degraded, [`Settings::save`] refuses to run: auto-saving defaults
     /// over a corrupt file is how SSH hosts and the notes root get wiped.
@@ -75,6 +78,7 @@ impl Default for Settings {
             daily_forward: true,
             sidebar_collapsed: Vec::new(),
             week_strip: default_week_strip(),
+            day_timeline: true,
             degraded: false,
         }
     }

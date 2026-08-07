@@ -259,7 +259,9 @@ impl Workspace {
         };
         self.doc_text = text;
         self.day_timeline = match (&self.view, &self.doc_text) {
-            (PaneView::Day, Some(text)) => notes::time_blocks(text),
+            (PaneView::Day, Some(text)) if self.settings.day_timeline => {
+                notes::time_blocks(text)
+            }
             _ => Vec::new(),
         };
         // Linked mentions for the pane's document: a day is referenced by its

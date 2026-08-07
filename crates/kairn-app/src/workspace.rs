@@ -372,6 +372,21 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Show or hide the daily note's timeline pill row.
+    pub fn set_day_timeline(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.settings.day_timeline == on {
+            return;
+        }
+        self.settings.day_timeline = on;
+        if let Err(e) = self.settings.save() {
+            eprintln!("kairn: failed to save settings: {e}");
+        }
+        // Turning it on must fill the row for the note already on screen;
+        // off clears it (reload skips the parse entirely while disabled).
+        self.reload_notes(cx);
+        cx.notify();
+    }
+
     /// Point the sidebar Daily section forward (today + next two days) or
     /// back (today + previous two).
     pub fn set_daily_forward(&mut self, forward: bool, cx: &mut Context<Self>) {
