@@ -86,6 +86,9 @@ struct ShapeCache {
     /// Font the cached lines were shaped with; changing it clears the cache.
     font_sig: (String, i32),
     map: HashMap<u64, ShapedLine>,
+    /// Measured cell metrics (width, unmultiplied line height) for the same
+    /// font, so the probe glyph is shaped once per font instead of per frame.
+    cell: Option<(Pixels, Pixels)>,
 }
 
 impl ShapeCache {
@@ -97,8 +100,38 @@ impl ShapeCache {
         Self {
             font_sig: (String::new(), 0),
             map: HashMap::new(),
+            cell: None,
         }
     }
+}
+
+/// A row's paint-ready layout: geometry-independent (positions are derived
+/// from row/column indices at paint time), so it survives pane moves and
+/// stays valid until the grid itself changes.
+struct RowLayout {
+    backgrounds: Vec<BackgroundRect>,
+    /// Horizontal box-drawing spans: (start_col, end_col inclusive, weight, color).
+    h_spans: Vec<(usize, usize, box_drawing::LineWeight, Hsla)>,
+    /// Box-drawing cells: (col, char, color, horizontal part already drawn by a span).
+    box_cells: Vec<(usize, char, Hsla, bool)>,
+    /// Shaped text runs: (start_col, shaped line).
+    runs: Vec<(usize, ShapedLine)>,
+}
+
+/// The whole visible frame laid out and shaped, cached against the terminal's
+/// mutation generation. The window repaints far more often than the grid
+/// changes (every notify repaints everything in gpui, and the Linux backend
+/// repaints continuously); replaying this cache turns those repaints into
+/// plain draw calls with no grid walk, no batching, and no shaping.
+struct FrameLayout {
+    generation: u64,
+    font_sig: (String, i32),
+    cols: usize,
+    default_bg: Hsla,
+    /// Cursor as (visible row, col), if on screen.
+    cursor: Option<(usize, usize)>,
+    cursor_color: Hsla,
+    rows: Vec<RowLayout>,
 }
 
 /// A batched run of text with consistent styling.
@@ -215,6 +248,9 @@ pub struct TerminalRenderer {
 
     /// Shaped-run cache shared across the clones made per frame
     shaped_cache: Arc<parking_lot::Mutex<ShapeCache>>,
+
+    /// Laid-out frame reused until the grid's generation moves on
+    frame_cache: Arc<parking_lot::Mutex<Option<FrameLayout>>>,
 }
 
 impl TerminalRenderer {
@@ -259,16 +295,29 @@ impl TerminalRenderer {
             line_height_multiplier,
             palette,
             shaped_cache: Arc::new(parking_lot::Mutex::new(ShapeCache::new())),
+            frame_cache: Arc::new(parking_lot::Mutex::new(None)),
         }
+    }
+
+    /// Drop every cached shaping and layout product. Call when anything the
+    /// caches can't see changes: palette, padding, or line-height multiplier
+    /// (font changes invalidate implicitly through the font signature).
+    pub fn invalidate_caches(&self) {
+        *self.shaped_cache.lock() = ShapeCache::new();
+        *self.frame_cache.lock() = None;
+    }
+
+    fn font_sig(&self) -> (String, i32) {
+        (
+            self.font_family.clone(),
+            (f32::from(self.font_size) * 100.0) as i32,
+        )
     }
 
     /// The shaped line for a styled run, from cache when its content and
     /// style were shaped before.
     fn shaped_run(&self, run: &BatchedTextRun, text: &str, window: &mut Window) -> ShapedLine {
-        let font_sig = (
-            self.font_family.clone(),
-            (f32::from(self.font_size) * 100.0) as i32,
-        );
+        let font_sig = self.font_sig();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         text.hash(&mut hasher);
         run.fg_color.h.to_bits().hash(&mut hasher);
@@ -281,6 +330,7 @@ impl TerminalRenderer {
         let mut cache = self.shaped_cache.lock();
         if cache.font_sig != font_sig {
             cache.map.clear();
+            cache.cell = None;
             cache.font_sig = font_sig;
         }
         if let Some(shaped) = cache.map.get(&key) {
@@ -339,6 +389,23 @@ impl TerminalRenderer {
     ///
     /// * `window` - The GPUI window for text system access
     pub fn measure_cell(&mut self, window: &mut Window) {
+        // Metrics only depend on the font; reuse the last measurement instead
+        // of shaping the probe glyph on every frame.
+        let font_sig = self.font_sig();
+        {
+            let mut cache = self.shaped_cache.lock();
+            if cache.font_sig != font_sig {
+                cache.map.clear();
+                cache.cell = None;
+                cache.font_sig = font_sig.clone();
+            }
+            if let Some((width, line_height)) = cache.cell {
+                self.cell_width = width;
+                self.cell_height = line_height * self.line_height_multiplier;
+                return;
+            }
+        }
+
         // Measure using '│' (U+2502, BOX DRAWINGS LIGHT VERTICAL)
         // This character spans the full cell height in terminal fonts, making it
         // ideal for measuring exact cell dimensions used by TUIs
@@ -373,6 +440,9 @@ impl TerminalRenderer {
         let line_height = (shaped.ascent + shaped.descent).ceil();
         if line_height > px(0.0) {
             self.cell_height = line_height * self.line_height_multiplier;
+        }
+        if shaped.width > px(0.0) && line_height > px(0.0) {
+            self.shaped_cache.lock().cell = Some((shaped.width, line_height));
         }
     }
 
@@ -538,14 +608,17 @@ impl TerminalRenderer {
 
     /// Paint terminal content to the window.
     ///
-    /// This is the main rendering method that draws the terminal grid,
-    /// including backgrounds, text, and cursor.
+    /// The heavy work (walking the grid, batching runs, shaping text) happens
+    /// in [`layout_frame`](Self::layout_frame) and is cached against the
+    /// terminal's mutation `generation`; a repaint of an unchanged grid
+    /// replays the cached layout as plain draw calls.
     ///
     /// # Arguments
     ///
     /// * `bounds` - The bounding box to render within
     /// * `padding` - Padding around the terminal content
     /// * `term` - The terminal state
+    /// * `generation` - The terminal's mutation counter at paint time
     /// * `window` - The GPUI window
     /// * `cx` - The application context
     pub fn paint(
@@ -553,10 +626,31 @@ impl TerminalRenderer {
         bounds: Bounds<Pixels>,
         padding: Edges<Pixels>,
         term: &Term<GpuiEventProxy>,
+        generation: u64,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) {
-        // Get terminal dimensions
+        let font_sig = self.font_sig();
+        let mut cache = self.frame_cache.lock();
+        let valid = cache
+            .as_ref()
+            .is_some_and(|f| f.generation == generation && f.font_sig == font_sig);
+        if !valid {
+            *cache = Some(self.layout_frame(term, generation, font_sig, window));
+        }
+        let frame = cache.as_ref().expect("frame cache filled above");
+        self.paint_frame(frame, bounds, padding, window, cx);
+    }
+
+    /// Walk the visible grid once and produce everything painting needs:
+    /// merged backgrounds, box-drawing spans and cells, and shaped text runs.
+    fn layout_frame(
+        &self,
+        term: &Term<GpuiEventProxy>,
+        generation: u64,
+        font_sig: (String, i32),
+        window: &mut Window,
+    ) -> FrameLayout {
         let grid = term.grid();
         let num_lines = grid.screen_lines();
         let num_cols = grid.columns();
@@ -565,29 +659,21 @@ impl TerminalRenderer {
         // above the live screen (grid lines go negative into scrollback).
         let display_offset = grid.display_offset() as i32;
 
-        // Calculate default background color
         let default_bg = self.palette.resolve(
             Color::Named(alacritty_terminal::vte::ansi::NamedColor::Background),
             colors,
         );
+        let cursor_color = self.palette.resolve(
+            Color::Named(alacritty_terminal::vte::ansi::NamedColor::Cursor),
+            colors,
+        );
+        // Cursor shifts down with the content when scrolled into history and
+        // disappears once it leaves the visible window.
+        let cursor_row = grid.cursor.point.line.0 + display_offset;
+        let cursor = (cursor_row >= 0 && cursor_row < num_lines as i32)
+            .then_some((cursor_row as usize, grid.cursor.point.column.0));
 
-        // Paint default background (covers full bounds including padding)
-        window.paint_quad(quad(
-            bounds,
-            px(0.0),
-            default_bg,
-            Edges::<Pixels>::default(),
-            transparent_black(),
-            Default::default(),
-        ));
-
-        // Calculate origin offset (content starts after padding)
-        let origin = Point {
-            x: bounds.origin.x + padding.left,
-            y: bounds.origin.y + padding.top,
-        };
-
-        // Iterate over visible lines
+        let mut rows = Vec::with_capacity(num_lines);
         for line_idx in 0..num_lines {
             let line = Line(line_idx as i32 - display_offset);
 
@@ -605,28 +691,148 @@ impl TerminalRenderer {
             let (backgrounds, text_runs) =
                 self.layout_row(line_idx, cells.iter().cloned(), colors);
 
-            let fill = |window: &mut Window, b: Bounds<Pixels>, color: Hsla| {
-                window.paint_quad(quad(
-                    b,
-                    px(0.0),
-                    color,
-                    Edges::<Pixels>::default(),
-                    transparent_black(),
-                    Default::default(),
-                ));
-            };
+            // First pass: find horizontal spans of box-drawing characters so
+            // continuous lines draw across cells without gaps.
+            let mut h_spans = Vec::new();
+            let mut processed_horizontal: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            let mut i = 0;
+            while i < cells.len() {
+                let (col_idx, ref cell) = cells[i];
+                if let Some(weight) = box_drawing::get_horizontal_weight(cell.c) {
+                    let fg_color = self.palette.resolve(cell.fg, colors);
+                    let start_col = col_idx;
+                    let mut end_col = col_idx;
+                    let mut j = i + 1;
+                    while j < cells.len() {
+                        let (next_col, ref next_cell) = cells[j];
+                        if next_col != end_col + 1 {
+                            break;
+                        }
+                        let next_fg = self.palette.resolve(next_cell.fg, colors);
+                        if box_drawing::get_horizontal_weight(next_cell.c) == Some(weight)
+                            && next_fg == fg_color
+                        {
+                            end_col = next_col;
+                            j += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    for col in start_col..=end_col {
+                        processed_horizontal.insert(col);
+                    }
+                    h_spans.push((start_col, end_col, weight, fg_color));
+                    i = j;
+                    continue;
+                }
+                i += 1;
+            }
+
+            // Second pass: box-drawing cells, remembering whether a span
+            // already covers their horizontal component.
+            let mut box_cells = Vec::new();
+            for (col_idx, cell) in cells.iter() {
+                let ch = cell.c;
+                if ch == ' ' || ch == '\0' || !box_drawing::is_box_drawing_char(ch) {
+                    continue;
+                }
+                let fg_color = self.palette.resolve(cell.fg, colors);
+                box_cells.push((*col_idx, ch, fg_color, processed_horizontal.contains(col_idx)));
+            }
+
+            // Third pass: shape the row's text as its batched styled runs,
+            // through the run cache. Box-drawing characters keep their cells
+            // as spaces (they paint as quads), all-blank runs drop entirely.
+            let mut runs = Vec::new();
+            for run in &text_runs {
+                let display: String = run
+                    .text
+                    .chars()
+                    .map(|c| {
+                        if c == '\0' || box_drawing::is_box_drawing_char(c) {
+                            ' '
+                        } else {
+                            c
+                        }
+                    })
+                    .collect();
+                if display.trim().is_empty() {
+                    continue;
+                }
+                runs.push((run.start_col, self.shaped_run(run, &display, window)));
+            }
+
+            rows.push(RowLayout { backgrounds, h_spans, box_cells, runs });
+        }
+
+        FrameLayout {
+            generation,
+            font_sig,
+            cols: num_cols,
+            default_bg,
+            cursor,
+            cursor_color,
+            rows,
+        }
+    }
+
+    /// Replay a laid-out frame as draw calls. Positions derive from the
+    /// current bounds and cell metrics, so the same frame stays valid while
+    /// the pane moves or the window scrolls around it.
+    fn paint_frame(
+        &self,
+        frame: &FrameLayout,
+        bounds: Bounds<Pixels>,
+        padding: Edges<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let default_bg = frame.default_bg;
+        let num_lines = frame.rows.len();
+
+        // Paint default background (covers full bounds including padding)
+        window.paint_quad(quad(
+            bounds,
+            px(0.0),
+            default_bg,
+            Edges::<Pixels>::default(),
+            transparent_black(),
+            Default::default(),
+        ));
+
+        // Content starts after padding
+        let origin = Point {
+            x: bounds.origin.x + padding.left,
+            y: bounds.origin.y + padding.top,
+        };
+
+        let fill = |window: &mut Window, b: Bounds<Pixels>, color: Hsla| {
+            window.paint_quad(quad(
+                b,
+                px(0.0),
+                color,
+                Edges::<Pixels>::default(),
+                transparent_black(),
+                Default::default(),
+            ));
+        };
+
+        // Vertical offset centering text in the (possibly multiplied) cell
+        let base_height = self.cell_height / self.line_height_multiplier;
+        let vertical_offset = (self.cell_height - base_height) / 2.0;
+
+        for (line_idx, row) in frame.rows.iter().enumerate() {
+            let row_y = origin.y + self.cell_height * (line_idx as f32);
 
             // Paint backgrounds
-            let row_y = origin.y + self.cell_height * (line_idx as f32);
-            for bg_rect in &backgrounds {
+            for bg_rect in &row.backgrounds {
                 // Skip if it's the default background color
                 if bg_rect.color == default_bg {
                     continue;
                 }
-
                 let x = origin.x + self.cell_width * (bg_rect.start_col as f32);
                 let width = self.cell_width * ((bg_rect.end_col - bg_rect.start_col) as f32);
-
                 fill(
                     window,
                     Bounds {
@@ -640,10 +846,11 @@ impl TerminalRenderer {
             // Extend edge-cell backgrounds into the padding and the
             // partial-cell remainder, so a full-screen TUI reaches the pane
             // edges instead of sitting in a letterboxed grid.
+            let num_cols = frame.cols;
             let content_right = origin.x + self.cell_width * (num_cols as f32);
             let bounds_right = bounds.origin.x + bounds.size.width;
             let bounds_bottom = bounds.origin.y + bounds.size.height;
-            if let Some(first) = backgrounds.first()
+            if let Some(first) = row.backgrounds.first()
                 && first.color != default_bg
             {
                 fill(
@@ -658,7 +865,7 @@ impl TerminalRenderer {
                     first.color,
                 );
             }
-            if let Some(last) = backgrounds.last()
+            if let Some(last) = row.backgrounds.last()
                 && last.color != default_bg
             {
                 fill(
@@ -676,7 +883,7 @@ impl TerminalRenderer {
             let top_row = line_idx == 0;
             let bottom_row = line_idx + 1 == num_lines;
             if top_row || bottom_row {
-                for bg_rect in &backgrounds {
+                for bg_rect in &row.backgrounds {
                     if bg_rect.color == default_bg {
                         continue;
                     }
@@ -718,182 +925,78 @@ impl TerminalRenderer {
                 }
             }
 
-            // Calculate vertical offset to center text in cell
-            // The multiplier adds extra height; we want to distribute it evenly top/bottom
-            let base_height = self.cell_height / self.line_height_multiplier;
-            let vertical_offset = (self.cell_height - base_height) / 2.0;
-
-            let y_base = origin.y + self.cell_height * (line_idx as f32);
-            let cy = y_base + self.cell_height / 2.0;
-
-            // Use cells vec for multiple passes (already collected above)
-            let cells_vec = &cells;
-
-            // First pass: find and draw horizontal spans of box-drawing characters
-            // This draws continuous lines across multiple cells to avoid gaps
-            let mut processed_horizontal: std::collections::HashSet<usize> = std::collections::HashSet::new();
-
-            let mut i = 0;
-            while i < cells_vec.len() {
-                let (col_idx, ref cell) = cells_vec[i];
-                let ch = cell.c;
-
-                // Check if this starts a horizontal span
-                if let Some(weight) = box_drawing::get_horizontal_weight(ch) {
-                    let fg_color = self.palette.resolve(cell.fg, colors);
-                    let start_col = col_idx;
-                    let mut end_col = col_idx;
-
-                    // Look ahead for consecutive cells with same horizontal weight
-                    let mut j = i + 1;
-                    while j < cells_vec.len() {
-                        let (next_col, ref next_cell) = cells_vec[j];
-                        // Must be adjacent
-                        if next_col != end_col + 1 {
-                            break;
-                        }
-                        // Must have same horizontal weight and same color
-                        let next_fg = self.palette.resolve(next_cell.fg, colors);
-                        if box_drawing::get_horizontal_weight(next_cell.c) == Some(weight)
-                            && next_fg == fg_color
-                        {
-                            end_col = next_col;
-                            j += 1;
-                        } else {
-                            break;
-                        }
-                    }
-
-                    // Draw the horizontal span
-                    let start_x = origin.x + self.cell_width * (start_col as f32);
-                    let end_x = origin.x + self.cell_width * ((end_col + 1) as f32);
-
-                    box_drawing::draw_horizontal_span(
-                        start_x,
-                        end_x,
-                        cy,
-                        weight,
+            // Box-drawing: horizontal spans first, then vertical components
+            let cy = row_y + self.cell_height / 2.0;
+            for (start_col, end_col, weight, color) in &row.h_spans {
+                let start_x = origin.x + self.cell_width * (*start_col as f32);
+                let end_x = origin.x + self.cell_width * ((*end_col + 1) as f32);
+                box_drawing::draw_horizontal_span(
+                    start_x,
+                    end_x,
+                    cy,
+                    *weight,
+                    self.cell_width,
+                    *color,
+                    window,
+                );
+            }
+            for (col_idx, ch, color, horizontal_drawn) in &row.box_cells {
+                let x = origin.x + self.cell_width * (*col_idx as f32);
+                let cell_bounds = Bounds {
+                    origin: Point { x, y: row_y },
+                    size: Size {
+                        width: self.cell_width,
+                        height: self.cell_height,
+                    },
+                };
+                if *horizontal_drawn {
+                    box_drawing::draw_vertical_components(
+                        *ch,
+                        cell_bounds,
+                        *color,
                         self.cell_width,
-                        fg_color,
                         window,
                     );
-
-                    // Mark these columns as having horizontal drawn
-                    for col in start_col..=end_col {
-                        processed_horizontal.insert(col);
-                    }
-
-                    // Skip past this span
-                    i = j;
-                    continue;
-                }
-                i += 1;
-            }
-
-            // Second pass: draw vertical components and non-horizontal box chars
-            for (col_idx, cell) in cells_vec.iter() {
-                let ch = cell.c;
-
-                if ch == ' ' || ch == '\0' {
-                    continue;
-                }
-
-                let x = origin.x + self.cell_width * (*col_idx as f32);
-                let fg_color = self.palette.resolve(cell.fg, colors);
-
-                if box_drawing::is_box_drawing_char(ch) {
-                    let cell_bounds = Bounds {
-                        origin: Point { x, y: y_base },
-                        size: Size {
-                            width: self.cell_width,
-                            height: self.cell_height,
-                        },
-                    };
-
-                    if processed_horizontal.contains(col_idx) {
-                        // Horizontal already drawn, just draw vertical components
-                        box_drawing::draw_vertical_components(
-                            ch,
-                            cell_bounds,
-                            fg_color,
-                            self.cell_width,
-                            window,
-                        );
-                    } else {
-                        // Not part of a horizontal span, draw the whole character
-                        box_drawing::draw_box_character(
-                            ch,
-                            cell_bounds,
-                            fg_color,
-                            self.cell_width,
-                            window,
-                        );
-                    }
-                    continue;
+                } else {
+                    box_drawing::draw_box_character(
+                        *ch,
+                        cell_bounds,
+                        *color,
+                        self.cell_width,
+                        window,
+                    );
                 }
             }
 
-            // Third pass: draw the row's text as its batched styled runs,
-            // shaped through the cache. Shaping per character per frame is
-            // what made full-screen TUIs unusable on low-power machines.
-            // Box-drawing characters keep their cells as spaces (they were
-            // painted as quads above), and all-blank runs skip entirely.
-            for run in &text_runs {
-                let display: String = run
-                    .text
-                    .chars()
-                    .map(|c| {
-                        if c == '\0' || box_drawing::is_box_drawing_char(c) {
-                            ' '
-                        } else {
-                            c
-                        }
-                    })
-                    .collect();
-                if display.trim().is_empty() {
-                    continue;
-                }
-                let shaped = self.shaped_run(run, &display, window);
-                let x = origin.x + self.cell_width * (run.start_col as f32);
-                let y = y_base + vertical_offset;
-                shaped.paint(Point { x, y }, self.cell_height, window, _cx).ok();
+            // Text runs
+            for (start_col, shaped) in &row.runs {
+                let x = origin.x + self.cell_width * (*start_col as f32);
+                let y = row_y + vertical_offset;
+                shaped.paint(Point { x, y }, self.cell_height, window, cx).ok();
             }
         }
 
-        // Paint cursor; scrolled into history it shifts down with the
-        // content and disappears once it leaves the visible window.
-        let cursor_point = grid.cursor.point;
-        let cursor_row = cursor_point.line.0 + display_offset;
-        if cursor_row < 0 || cursor_row >= num_lines as i32 {
-            return;
+        // Cursor
+        if let Some((cursor_row, cursor_col)) = frame.cursor {
+            let cursor_bounds = Bounds {
+                origin: Point {
+                    x: origin.x + self.cell_width * (cursor_col as f32),
+                    y: origin.y + self.cell_height * (cursor_row as f32),
+                },
+                size: Size {
+                    width: self.cell_width,
+                    height: self.cell_height,
+                },
+            };
+            window.paint_quad(quad(
+                cursor_bounds,
+                px(0.0),
+                frame.cursor_color,
+                Edges::<Pixels>::default(),
+                transparent_black(),
+                Default::default(),
+            ));
         }
-        let cursor_x = origin.x + self.cell_width * (cursor_point.column.0 as f32);
-        let cursor_y = origin.y + self.cell_height * (cursor_row as f32);
-
-        let cursor_color = self.palette.resolve(
-            Color::Named(alacritty_terminal::vte::ansi::NamedColor::Cursor),
-            colors,
-        );
-
-        let cursor_bounds = Bounds {
-            origin: Point {
-                x: cursor_x,
-                y: cursor_y,
-            },
-            size: Size {
-                width: self.cell_width,
-                height: self.cell_height,
-            },
-        };
-
-        window.paint_quad(quad(
-            cursor_bounds,
-            px(0.0),
-            cursor_color,
-            Edges::<Pixels>::default(),
-            transparent_black(),
-            Default::default(),
-        ));
     }
 }
 

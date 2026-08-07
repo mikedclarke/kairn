@@ -50,6 +50,7 @@ use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use parking_lot::Mutex;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Simple dimensions implementation for terminal initialization.
 struct TermDimensions {
@@ -132,6 +133,12 @@ pub struct TerminalState {
 
     /// Number of rows (lines) in the terminal.
     rows: usize,
+
+    /// Bumped on every mutation of the terminal (bytes, resize, scroll), so
+    /// the renderer can tell an unchanged grid from a changed one without
+    /// diffing cells. The window repaints far more often than the grid
+    /// changes; this is what lets those repaints skip layout entirely.
+    generation: Arc<AtomicU64>,
 }
 
 impl TerminalState {
@@ -177,7 +184,14 @@ impl TerminalState {
             parser,
             cols,
             rows,
+            generation: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    /// Shared handle to the mutation counter; read it before painting to
+    /// decide whether the cached frame layout is still current.
+    pub fn generation_arc(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.generation)
     }
 
     /// Process incoming bytes from the PTY.
@@ -206,6 +220,7 @@ impl TerminalState {
         // The parser.advance method calls handler methods on the Term
         // The Term implements the Handler trait from the VTE crate
         self.parser.advance(&mut *term, bytes);
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Resize the terminal to new dimensions.
@@ -241,6 +256,7 @@ impl TerminalState {
 
         // Resize the terminal
         term.resize(dimensions);
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get the current terminal mode.
@@ -339,7 +355,9 @@ impl TerminalState {
         F: FnOnce(&mut Term<GpuiEventProxy>) -> R,
     {
         let mut term = self.term.lock();
-        f(&mut term)
+        let result = f(&mut term);
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        result
     }
 
     /// Get the number of columns in the terminal.

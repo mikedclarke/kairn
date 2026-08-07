@@ -946,6 +946,8 @@ impl TerminalView {
         self.renderer.font_size = config.font_size;
         self.renderer.line_height_multiplier = config.line_height_multiplier;
         self.renderer.palette = config.colors.clone();
+        // Palette and metrics feed the cached layouts; start fresh
+        self.renderer.invalidate_caches();
 
         // Store the new config
         self.config = config;
@@ -977,6 +979,7 @@ impl Render for TerminalView {
 
         // Get terminal state and renderer for rendering
         let state_arc = self.state.term_arc();
+        let generation = self.state.generation_arc();
         let renderer = self.renderer.clone();
         let resize_callback = self.resize_callback.clone();
         let padding = self.config.padding;
@@ -1048,6 +1051,9 @@ impl Render for TerminalView {
                                 callback(cols, rows);
                             }
                             term.resize(TermSize { cols, rows });
+                            // This resize bypasses TerminalState, so the
+                            // frame cache must learn about it here.
+                            generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
 
                         // Remember where content sits and the cell metrics so
@@ -1062,7 +1068,8 @@ impl Render for TerminalView {
                         ));
 
                         // Paint the terminal with measured dimensions
-                        measured_renderer.paint(bounds, padding, &term, window, cx);
+                        let gen_now = generation.load(std::sync::atomic::Ordering::Relaxed);
+                        measured_renderer.paint(bounds, padding, &term, gen_now, window, cx);
                     },
                 )
                 .size_full(),
