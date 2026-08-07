@@ -76,6 +76,9 @@ pub struct Workspace {
     /// pass the rendered line back so a file that changed underneath is never
     /// clobbered.
     pub(crate) doc_text: Option<String>,
+    /// The pane document is the daily template rendered for a day with no
+    /// file yet; the first mutation writes it to disk.
+    pub(crate) doc_seeded: bool,
     /// The file `doc_text` was read from (`.md` or NotePlan's `.txt`).
     pub(crate) doc_path: Option<PathBuf>,
     /// Lines elsewhere that link to the pane's document.
@@ -182,6 +185,7 @@ impl Workspace {
             view: PaneView::Day,
             doc_lines: None,
             doc_text: None,
+            doc_seeded: false,
             doc_path: None,
             mentions: Vec::new(),
             conflicts: Vec::new(),

@@ -19,12 +19,14 @@ pub mod links;
 pub mod parse;
 pub mod settings;
 pub mod tasks;
+pub mod template;
 pub mod vault;
 pub mod write;
 
 pub use links::*;
 pub use parse::*;
 pub use tasks::*;
+pub use template::*;
 pub use vault::*;
 pub use write::*;
 

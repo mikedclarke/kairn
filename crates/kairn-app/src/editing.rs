@@ -75,6 +75,7 @@ impl Workspace {
             return;
         }
         self.commit_line_edit(true, cx);
+        self.materialize_seed();
         let path = match &self.doc_path {
             Some(p) => p.clone(),
             None => match &self.view {

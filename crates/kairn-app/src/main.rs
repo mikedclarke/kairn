@@ -25,6 +25,7 @@ fn main() {
     app.run(move |cx| {
         gpui_component::init(cx);
         workspace::init(cx);
+        theme::resolve_fonts(cx);
 
         let settings = Settings::load();
         theme::apply(Mode::from_str(&settings.theme), None, cx);

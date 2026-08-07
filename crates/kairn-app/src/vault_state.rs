@@ -151,6 +151,23 @@ impl Workspace {
             },
         };
         self.doc_error = doc_error;
+        // A day from today onward with no file yet starts from the daily
+        // template (Notes/@Templates/Daily.md): rendered immediately, written
+        // to disk only when the first edit lands. Past days stay blank — a
+        // template there would dress up history that never happened.
+        self.doc_seeded = false;
+        let text = if text.is_none()
+            && matches!(self.view, PaneView::Day)
+            && self.doc_error.is_none()
+            && !self.root_missing
+            && self.selected_day >= today
+        {
+            let seed = notes::daily_template(&self.notes_root);
+            self.doc_seeded = seed.is_some();
+            seed
+        } else {
+            text
+        };
         self.doc_lines = text.as_deref().map(notes::parse);
         self.doc_text = text;
         // Linked mentions for the pane's document: a day is referenced by its
@@ -216,10 +233,54 @@ impl Workspace {
         }
     }
 
+    /// A day rendered from the template exists only in memory until the
+    /// first mutation: write the seeded content now so line edits, toggles,
+    /// and moves land in a real file. Never overwrites — if the file
+    /// appeared meanwhile (sync, an agent), the per-line verification of
+    /// whatever edit follows sorts out any mismatch.
+    pub(crate) fn materialize_seed(&mut self) {
+        if !self.doc_seeded {
+            return;
+        }
+        self.doc_seeded = false;
+        if !matches!(self.view, PaneView::Day) {
+            return;
+        }
+        let Some(text) = &self.doc_text else { return };
+        let path = notes::daily_path(&self.notes_root, self.selected_day);
+        match notes::create_note_if_absent(&path, text) {
+            Ok(_) => {
+                self.note_self_write(&path);
+                self.doc_path = Some(path);
+            }
+            Err(e) => eprintln!("kairn: could not create {}: {e}", path.display()),
+        }
+    }
+
+    /// Move a dragged line so it sits before `before_idx`, writing the
+    /// reorder back to the file.
+    pub fn drop_line(&mut self, from_idx: usize, from_line: &str, before_idx: usize, cx: &mut Context<Self>) {
+        self.commit_line_edit(true, cx);
+        self.materialize_seed();
+        let Some(path) = self.doc_path.clone() else {
+            return;
+        };
+        match notes::move_line_on_disk(&path, from_idx, from_line, before_idx) {
+            Ok(Some(_)) => self.note_self_write(&path),
+            // The line changed on disk since render; the reload below picks
+            // up whatever is there now.
+            Ok(None) => {}
+            Err(e) => eprintln!("kairn: could not update {}: {e}", path.display()),
+        }
+        self.reload_notes();
+        cx.notify();
+    }
+
     /// Toggle the task on line `line_idx` of the pane's document between open
     /// and done, writing the change back to the file.
     pub fn toggle_task(&mut self, line_idx: usize, cx: &mut Context<Self>) {
         self.commit_line_edit(true, cx);
+        self.materialize_seed();
         let (Some(path), Some(text)) = (&self.doc_path, &self.doc_text) else {
             return;
         };

@@ -35,6 +35,13 @@ pub enum SpanKind {
     DateRef,
     /// `==highlighted==` text, markers stripped.
     Highlight,
+    /// Bold content: NotePlan-flavour `*bold*` as well as `**bold**`.
+    Bold,
+    /// Italic content: `_italic_`.
+    Italic,
+    /// An emphasis delimiter (`*`, `**`, `_`), kept visible but faded so the
+    /// rendered line maps 1:1 onto the raw markdown.
+    Marker,
 }
 
 pub type Span = (SpanKind, String);
@@ -150,6 +157,15 @@ fn inline_spans(text: &str) -> Vec<Span> {
             continue;
         }
         let at_word_start = i == 0 || bytes[i - 1].is_ascii_whitespace() || bytes[i - 1] == b'(';
+        if let Some((marker, kind, consumed)) = emphasis_at(rest, at_word_start) {
+            let content = &rest[marker.len()..consumed - marker.len()];
+            flush(&mut plain, &mut spans);
+            spans.push((SpanKind::Marker, marker.to_string()));
+            spans.push((kind, content.to_string()));
+            spans.push((SpanKind::Marker, marker.to_string()));
+            i += consumed;
+            continue;
+        }
         if at_word_start && (rest.starts_with('#') || rest.starts_with('@')) {
             let token: &str = rest
                 .split(|c: char| c.is_whitespace())
@@ -194,6 +210,40 @@ fn inline_spans(text: &str) -> Vec<Span> {
     }
     flush(&mut plain, &mut spans);
     spans
+}
+
+/// An emphasis run starting at `rest`, NotePlan flavour: `*bold*` and
+/// `**bold**` are bold, `_italic_` is italic. Returns the delimiter, the
+/// content kind, and the total bytes consumed. Content must not start or
+/// end with whitespace (so `5 * 3 * 2` stays arithmetic), and underscores
+/// only count on word boundaries (so snake_case identifiers stay plain).
+fn emphasis_at(rest: &str, at_word_start: bool) -> Option<(&'static str, SpanKind, usize)> {
+    let (marker, kind): (&'static str, SpanKind) = if rest.starts_with("**") {
+        ("**", SpanKind::Bold)
+    } else if rest.starts_with('*') {
+        ("*", SpanKind::Bold)
+    } else if rest.starts_with('_') {
+        ("_", SpanKind::Italic)
+    } else {
+        return None;
+    };
+    if marker == "_" && !at_word_start {
+        return None;
+    }
+    let m = marker.len();
+    let close = rest[m..].find(marker)? + m;
+    let content = &rest[m..close];
+    let first = content.chars().next()?;
+    let last = content.chars().last()?;
+    if first.is_whitespace() || last.is_whitespace() {
+        return None;
+    }
+    let end = close + m;
+    // The closer must end the word: `_foo_bar` is an identifier, not italic.
+    if marker == "_" && rest[end..].chars().next().is_some_and(|c| c.is_alphanumeric()) {
+        return None;
+    }
+    Some((marker, kind, end))
 }
 
 /// The styled span sitting `display_chars` characters into the line's
@@ -356,6 +406,73 @@ mod tests {
                 ]
             }
         );
+    }
+
+    #[test]
+    fn emphasis() {
+        // NotePlan flavour: single asterisks are bold, markers stay visible.
+        assert_eq!(
+            parse_line("a *bold* word"),
+            Line::Text {
+                spans: vec![
+                    (SpanKind::Text, "a ".into()),
+                    (SpanKind::Marker, "*".into()),
+                    (SpanKind::Bold, "bold".into()),
+                    (SpanKind::Marker, "*".into()),
+                    (SpanKind::Text, " word".into()),
+                ]
+            }
+        );
+        assert_eq!(
+            parse_line("**Other clients — only if there's a gap**"),
+            Line::Text {
+                spans: vec![
+                    (SpanKind::Marker, "**".into()),
+                    (SpanKind::Bold, "Other clients — only if there's a gap".into()),
+                    (SpanKind::Marker, "**".into()),
+                ]
+            }
+        );
+        assert_eq!(
+            parse_line("stay _calm_ now"),
+            Line::Text {
+                spans: vec![
+                    (SpanKind::Text, "stay ".into()),
+                    (SpanKind::Marker, "_".into()),
+                    (SpanKind::Italic, "calm".into()),
+                    (SpanKind::Marker, "_".into()),
+                    (SpanKind::Text, " now".into()),
+                ]
+            }
+        );
+        // Bold inside a task line, after the marker is stripped.
+        assert_eq!(
+            parse_line("* *this is just a note*"),
+            Line::Task {
+                state: TaskState::Open,
+                spans: vec![
+                    (SpanKind::Marker, "*".into()),
+                    (SpanKind::Bold, "this is just a note".into()),
+                    (SpanKind::Marker, "*".into()),
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn emphasis_false_positives_stay_plain() {
+        // Arithmetic: content edges are whitespace.
+        assert_eq!(parse_line("5 * 3 * 2"), Line::Text { spans: plain("5 * 3 * 2") });
+        // Identifiers: underscores mid-word or closing into a word.
+        assert_eq!(parse_line("file_name_here"), Line::Text { spans: plain("file_name_here") });
+        assert_eq!(parse_line("_foo_bar"), Line::Text { spans: plain("_foo_bar") });
+        // Unclosed markers.
+        assert_eq!(parse_line("a *dangling star"), Line::Text { spans: plain("a *dangling star") });
+        assert_eq!(parse_line("just ** stars"), Line::Text { spans: plain("just ** stars") });
+        // Display text still maps 1:1 onto raw content for cursor math.
+        let raw = "* a *bold* word";
+        assert_eq!(raw_col_for_display_char(raw, 3), 5);
+        assert_eq!(span_at_display_char(raw, 3), Some((SpanKind::Bold, "bold".into())));
     }
 
     #[test]

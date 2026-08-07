@@ -4,18 +4,18 @@ use std::collections::HashMap;
 use chrono::{Datelike, Days, Local};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, ClickEvent, Context, HighlightStyle, InteractiveElement, IntoElement,
-    ParentElement, StatefulInteractiveElement, Styled, StyledText, TextLayout, Window, div, px,
-    relative,
+    AnyElement, AppContext as _, ClickEvent, Context, HighlightStyle, InteractiveElement,
+    IntoElement, ParentElement, StatefulInteractiveElement, Styled, StyledText, TextLayout,
+    Window, div, px, relative,
 };
 use gpui_component::h_flex;
 use gpui_component::input::Input;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 
 use kairn_core::{self as notes, Line, Span, SpanKind, TaskState};
-use crate::theme::{self, KairnTheme};
+use crate::theme::{self, KairnTheme, KairnThemeExt as _};
 use crate::workspace::{
-    InputDown, InputUp, LayoutMode, PaneView, TaskQuery, Workspace, chord, chord_alt, kbd,
+    InputDown, InputUp, LayoutMode, PaneView, TaskQuery, Workspace, chord,
 };
 
 /// Per-render stash of each note line's text layout, for click hit-testing.
@@ -300,13 +300,27 @@ impl Workspace {
                 }
             }
             Some(lines) => {
+                let raw: Vec<String> = self
+                    .doc_text
+                    .as_deref()
+                    .map(|text| text.lines().map(str::to_string).collect())
+                    .unwrap_or_default();
                 for (idx, line) in lines.iter().enumerate() {
                     if editing_idx == Some(idx) {
                         note = note.child(self.render_line_editor(cx));
                     } else {
-                        note = note.child(clickable_line(
+                        let inner = clickable_line(
                             idx,
                             render_line(t, idx, line, &self.line_layouts, cx),
+                            cx,
+                        );
+                        let draggable = !matches!(line, Line::Blank | Line::Rule);
+                        note = note.child(draggable_row(
+                            t,
+                            idx,
+                            raw.get(idx).cloned().unwrap_or_default(),
+                            draggable,
+                            inner,
                             cx,
                         ));
                     }
@@ -317,28 +331,26 @@ impl Workspace {
             }
         }
 
-        // Clicking the space under the note starts a new line at the end.
-        note = note.child(div().id("note-append").h(px(140.)).on_click(cx.listener(
-            |this, _, window, cx| {
-                cx.stop_propagation();
-                this.edit_line(usize::MAX, window, cx);
-            },
-        )));
-
-        note = note.child(self.render_mentions(t, cx));
-
-        note.child(
+        // Clicking the space under the note starts a new line at the end;
+        // dropping a dragged line here moves it to the end.
+        let accent = t.accent;
+        note = note.child(
             div()
-                .mt(px(4.))
-                .flex()
-                .gap(px(6.))
-                .items_center()
-                .text_size(px(11.5))
-                .text_color(t.faint)
-                .child(kbd(t, chord_alt("⏎")))
-                .child("writing mode · click any line to edit in place"),
-        )
-        .into_any_element()
+                .id("note-append")
+                .h(px(140.))
+                .border_t_2()
+                .border_color(gpui::transparent_black())
+                .drag_over::<DragLine>(move |style, _, _, _| style.border_color(accent))
+                .on_drop::<DragLine>(cx.listener(|this, drag: &DragLine, _, cx| {
+                    this.drop_line(drag.idx, &drag.text, usize::MAX, cx);
+                }))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.edit_line(usize::MAX, window, cx);
+                })),
+        );
+
+        note.child(self.render_mentions(t, cx)).into_any_element()
     }
 
     /// A line edit whose target line vanished from the file before saving:
@@ -471,7 +483,17 @@ impl Workspace {
             .on_action(cx.listener(Self::on_line_edit_right))
             .on_action(cx.listener(Self::on_line_edit_backspace))
             .on_action(cx.listener(Self::on_line_edit_delete))
-            .child(Input::new(&le.input).appearance(false).w_full())
+            // Strip the input's own metrics so the raw line sits exactly
+            // where the rendered line was: same size, leading, and left edge.
+            .child(
+                Input::new(&le.input)
+                    .appearance(false)
+                    .w_full()
+                    .p_0()
+                    .h(px(21.))
+                    .text_size(px(13.))
+                    .line_height(relative(1.58)),
+            )
             .into_any_element()
     }
 
@@ -626,6 +648,84 @@ fn week_nav(t: &KairnTheme, id: &'static str, glyph: &'static str) -> gpui::Stat
         .cursor_pointer()
         .hover(move |s| s.text_color(hover_text))
         .child(glyph)
+}
+
+/// A dragged note line: the source index plus the raw markdown, so the drop
+/// applies a verified move that can never clobber a file that shifted.
+#[derive(Clone)]
+struct DragLine {
+    idx: usize,
+    text: String,
+}
+
+/// The floating preview while a line is dragged.
+struct DragPreview(String);
+
+impl gpui::Render for DragPreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = cx.kairn().clone();
+        div()
+            .px(px(10.))
+            .py(px(4.))
+            .rounded(px(6.))
+            .bg(t.panel2)
+            .border_1()
+            .border_color(t.border)
+            .text_size(px(12.))
+            .text_color(t.dim)
+            .max_w(px(420.))
+            .overflow_hidden()
+            .child(self.0.clone())
+    }
+}
+
+/// Wrap a rendered line with its reorder affordances: a grab handle in the
+/// left margin, visible while the row is hovered, and a drop target that
+/// moves the dragged line to sit above this one.
+fn draggable_row(
+    t: &KairnTheme,
+    idx: usize,
+    raw: String,
+    draggable: bool,
+    inner: AnyElement,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
+    let group = gpui::SharedString::from(format!("note-line-{idx}"));
+    let accent = t.accent;
+    let grip_hover = t.dim;
+    let mut row = div()
+        .id(("line-row", idx))
+        .group(group.clone())
+        .flex()
+        .items_start()
+        .border_t_2()
+        .border_color(gpui::transparent_black())
+        .drag_over::<DragLine>(move |style, _, _, _| style.border_color(accent))
+        .on_drop::<DragLine>(cx.listener(move |this, drag: &DragLine, _, cx| {
+            this.drop_line(drag.idx, &drag.text, idx, cx);
+        }));
+    if draggable {
+        row = row.child(
+            div()
+                .id(("line-grip", idx))
+                .flex_none()
+                .w(px(16.))
+                .ml(px(-16.))
+                .pt(px(5.))
+                .text_size(px(10.))
+                .text_color(t.faint)
+                .opacity(0.)
+                .group_hover(group, |s| s.opacity(1.))
+                .hover(move |s| s.text_color(grip_hover))
+                .cursor_grab()
+                .on_drag(DragLine { idx, text: raw }, |drag, _, _, cx| {
+                    cx.new(|_| DragPreview(drag.text.clone()))
+                })
+                .child("⠿"),
+        );
+    }
+    row.child(div().flex_1().min_w(px(0.)).child(inner))
+        .into_any_element()
 }
 
 /// Wrap a rendered line so clicking it starts editing it in place, cursor
@@ -833,6 +933,18 @@ fn spans_text(t: &KairnTheme, spans: &[Span]) -> StyledText {
             SpanKind::Highlight => Some(HighlightStyle {
                 color: Some(t.text),
                 background_color: Some(t.amber.opacity(0.28)),
+                ..Default::default()
+            }),
+            SpanKind::Bold => Some(HighlightStyle {
+                font_weight: Some(gpui::FontWeight::BOLD),
+                ..Default::default()
+            }),
+            SpanKind::Italic => Some(HighlightStyle {
+                font_style: Some(gpui::FontStyle::Italic),
+                ..Default::default()
+            }),
+            SpanKind::Marker => Some(HighlightStyle {
+                color: Some(t.faint),
                 ..Default::default()
             }),
         };

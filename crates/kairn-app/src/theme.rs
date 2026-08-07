@@ -173,20 +173,66 @@ pub fn apply(mode: Mode, window: Option<&mut Window>, cx: &mut App) {
     cx.refresh_windows();
 }
 
+static MONO_FONT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static SERIF_FONT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Resolve the app's fonts against the families actually installed, once at
+/// startup. Asking for a family that isn't there makes gpui fall back per
+/// glyph with mismatched advance widths — on Linux the terminal renders with
+/// broken letter spacing rather than failing loudly.
+pub fn resolve_fonts(cx: &App) {
+    let installed: std::collections::HashSet<String> =
+        cx.text_system().all_font_names().into_iter().collect();
+    let pick = |candidates: &[&str], contains: &str, last: &str| {
+        candidates
+            .iter()
+            .find(|c| installed.contains(**c))
+            .map(|c| c.to_string())
+            .or_else(|| {
+                let mut close: Vec<&String> =
+                    installed.iter().filter(|f| f.contains(contains)).collect();
+                close.sort();
+                close.first().map(|f| f.to_string())
+            })
+            .unwrap_or_else(|| last.to_string())
+    };
+    let mono = pick(
+        &[
+            "Menlo",
+            "SF Mono",
+            "JetBrains Mono",
+            "Fira Code",
+            "Hack",
+            "Adwaita Mono",
+            "DejaVu Sans Mono",
+            "Noto Sans Mono",
+            "Ubuntu Mono",
+            "Liberation Mono",
+        ],
+        "Mono",
+        "monospace",
+    );
+    let serif = pick(
+        &[
+            "Georgia",
+            "Charter",
+            "DejaVu Serif",
+            "Noto Serif",
+            "Liberation Serif",
+        ],
+        "Serif",
+        "serif",
+    );
+    let _ = MONO_FONT.set(mono);
+    let _ = SERIF_FONT.set(serif);
+}
+
 pub fn mono_font() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "Menlo"
-    } else {
-        "DejaVu Sans Mono"
-    }
+    MONO_FONT.get().map(String::as_str).unwrap_or("monospace")
 }
 
 pub fn serif_font() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "Georgia"
-    } else {
-        "DejaVu Serif"
-    }
+    SERIF_FONT.get().map(String::as_str).unwrap_or("serif")
 }
 
 /// Terminal colors: sage-tinted ANSI ramp; the terminal stays dark in both

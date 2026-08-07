@@ -264,6 +264,54 @@ pub fn join_lines_on_disk(
     Ok(Some(idx))
 }
 
+/// Move the line at `from_idx` so it sits before the line currently at
+/// `before_idx` (`before_idx` at or past the end moves it to the end). The
+/// moved line is verified (or relocated to a unique content match) like
+/// every other edit; `None` when it is gone or ambiguous and nothing was
+/// written. Returns the index the line landed on.
+pub fn move_line_on_disk(
+    path: &Path,
+    from_idx: usize,
+    expected: &str,
+    before_idx: usize,
+) -> io::Result<Option<usize>> {
+    let text = fs::read_to_string(path)?;
+    let lines: Vec<&str> = text.lines().collect();
+    let from = if lines.get(from_idx).is_some_and(|l| *l == expected) {
+        from_idx
+    } else {
+        let mut matches = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| **l == expected)
+            .map(|(i, _)| i);
+        let Some(only) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Ok(None);
+        }
+        only
+    };
+    let mut order: Vec<&str> = lines.clone();
+    let moved = order.remove(from);
+    let mut target = before_idx.min(lines.len());
+    if target > from {
+        target -= 1;
+    }
+    if target == from {
+        return Ok(Some(from));
+    }
+    order.insert(target, moved);
+    let ending = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut out = order.join(ending);
+    if text.ends_with('\n') {
+        out.push_str(ending);
+    }
+    atomic_write(path, &out)?;
+    Ok(Some(target))
+}
+
 /// Toggle a task in a note on disk. The file is re-read fresh so a change made
 /// since it was rendered is never clobbered: the single-line edit is re-applied
 /// against current content, and if the line no longer exists nothing is
@@ -368,6 +416,46 @@ mod tests {
             join_lines_in_text("* a\n* b", 0, "* a", "* b", "* ab"),
             Some(("* ab".into(), 0))
         );
+    }
+
+    #[test]
+    fn move_line_reorders() {
+        let root = ScratchRoot::new("move");
+        let path = root.write("Calendar/20260807.md", "# Day\n* one\n* two\n* three\n");
+        // Move "one" below "two" (before "three").
+        assert_eq!(move_line_on_disk(&path, 1, "* one", 3).expect("io"), Some(2));
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "# Day\n* two\n* one\n* three\n"
+        );
+        // Move "three" to the very top.
+        assert_eq!(move_line_on_disk(&path, 3, "* three", 0).expect("io"), Some(0));
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "* three\n# Day\n* two\n* one\n"
+        );
+        // Past-the-end target moves to the end.
+        assert_eq!(move_line_on_disk(&path, 0, "* three", 99).expect("io"), Some(3));
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "# Day\n* two\n* one\n* three\n"
+        );
+        // Dropping a line onto itself writes nothing and keeps its index.
+        assert_eq!(move_line_on_disk(&path, 1, "* two", 1).expect("io"), Some(1));
+        // The line shifted since render: relocated by unique content.
+        assert_eq!(move_line_on_disk(&path, 0, "* one", 0).expect("io"), Some(0));
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "* one\n# Day\n* two\n* three\n"
+        );
+        // Gone or ambiguous: nothing is written.
+        assert_eq!(move_line_on_disk(&path, 0, "* gone", 2).expect("io"), None);
+        let dupes = root.write("Notes/Dupes.md", "* a\n\nx\n\n* b\n");
+        assert_eq!(move_line_on_disk(&dupes, 0, "", 4).expect("io"), None);
+        // No trailing newline stays that way.
+        let bare = root.write("Notes/Bare.md", "one\ntwo");
+        assert_eq!(move_line_on_disk(&bare, 1, "two", 0).expect("io"), Some(0));
+        assert_eq!(fs::read_to_string(&bare).expect("read"), "two\none");
     }
 
     #[test]
