@@ -1,0 +1,19 @@
+[package]
+name = "kairn-cli"
+version = "0.1.0"
+edition = "2024"
+
+# The agent-facing surface: a plain CLI over kairn-core, no UI dependencies,
+# no servers. Help text is a first-class UI here — any model reading
+# `--help` alone should be able to drive it.
+[[bin]]
+name = "kairn"
+path = "src/main.rs"
+
+[dependencies]
+kairn-core = { path = "../kairn-core" }
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

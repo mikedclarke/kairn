@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "kairn"
+# `kairn` on PATH is the CLI (crates/kairn-cli); the app binary carries the
+# -app suffix and is what bundles and launchers point at.
+name = "kairn-app"
 path = "src/main.rs"
 
 [dependencies]
