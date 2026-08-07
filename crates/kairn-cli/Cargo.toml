@@ -1,7 +1,9 @@
 [package]
 name = "kairn-cli"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 # The agent-facing surface: a plain CLI over kairn-core, no UI dependencies,
 # no servers. Help text is a first-class UI here — any model reading

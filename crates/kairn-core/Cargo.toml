@@ -1,7 +1,9 @@
 [package]
 name = "kairn-core"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 # The notes/vault/settings core, deliberately UI-free: the app and the
 # `kairn` CLI both build on it, and keeping gpui out of the dependency

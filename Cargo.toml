@@ -11,6 +11,14 @@ members = [
 # owns that name on PATH). Use `cargo test --workspace` to cover every member.
 default-members = ["crates/kairn-app"]
 
+# One version for the app, core, and CLI: bump it here when cutting a release
+# (see docs/RELEASING.md). The vendored gpui-terminal fork keeps its own.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/mikedclarke/kairn"
+
 # Debug builds keep Kairn's own code unoptimised but compile every dependency
 # (gpui, taffy, cosmic-text, alacritty) at opt-level 2: a full UI frame with
 # deps at opt-level 0 costs hundreds of milliseconds on a power-limited machine.
