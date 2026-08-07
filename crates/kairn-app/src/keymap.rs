@@ -32,6 +32,13 @@ actions!(
         EditorUndo,
         EditorRedo,
         EditorPaste,
+        EditorCopy,
+        EditorCut,
+        EditorSelectAll,
+        EditorSelectLeft,
+        EditorSelectRight,
+        EditorSelectUp,
+        EditorSelectDown,
         Session1,
         Session2,
         Session3,
@@ -105,6 +112,13 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(&p("z"), EditorUndo, Some("NoteEditor")),
         KeyBinding::new(&p("shift-z"), EditorRedo, Some("NoteEditor")),
         KeyBinding::new(&p("v"), EditorPaste, Some("NoteEditor")),
+        KeyBinding::new(&p("c"), EditorCopy, Some("NoteEditor")),
+        KeyBinding::new(&p("x"), EditorCut, Some("NoteEditor")),
+        KeyBinding::new(&p("a"), EditorSelectAll, Some("NoteEditor")),
+        KeyBinding::new("shift-left", EditorSelectLeft, Some("NoteEditor")),
+        KeyBinding::new("shift-right", EditorSelectRight, Some("NoteEditor")),
+        KeyBinding::new("shift-up", EditorSelectUp, Some("NoteEditor")),
+        KeyBinding::new("shift-down", EditorSelectDown, Some("NoteEditor")),
     ]);
 }
 

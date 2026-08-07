@@ -208,6 +208,79 @@ impl NoteBuffer {
         self.edit_with_kind(split_at..split_at, &insert, offset, now_ms, GroupKind::Other)
     }
 
+    /// Move the whole line containing `offset` so it sits at the line
+    /// boundary `target` (a line-start offset in the current text, or the
+    /// text length to move it to the end). One undoable step; a drop back
+    /// onto the source line is a no-op. Returns the byte offset the moved
+    /// line starts at afterwards.
+    pub fn move_line(
+        &mut self,
+        offset: usize,
+        target: usize,
+        cursor_before: usize,
+        now_ms: u64,
+    ) -> usize {
+        let offset = floor_boundary(&self.text, offset);
+        let line_start = self.text[..offset].rfind('\n').map_or(0, |i| i + 1);
+        let line_end =
+            self.text[line_start..].find('\n').map_or(self.text.len(), |i| line_start + i);
+        let target = floor_boundary(&self.text, target);
+        if target >= line_start && target <= line_end + 1 {
+            return line_start;
+        }
+
+        let trailing_nl = self.text.ends_with('\n');
+        let mut lines: Vec<String> = self.text.split('\n').map(str::to_string).collect();
+        if trailing_nl {
+            lines.pop();
+        }
+        let src = self.text[..line_start].matches('\n').count();
+        let mut dst = if target >= self.text.len() {
+            lines.len()
+        } else {
+            self.text[..target].matches('\n').count()
+        };
+        if src < dst {
+            dst -= 1;
+        }
+        let line = lines.remove(src);
+        let dst = dst.min(lines.len());
+        lines.insert(dst, line);
+        let mut new_text = lines.join("\n");
+        if trailing_nl {
+            new_text.push('\n');
+        }
+        let new_start: usize = lines.iter().take(dst).map(|l| l.len() + 1).sum();
+
+        // Reordering never changes the length; apply just the region that
+        // moved as a single op so undo restores it in one step.
+        let len = self.text.len();
+        let mut prefix =
+            self.text.bytes().zip(new_text.bytes()).take_while(|(a, b)| a == b).count();
+        while !self.text.is_char_boundary(prefix) {
+            prefix -= 1;
+        }
+        let mut suffix = self
+            .text
+            .bytes()
+            .rev()
+            .zip(new_text.bytes().rev())
+            .take_while(|(a, b)| a == b)
+            .count()
+            .min(len - prefix);
+        while !self.text.is_char_boundary(len - suffix) {
+            suffix -= 1;
+        }
+        self.edit_with_kind(
+            prefix..len - suffix,
+            &new_text[prefix..new_text.len() - suffix],
+            cursor_before,
+            now_ms,
+            GroupKind::Other,
+        );
+        new_start
+    }
+
     /// Absorb the file's current content into the buffer without writing:
     /// the merge path for watcher events landing mid-edit and for saves over
     /// a changed file. After this, `text()` holds the merge and the baseline
@@ -372,6 +445,49 @@ mod tests {
         assert_eq!(b.text(), "* task\n* ");
         b.undo();
         assert_eq!(b.text(), "* task");
+    }
+
+    #[test]
+    fn move_line_down_and_up() {
+        let mut b = NoteBuffer::new("a\nb\nc\n");
+        // Move "a" to sit where "c" starts.
+        assert_eq!(b.move_line(0, 4, 0, 1000), 2);
+        assert_eq!(b.text(), "b\na\nc\n");
+        // Move "c" (now still at 4) to the top.
+        assert_eq!(b.move_line(4, 0, 0, 2000), 0);
+        assert_eq!(b.text(), "c\nb\na\n");
+    }
+
+    #[test]
+    fn move_line_to_end_without_trailing_newline() {
+        let mut b = NoteBuffer::new("a\nb\nc");
+        assert_eq!(b.move_line(0, 5, 0, 1000), 4);
+        assert_eq!(b.text(), "b\nc\na");
+        // And the last line back to the top.
+        let mut b = NoteBuffer::new("a\nb\nc");
+        assert_eq!(b.move_line(4, 0, 0, 1000), 0);
+        assert_eq!(b.text(), "c\na\nb");
+    }
+
+    #[test]
+    fn move_line_onto_itself_is_a_no_op() {
+        let mut b = NoteBuffer::new("a\nb\nc\n");
+        assert_eq!(b.move_line(2, 2, 0, 1000), 2);
+        // Dropping on the boundary just below is the same position.
+        assert_eq!(b.move_line(2, 4, 0, 1000), 2);
+        assert_eq!(b.text(), "a\nb\nc\n");
+        assert_eq!(b.undo(), None);
+    }
+
+    #[test]
+    fn move_line_is_one_undo_step() {
+        let mut b = NoteBuffer::new("a\nb\nc\n");
+        b.move_line(0, 6, 5, 1000);
+        assert_eq!(b.text(), "b\nc\na\n");
+        assert_eq!(b.undo(), Some(5));
+        assert_eq!(b.text(), "a\nb\nc\n");
+        assert!(b.redo().is_some());
+        assert_eq!(b.text(), "b\nc\na\n");
     }
 
     #[test]

@@ -337,6 +337,37 @@ pub fn raw_col_for_display_char(raw: &str, display_chars: usize) -> usize {
     raw.len()
 }
 
+/// Inverse of [`raw_col_for_display_char`]: the rendered-content character
+/// index for a byte offset into `raw`. Offsets inside the line's prefix or
+/// a stripped highlight marker clamp to the nearest rendered character.
+pub fn display_char_for_raw_col(raw: &str, raw_col: usize) -> usize {
+    let line = parse_line(raw);
+    let spans = match &line {
+        Line::Heading { spans, .. }
+        | Line::Task { spans, .. }
+        | Line::Bullet { spans }
+        | Line::Quote { spans }
+        | Line::Text { spans } => spans,
+        Line::Rule | Line::Blank => return 0,
+    };
+    let mut raw_pos = content_start(raw, &line);
+    let mut display = 0usize;
+    for (kind, s) in spans {
+        let marker = if *kind == SpanKind::Highlight { 2 } else { 0 };
+        let span_start = raw_pos + marker;
+        if raw_col < span_start {
+            return display;
+        }
+        if raw_col < span_start + s.len() {
+            let local = raw_col - span_start;
+            return display + s.char_indices().take_while(|(i, _)| *i < local).count();
+        }
+        display += s.chars().count();
+        raw_pos = span_start + s.len() + marker;
+    }
+    display
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,6 +561,47 @@ mod tests {
         // Blank-ish lines land at the end.
         assert_eq!(raw_col_for_display_char("   ", 0), 3);
         assert_eq!(raw_col_for_display_char("---", 0), 3);
+    }
+
+    #[test]
+    fn raw_col_to_display_char() {
+        // Task content starts after "* [ ] "; anywhere in the prefix clamps
+        // to the first rendered character.
+        assert_eq!(display_char_for_raw_col("* [ ] buy milk", 6), 0);
+        assert_eq!(display_char_for_raw_col("* [ ] buy milk", 3), 0);
+        assert_eq!(display_char_for_raw_col("* [ ] buy milk", 10), 4);
+        assert_eq!(display_char_for_raw_col("* [ ] buy milk", 14), 8);
+        assert_eq!(display_char_for_raw_col("## Today", 5), 2);
+        assert_eq!(display_char_for_raw_col("see [[kairn]] now", 5), 5);
+        // Inside a stripped highlight marker: clamp to the highlight start.
+        assert_eq!(display_char_for_raw_col("== hot ==x", 1), 0);
+        assert_eq!(display_char_for_raw_col("== hot ==x", 8), 5);
+        assert_eq!(display_char_for_raw_col("== hot ==x", 9), 5);
+        assert_eq!(display_char_for_raw_col("* 中文", "* 中".len()), 1);
+        assert_eq!(display_char_for_raw_col("---", 2), 0);
+    }
+
+    #[test]
+    fn display_mapping_round_trips() {
+        for raw in [
+            "* [ ] buy *milk* ==now== #chore",
+            "  - [x] done >2026-08-09",
+            "## Section ==hot==",
+            "see [[kairn]] and @mike",
+            "plain text line",
+        ] {
+            let chars = {
+                let mut n = 0;
+                while raw_col_for_display_char(raw, n) < raw.len() {
+                    n += 1;
+                }
+                n
+            };
+            for i in 0..chars {
+                let col = raw_col_for_display_char(raw, i);
+                assert_eq!(display_char_for_raw_col(raw, col), i, "{raw} char {i}");
+            }
+        }
     }
 
     #[test]
