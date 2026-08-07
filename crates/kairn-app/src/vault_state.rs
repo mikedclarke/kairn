@@ -141,9 +141,36 @@ impl Workspace {
                 }
                 NoteEditorEvent::OpenDate(date) => this.select_day(*date, cx),
                 NoteEditorEvent::OpenUrl(url) => cx.open_url(url),
+                NoteEditorEvent::TaskDropped { line_start, position } => {
+                    this.on_task_dropped(*line_start, *position, cx);
+                }
             },
         ));
         self.note_editor = Some(editor);
+    }
+
+    /// The drop half of drag-to-reschedule: an open task's glyph drag was
+    /// released outside the editor. If the pointer sat on a week-strip day,
+    /// rewrite the task's `>date` through the editor buffer (undoable,
+    /// autosaved); anywhere else the drag just ends.
+    pub(crate) fn on_task_dropped(
+        &mut self,
+        line_start: usize,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let day = self
+            .week_strip_bounds
+            .borrow()
+            .iter()
+            .find(|(_, bounds)| bounds.contains(&position))
+            .map(|(day, _)| *day);
+        if let Some(day) = day
+            && let Some(editor) = &self.note_editor
+        {
+            editor.update(cx, |ed, cx| ed.reschedule_line_at(line_start, day, cx));
+        }
+        cx.notify();
     }
 
     pub fn notes_expanded_contains(&self, path: &std::path::Path) -> bool {

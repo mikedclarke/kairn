@@ -51,6 +51,9 @@ pub enum NoteEditorEvent {
     OpenWikiLink(String),
     OpenDate(chrono::NaiveDate),
     OpenUrl(String),
+    /// An open task's glyph drag was released outside the editor; the
+    /// workspace reschedules if the pointer sat on a week-strip day.
+    TaskDropped { line_start: usize, position: Point<Pixels> },
 }
 
 pub struct NoteEditor {
@@ -113,10 +116,17 @@ struct GlyphDrag {
     /// Line-start offset of the dragged line at mouse down.
     line_start: usize,
     origin: Point<Pixels>,
+    /// Where the pointer is now, window coordinates: the workspace reads it
+    /// to place the drag ghost and light up week-strip drop targets.
+    position: Point<Pixels>,
     moved: bool,
     /// Whether releasing without moving toggles the task.
     toggles: bool,
-    /// Drop position: a line-start offset, or the text length for the end.
+    /// The dragged line is an open task: leaving the editor turns the drag
+    /// into a reschedule instead of a reorder.
+    open_task: bool,
+    /// Drop position for a reorder: a line-start offset (or the text length
+    /// for the end); `None` while the pointer is outside the editor.
     target: Option<usize>,
 }
 
@@ -584,7 +594,7 @@ impl NoteEditor {
         cx: &mut Context<Self>,
     ) {
         enum Click {
-            Glyph { line_start: usize, toggles: bool },
+            Glyph { line_start: usize, toggles: bool, open_task: bool },
             Nav(notes::LinkTarget),
             Cursor(usize),
         }
@@ -610,6 +620,7 @@ impl NoteEditor {
                             slot.entry.glyph,
                             Glyph::Task(TaskState::Open | TaskState::Done)
                         ),
+                        open_task: matches!(slot.entry.glyph, Glyph::Task(TaskState::Open)),
                     };
                     break;
                 }
@@ -644,12 +655,14 @@ impl NoteEditor {
             click
         };
         match click {
-            Click::Glyph { line_start, toggles } => {
+            Click::Glyph { line_start, toggles, open_task } => {
                 self.glyph_drag = Some(GlyphDrag {
                     line_start,
                     origin: event.position,
+                    position: event.position,
                     moved: false,
                     toggles,
+                    open_task,
                     target: None,
                 });
             }
@@ -716,8 +729,17 @@ impl NoteEditor {
             {
                 drag.moved = true;
             }
+            drag.position = event.position;
             if drag.moved {
-                drag.target = Some(self.drop_target_for_y(event.position.y));
+                // Inside the editor the drag is a reorder; once the pointer
+                // leaves (e.g. up to the week strip) the drop indicator goes
+                // away and releasing becomes the workspace's drop to handle.
+                let inside = self
+                    .layout
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|l| l.bounds.contains(&event.position));
+                drag.target = inside.then(|| self.drop_target_for_y(event.position.y));
                 cx.notify();
             }
             self.glyph_drag = Some(drag);
@@ -746,6 +768,13 @@ impl NoteEditor {
                     self.buffer.move_line(drag.line_start, target, self.cursor, now_ms());
                 self.cursor = new_start;
                 self.after_edit(cx);
+            } else if drag.open_task {
+                // Released outside the editor: the workspace decides whether
+                // the pointer was over a reschedule target.
+                cx.emit(NoteEditorEvent::TaskDropped {
+                    line_start: drag.line_start,
+                    position: drag.position,
+                });
             }
             cx.notify();
             return;
@@ -821,6 +850,34 @@ impl NoteEditor {
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
         let Some(toggled) = notes::toggle_task_line(&line, &now) else { return };
         self.buffer.edit(raw_range, &toggled, self.cursor, now_ms());
+        self.after_edit(cx);
+    }
+
+    /// The in-flight glyph drag of an open task, once it has actually moved:
+    /// the task's text and the pointer's window position. The workspace
+    /// reads this to draw the drag ghost and light week-strip drop targets.
+    pub fn task_drag(&self) -> Option<(String, Point<Pixels>)> {
+        let drag = self.glyph_drag.as_ref()?;
+        if !drag.moved || !drag.open_task {
+            return None;
+        }
+        let range = self.line_range_at(drag.line_start);
+        Some((self.text()[range].to_string(), drag.position))
+    }
+
+    /// Set the due date of the task line at `line_start`, as an ordinary
+    /// undoable buffer edit that autosaves like typing: the drop half of
+    /// drag-to-reschedule.
+    pub fn reschedule_line_at(
+        &mut self,
+        line_start: usize,
+        due: chrono::NaiveDate,
+        cx: &mut Context<Self>,
+    ) {
+        let range = self.line_range_at(line_start);
+        let line = self.text()[range.clone()].to_string();
+        let Some(updated) = notes::reschedule_task_line(&line, due) else { return };
+        self.buffer.edit(range, &updated, self.cursor, now_ms());
         self.after_edit(cx);
     }
 
@@ -1535,7 +1592,7 @@ impl Element for NoteEditorElement {
         cx: &mut App,
     ) {
         let t = cx.kairn().clone();
-        let (focus_handle, cursor, blink_visible, selection, text, drag_target) = {
+        let (focus_handle, cursor, blink_visible, selection, text, drag_target, drag_lifted) = {
             let ed = self.editor.read(cx);
             let selection = ed.selection();
             // The document text is only consulted for mapping a selection's
@@ -1549,6 +1606,7 @@ impl Element for NoteEditorElement {
                 selection,
                 text,
                 ed.glyph_drag.as_ref().filter(|d| d.moved).and_then(|d| d.target),
+                ed.glyph_drag.as_ref().filter(|d| d.moved).map(|d| d.line_start),
             )
         };
         window.handle_input(
@@ -1761,6 +1819,20 @@ impl Element for NoteEditorElement {
                     t.accent,
                 ));
             }
+        }
+
+        // The dragged line lifts (dims) while a glyph drag is in flight, so
+        // it reads as picked up rather than duplicated by the ghost.
+        if let Some(lifted) = drag_lifted
+            && let Some(slot) = layout.slots.iter().find(|s| s.raw_start == lifted)
+        {
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(bounds.origin.x, bounds.origin.y + slot.y),
+                    size(bounds.size.width, slot.height),
+                ),
+                t.bg.opacity(0.65),
+            ));
         }
 
         // The drop indicator for an in-flight glyph drag: a line across the

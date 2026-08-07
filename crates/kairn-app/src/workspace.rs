@@ -105,6 +105,10 @@ pub struct Workspace {
     pub(crate) daily_cache: notes::TextCache,
     /// Non-daily note text (period notes, Notes/ files) for the task scan.
     pub(crate) note_cache: notes::TextCache,
+    /// Week-strip day cells' window bounds from the last paint, captured so
+    /// a task drag can hit-test its drop day without a second layout pass.
+    pub(crate) week_strip_bounds:
+        std::rc::Rc<std::cell::RefCell<Vec<(NaiveDate, gpui::Bounds<gpui::Pixels>)>>>,
     _activity_timer: Task<()>,
     /// Watches the notes root so outside edits (agents, Syncthing, NotePlan
     /// elsewhere) appear without a restart. Dropped with the workspace.
@@ -195,6 +199,7 @@ impl Workspace {
             self_writes,
             daily_cache: notes::TextCache::default(),
             note_cache: notes::TextCache::default(),
+            week_strip_bounds: Default::default(),
             _activity_timer: activity_timer,
             _notes_watcher: notes_watcher,
             _notes_watch_task: notes_watch_task,
@@ -418,7 +423,57 @@ impl Render for Workspace {
             .children(self.render_picker(&t, window, cx))
             .children(self.render_switcher(&t, cx))
             .children(self.render_capture(&t, cx))
+            .children(self.render_drag_ghost(&t, cx))
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_notification_layer(window, cx))
+    }
+}
+
+impl Workspace {
+    /// The floating ghost that follows a task's drag-to-reschedule: a small
+    /// card with the task's text, offset from the pointer so it never sits
+    /// under it (which would block the week strip's hit-testing).
+    fn render_drag_ghost(
+        &self,
+        t: &theme::KairnTheme,
+        cx: &Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let (line, position) = self.note_editor.as_ref()?.read(cx).task_drag()?;
+        let text = line.trim_start();
+        let text = ["* ", "+ ", "- "]
+            .iter()
+            .find_map(|m| text.strip_prefix(m))
+            .unwrap_or(text)
+            .trim_start();
+        let text = text.strip_prefix("[ ]").map(str::trim_start).unwrap_or(text);
+        let text: String = text.chars().take(48).collect();
+        Some(
+            div()
+                .absolute()
+                .left(position.x + px(14.))
+                .top(position.y + px(10.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .px(px(10.))
+                .py(px(5.))
+                .rounded(px(7.))
+                .bg(t.panel)
+                .border_1()
+                .border_color(t.border)
+                .shadow_md()
+                .text_size(px(12.))
+                .text_color(t.dim)
+                .child(
+                    div()
+                        .w(px(10.))
+                        .h(px(10.))
+                        .flex_none()
+                        .rounded(px(3.))
+                        .border_1()
+                        .border_color(t.faint),
+                )
+                .child(text),
+        )
     }
 }

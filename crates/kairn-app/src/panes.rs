@@ -123,6 +123,23 @@ impl Workspace {
         let selected = self.selected_day;
         let monday = selected - Days::new(selected.weekday().num_days_from_monday() as u64);
 
+        // Drag-to-reschedule: while an open task's glyph drag is in flight,
+        // the day under the pointer rings as the drop target (hit-tested
+        // against the cells' last-painted bounds, which a drag can't move).
+        let drag_pos = self
+            .note_editor
+            .as_ref()
+            .and_then(|e| e.read(cx).task_drag())
+            .map(|(_, position)| position);
+        let drop_day = drag_pos.and_then(|position| {
+            self.week_strip_bounds
+                .borrow()
+                .iter()
+                .find(|(_, bounds)| bounds.contains(&position))
+                .map(|(day, _)| *day)
+        });
+        self.week_strip_bounds.borrow_mut().clear();
+
         let mut strip = div()
             .h(px(62.))
             .flex_none()
@@ -161,9 +178,12 @@ impl Workspace {
             }
 
             let hover_bg = t.hover;
+            let is_drop = drop_day == Some(day);
+            let bounds_store = self.week_strip_bounds.clone();
             strip = strip.child(
                 div()
                     .id(("week-day", i as usize))
+                    .relative()
                     .flex_1()
                     .py(px(5.))
                     .rounded(px(9.))
@@ -176,10 +196,27 @@ impl Workspace {
                         |d| d.bg(t.amber).text_color(t.on_amber),
                         |d| d.text_color(t.dim).hover(move |s| s.bg(hover_bg)),
                     )
+                    .when(is_drop, |d| {
+                        d.bg(t.sel).text_color(t.accent).border_2().border_color(t.accent)
+                    })
+                    .child(
+                        gpui::canvas(
+                            move |bounds, _, _| bounds_store.borrow_mut().push((day, bounds)),
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
                     .child(
                         div()
                             .text_size(px(9.))
-                            .text_color(if is_selected { t.on_amber } else { t.faint })
+                            .text_color(if is_drop {
+                                t.accent
+                            } else if is_selected {
+                                t.on_amber
+                            } else {
+                                t.faint
+                            })
                             .child(day.format("%a").to_string().to_uppercase()),
                     )
                     .child(
