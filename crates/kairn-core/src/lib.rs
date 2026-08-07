@@ -15,7 +15,9 @@
 //! `+ item` lines are checklists, `- item` is a plain bullet unless
 //! bracketed.
 
+pub mod buffer;
 pub mod links;
+pub mod merge;
 pub mod parse;
 pub mod settings;
 pub mod tasks;
@@ -23,7 +25,9 @@ pub mod template;
 pub mod vault;
 pub mod write;
 
+pub use buffer::*;
 pub use links::*;
+pub use merge::*;
 pub use parse::*;
 pub use tasks::*;
 pub use template::*;
