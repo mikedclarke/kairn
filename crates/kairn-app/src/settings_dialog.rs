@@ -12,22 +12,23 @@ use gpui_component::{
 
 use kairn_core::settings::SshHost;
 use crate::keymap::keybind_list;
-use crate::theme::{KairnThemeExt as _, Mode};
+use crate::theme::{self, KairnThemeExt as _, Mode};
 use crate::ui::kbd;
 use crate::workspace::Workspace;
 
-/// Settings sections, one tab each; more arrive as the page grows
-/// (templates, theming…).
+/// Settings sections, one tab each; more arrive as the page grows.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     General,
+    Templates,
     Ssh,
     Keybinds,
 }
 
 impl Tab {
-    const ALL: [(Tab, &'static str); 3] = [
+    const ALL: [(Tab, &'static str); 4] = [
         (Tab::General, "General"),
+        (Tab::Templates, "Templates"),
         (Tab::Ssh, "SSH hosts"),
         (Tab::Keybinds, "Keybinds"),
     ];
@@ -38,6 +39,12 @@ pub struct SettingsEditor {
     tab: Tab,
     notes_root: Entity<InputState>,
     rows: Vec<HostRow>,
+    /// The daily template body as loaded at open, to skip a rewrite (and a
+    /// watcher round-trip) when Save changed nothing.
+    template_loaded: String,
+    template_body: Entity<InputState>,
+    /// Pending apply rule; lands with Save like the body.
+    template_rule: String,
 }
 
 struct HostRow {
@@ -76,11 +83,11 @@ impl HostRow {
 impl SettingsEditor {
     fn new(
         workspace: WeakEntity<Workspace>,
-        notes_root_raw: Option<String>,
-        hosts: &[SshHost],
+        ws: &Workspace,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let notes_root_raw = ws.settings.notes_root.clone();
         let notes_root = cx.new(|cx| {
             let state = InputState::new(window, cx).placeholder("~/kairn");
             match notes_root_raw {
@@ -88,14 +95,32 @@ impl SettingsEditor {
                 _ => state,
             }
         });
-        let mut rows: Vec<HostRow> = hosts
+        let mut rows: Vec<HostRow> = ws
+            .settings
+            .ssh_hosts
             .iter()
             .map(|h| HostRow::new(Some(h), window, cx))
             .collect();
         if rows.is_empty() {
             rows.push(HostRow::new(None, window, cx));
         }
-        Self { workspace, tab: Tab::General, notes_root, rows }
+        let template_loaded = kairn_core::template::daily_template_body(&ws.notes_root);
+        let template_body = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .rows(10)
+                .placeholder("## Tasks\n* ")
+                .default_value(template_loaded.clone())
+        });
+        Self {
+            workspace,
+            tab: Tab::General,
+            notes_root,
+            rows,
+            template_loaded,
+            template_body,
+            template_rule: ws.settings.daily_template_rule.clone(),
+        }
     }
 
     fn collect_hosts(&self, cx: &Context<Self>) -> Vec<SshHost> {
@@ -120,10 +145,15 @@ impl SettingsEditor {
 
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let raw = self.notes_root.read(cx).value().trim().to_string();
-        let notes_root = (!raw.is_empty()).then_some(raw);
-        let hosts = self.collect_hosts(cx);
+        let body = self.template_body.read(cx).value().to_string();
+        let patch = crate::vault_state::SettingsPatch {
+            notes_root: (!raw.is_empty()).then_some(raw),
+            hosts: self.collect_hosts(cx),
+            daily_template_rule: self.template_rule.clone(),
+            template_body: (body != self.template_loaded).then_some(body),
+        };
         let _ = self.workspace.update(cx, |ws, cx| {
-            ws.apply_settings(notes_root, hosts, window, cx);
+            ws.apply_settings(patch, window, cx);
         });
         window.close_dialog(cx);
     }
@@ -248,6 +278,44 @@ impl SettingsEditor {
             ))
     }
 
+    fn render_templates(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let rule_button = |id: &'static str, label: &'static str, rule: &'static str| {
+            let btn = Button::new(id).label(label);
+            let btn = if rule == self.template_rule { btn.primary() } else { btn.outline() };
+            btn.on_click(cx.listener(move |this, _, _, cx| {
+                this.template_rule = rule.to_string();
+                cx.notify();
+            }))
+        };
+
+        v_flex()
+            .gap_2()
+            .w_full()
+            .child(Self::section("Daily template"))
+            .child(
+                div()
+                    .font_family(theme::mono_font())
+                    .text_size(px(12.))
+                    .child(Input::new(&self.template_body).h(px(230.))),
+            )
+            .child(div().text_size(px(11.)).opacity(0.55).child(
+                "Seeds a new daily note the first time you edit it; past days are never \
+                 templated. Saved to Notes/@Templates/Daily.md, the same file NotePlan \
+                 reads, keeping any frontmatter the file already has.",
+            ))
+            .child(Self::section("Applies to"))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(rule_button("tpl-always", "Every day", "always"))
+                    .child(rule_button("tpl-weekdays", "Weekdays only", "weekdays"))
+                    .child(rule_button("tpl-off", "No days (off)", "off")),
+            )
+            .child(div().text_size(px(11.)).opacity(0.55).child(
+                "Changes apply when you save.",
+            ))
+    }
+
     fn render_ssh(&self, cx: &mut Context<Self>) -> gpui::Div {
         let mut root = v_flex().gap_2().w_full().child(Self::section("SSH hosts"));
         for (i, row) in self.rows.iter().enumerate() {
@@ -314,6 +382,7 @@ impl Render for SettingsEditor {
 
         let content = match self.tab {
             Tab::General => self.render_general(cx),
+            Tab::Templates => self.render_templates(cx),
             Tab::Ssh => self.render_ssh(cx),
             Tab::Keybinds => self.render_keybinds(cx),
         };
@@ -350,9 +419,7 @@ impl Render for SettingsEditor {
 
 pub fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     let weak = cx.weak_entity();
-    let notes_root_raw = workspace.settings.notes_root.clone();
-    let hosts = workspace.settings.ssh_hosts.clone();
-    let editor = cx.new(|cx| SettingsEditor::new(weak, notes_root_raw, &hosts, window, cx));
+    let editor = cx.new(|cx| SettingsEditor::new(weak, workspace, window, cx));
     window.open_dialog(cx, move |dialog, _, _| {
         dialog.w(px(600.)).title("Settings").child(editor.clone())
     });

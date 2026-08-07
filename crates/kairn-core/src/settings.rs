@@ -49,6 +49,10 @@ pub struct Settings {
     /// The timeline pill row of time-blocked lines on the daily note.
     #[serde(default = "default_true")]
     pub day_timeline: bool,
+    /// When the daily template seeds new days: "always", "weekdays", or
+    /// "off". Unknown values read as "always".
+    #[serde(default = "default_template_rule")]
+    pub daily_template_rule: String,
     /// Set when the settings file existed but couldn't be parsed. While
     /// degraded, [`Settings::save`] refuses to run: auto-saving defaults
     /// over a corrupt file is how SSH hosts and the notes root get wiped.
@@ -69,6 +73,10 @@ fn default_week_strip() -> String {
     "always".to_string()
 }
 
+fn default_template_rule() -> String {
+    "always".to_string()
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -79,6 +87,7 @@ impl Default for Settings {
             sidebar_collapsed: Vec::new(),
             week_strip: default_week_strip(),
             day_timeline: true,
+            daily_template_rule: default_template_rule(),
             degraded: false,
         }
     }

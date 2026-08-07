@@ -246,12 +246,14 @@ impl Workspace {
         // A day from today onward with no file yet starts from the daily
         // template (Notes/@Templates/Daily.md): rendered immediately, written
         // to disk only when the first edit lands. Past days stay blank — a
-        // template there would dress up history that never happened.
+        // template there would dress up history that never happened. The
+        // settings rule can narrow this to weekdays or turn it off.
         let text = if text.is_none()
             && matches!(self.view, PaneView::Day)
             && self.doc_error.is_none()
             && !self.root_missing
             && self.selected_day >= today
+            && notes::template_applies(&self.settings.daily_template_rule, self.selected_day)
         {
             notes::daily_template(&self.notes_root)
         } else {
@@ -529,13 +531,13 @@ impl Workspace {
     /// reloads the pane and calendar.
     pub fn apply_settings(
         &mut self,
-        notes_root: Option<String>,
-        hosts: Vec<kairn_core::settings::SshHost>,
+        patch: SettingsPatch,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.settings.ssh_hosts = hosts;
-        self.settings.notes_root = notes_root;
+        self.settings.ssh_hosts = patch.hosts;
+        self.settings.notes_root = patch.notes_root;
+        self.settings.daily_template_rule = patch.daily_template_rule;
         // Applying settings is the explicit user action that ends the
         // degraded no-save state after a corrupt settings.json.
         self.settings.degraded = false;
@@ -557,7 +559,30 @@ impl Workspace {
             Self::watch_notes(self.notes_root.clone(), self.self_writes.clone(), cx);
         self._notes_watcher = watcher;
         self._notes_watch_task = task;
+        // An edited template body writes through to the same file NotePlan
+        // reads. Never into a missing root: that would materialise a fresh
+        // tree at an unmounted path.
+        if let Some(body) = patch.template_body
+            && !self.root_missing
+        {
+            match notes::save_daily_template(&self.notes_root, &body) {
+                Ok(()) => self.note_self_write(&notes::daily_template_path(&self.notes_root)),
+                Err(e) => {
+                    eprintln!("kairn: could not save the daily template: {e}");
+                    window.push_notification("Could not save the daily template, see stderr.", cx);
+                }
+            }
+        }
         self.reload_notes(cx);
         cx.notify();
     }
+}
+
+/// Edits collected by the settings dialog, applied in one Save.
+pub struct SettingsPatch {
+    pub notes_root: Option<String>,
+    pub hosts: Vec<kairn_core::settings::SshHost>,
+    pub daily_template_rule: String,
+    /// The daily template body, only when the dialog changed it.
+    pub template_body: Option<String>,
 }
