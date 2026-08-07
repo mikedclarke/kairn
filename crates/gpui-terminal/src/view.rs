@@ -52,6 +52,8 @@ use crate::event::{GpuiEventProxy, TerminalEvent};
 use crate::input::keystroke_to_bytes;
 use crate::render::TerminalRenderer;
 use crate::terminal::TerminalState;
+use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
+use alacritty_terminal::term::TermMode;
 use gpui::{Edges, *};
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -420,6 +422,17 @@ pub struct TerminalView {
     /// Fractional scroll remainder so trackpad pixel deltas accumulate into
     /// whole lines
     scroll_accum: f32,
+
+    /// Button currently held over the terminal, for drag reports
+    pressed_mouse_button: Option<MouseButton>,
+
+    /// Last grid cell a motion report was sent for, so drags report once per
+    /// cell instead of once per pixel
+    last_motion_cell: Option<AlacPoint>,
+
+    /// Focus listeners that forward focus in/out to applications that request
+    /// reporting (CSI ?1004); registered on first render, when a Window exists
+    focus_subscriptions: Vec<Subscription>,
 }
 
 impl TerminalView {
@@ -543,6 +556,9 @@ impl TerminalView {
             exit_callback: None,
             last_layout: Arc::new(parking_lot::Mutex::new(None)),
             scroll_accum: 0.0,
+            pressed_mouse_button: None,
+            last_motion_cell: None,
+            focus_subscriptions: Vec::new(),
         }
     }
 
@@ -734,6 +750,22 @@ impl TerminalView {
             return; // Event consumed by handler
         }
 
+        // Paste chord: cmd+V on macOS, ctrl+shift+V elsewhere, shift+insert
+        // everywhere. keystroke_to_bytes ignores platform-modified keys, so
+        // paste has to be handled before it.
+        let ks = &event.keystroke;
+        let is_paste = if cfg!(target_os = "macos") {
+            ks.modifiers.platform && !ks.modifiers.control && !ks.modifiers.alt && ks.key == "v"
+        } else {
+            ks.modifiers.control && ks.modifiers.shift && ks.key == "v"
+        } || (ks.modifiers.shift && ks.key == "insert");
+        if is_paste {
+            if let Some(text) = _cx.read_from_clipboard().and_then(|item| item.text()) {
+                self.paste_text(&text);
+            }
+            return;
+        }
+
         // Typing while scrolled into history snaps back to the live view,
         // like every mainstream terminal.
         let scrolled = self
@@ -753,12 +785,55 @@ impl TerminalView {
         }
     }
 
+    /// Write bytes to the terminal process and flush.
+    fn write_to_pty(&self, bytes: &[u8]) {
+        let mut writer = self.stdin_writer.lock();
+        let _ = writer.write_all(bytes);
+        let _ = writer.flush();
+    }
+
+    /// Paste text into the terminal.
+    ///
+    /// Uses bracketed paste (CSI 200~ / 201~) when the application has
+    /// requested it, with the closing guard stripped from the payload so
+    /// pasted content cannot break out of the bracket. Otherwise newlines
+    /// become carriage returns, the way every mainstream terminal pastes.
+    fn paste_text(&self, text: &str) {
+        if self.state.mode().contains(TermMode::BRACKETED_PASTE) {
+            let sanitized = text.replace("\x1b[201~", "");
+            let mut writer = self.stdin_writer.lock();
+            let _ = writer.write_all(b"\x1b[200~");
+            let _ = writer.write_all(sanitized.as_bytes());
+            let _ = writer.write_all(b"\x1b[201~");
+            let _ = writer.flush();
+        } else {
+            self.write_to_pty(text.replace("\r\n", "\r").replace('\n', "\r").as_bytes());
+        }
+    }
+
+    /// Map a window position to a grid cell, clamped to the visible grid so
+    /// events in the padding resolve to the nearest edge cell.
+    fn grid_point(&self, position: Point<Pixels>) -> Option<AlacPoint> {
+        let (origin, cell_width, cell_height) = (*self.last_layout.lock())?;
+        let point = crate::mouse::pixel_to_cell(position, origin, cell_width, cell_height);
+        let (cols, rows) = self.state.with_term(|term| {
+            use alacritty_terminal::grid::Dimensions;
+            (term.columns(), term.screen_lines())
+        });
+        Some(AlacPoint::new(
+            Line(point.line.0.min(rows.saturating_sub(1) as i32)),
+            Column(point.column.0.min(cols.saturating_sub(1))),
+        ))
+    }
+
     /// Handle mouse down events.
     ///
-    /// Currently a placeholder for future mouse selection and interaction support.
+    /// Focuses the terminal, and forwards the press to the application as an
+    /// SGR mouse report when it has mouse tracking enabled. Shift bypasses
+    /// reporting (the standard escape hatch, reserved for local selection).
     fn on_mouse_down(
         &mut self,
-        _event: &MouseDownEvent,
+        event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -766,38 +841,94 @@ impl TerminalView {
         window.focus(&self.focus_handle);
         cx.notify();
 
-        // TODO: Implement mouse selection
-        // - Convert pixel coordinates to cell coordinates
-        // - Start selection at clicked cell
-        // - Send mouse reports if mouse tracking is enabled
+        let mode = self.state.mode();
+        if !mode.intersects(TermMode::MOUSE_MODE) || event.modifiers.shift {
+            return;
+        }
+        let Some(point) = self.grid_point(event.position) else {
+            return;
+        };
+        let modifiers = crate::mouse::encode_modifiers(
+            false,
+            event.modifiers.alt,
+            event.modifiers.control,
+        );
+        if let Some(bytes) =
+            crate::mouse::mouse_button_report(event.button, true, point, modifiers, mode)
+        {
+            self.write_to_pty(&bytes);
+        }
+        self.pressed_mouse_button = Some(event.button);
+        self.last_motion_cell = Some(point);
     }
 
     /// Handle mouse up events.
     ///
-    /// Currently a placeholder for future mouse selection support.
+    /// Forwards the release to the application when mouse tracking is enabled.
     fn on_mouse_up(
         &mut self,
-        _event: &MouseUpEvent,
+        event: &MouseUpEvent,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
-        // TODO: Implement mouse selection
-        // - End selection at released cell
-        // - Copy selection to clipboard if configured
+        if self.pressed_mouse_button == Some(event.button) {
+            self.pressed_mouse_button = None;
+            self.last_motion_cell = None;
+        }
+
+        let mode = self.state.mode();
+        if !mode.intersects(TermMode::MOUSE_MODE) || event.modifiers.shift {
+            return;
+        }
+        let Some(point) = self.grid_point(event.position) else {
+            return;
+        };
+        let modifiers = crate::mouse::encode_modifiers(
+            false,
+            event.modifiers.alt,
+            event.modifiers.control,
+        );
+        if let Some(bytes) =
+            crate::mouse::mouse_button_report(event.button, false, point, modifiers, mode)
+        {
+            self.write_to_pty(&bytes);
+        }
     }
 
     /// Handle mouse move events.
     ///
-    /// Currently a placeholder for future mouse selection support.
+    /// Sends motion reports when the application asks for them: drag tracking
+    /// (1002) reports motion while a button is held, any-motion tracking
+    /// (1003) reports all movement. Reports are deduplicated per grid cell.
     fn on_mouse_move(
         &mut self,
-        _event: &MouseMoveEvent,
+        event: &MouseMoveEvent,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
-        // TODO: Implement mouse selection
-        // - Update selection range while dragging
-        // - Send mouse motion reports if mouse tracking is enabled
+        let mode = self.state.mode();
+        if !mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION)
+            || event.modifiers.shift
+        {
+            return;
+        }
+        let Some(point) = self.grid_point(event.position) else {
+            return;
+        };
+        if self.last_motion_cell == Some(point) {
+            return;
+        }
+        let modifiers = crate::mouse::encode_modifiers(
+            false,
+            event.modifiers.alt,
+            event.modifiers.control,
+        );
+        if let Some(bytes) =
+            crate::mouse::mouse_motion_report(event.pressed_button, point, modifiers, mode)
+        {
+            self.write_to_pty(&bytes);
+            self.last_motion_cell = Some(point);
+        }
     }
 
     /// Handle scroll events.
@@ -977,6 +1108,24 @@ impl Render for TerminalView {
         // Process any pending events
         self.process_events(window, cx);
 
+        // Register focus forwarding once a Window exists (construction has no
+        // Window). Applications opt in with CSI ?1004; the mode check happens
+        // at event time so it tracks the application's current state.
+        if self.focus_subscriptions.is_empty() {
+            let handle = self.focus_handle.clone();
+            let focus_in = cx.on_focus_in(&handle, window, |this: &mut Self, _, _| {
+                if this.state.mode().contains(TermMode::FOCUS_IN_OUT) {
+                    this.write_to_pty(b"\x1b[I");
+                }
+            });
+            let focus_out = cx.on_focus_out(&handle, window, |this: &mut Self, _, _, _| {
+                if this.state.mode().contains(TermMode::FOCUS_IN_OUT) {
+                    this.write_to_pty(b"\x1b[O");
+                }
+            });
+            self.focus_subscriptions = vec![focus_in, focus_out];
+        }
+
         // Get terminal state and renderer for rendering
         let state_arc = self.state.term_arc();
         let generation = self.state.generation_arc();
@@ -991,7 +1140,11 @@ impl Render for TerminalView {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up(MouseButton::Right, cx.listener(Self::on_mouse_up))
+            .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .child(

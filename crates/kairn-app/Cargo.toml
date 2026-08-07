@@ -1,7 +1,9 @@
 [package]
 name = "kairn-app"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [[bin]]
 # `kairn` on PATH is the CLI (crates/kairn-cli); the app binary carries the
@@ -14,8 +16,9 @@ kairn-core = { path = "../kairn-core" }
 gpui = "0.2.2"
 # Pre-1.0 ecosystem: gpui-component pinned exactly (it must resolve to the same gpui
 # as gpui-terminal). gpui-terminal is vendored in-tree (crates/gpui-terminal, forked
-# from zortax/gpui-terminal @ 51f0292) so scrollback and mouse-wheel forwarding could
-# be implemented; see its README for the local changes.
+# from zortax/gpui-terminal @ 51f0292) for local changes: scrollback, mouse-wheel
+# forwarding, SGR mouse reporting (click/drag/motion, all three buttons), bracketed
+# paste, and focus in/out reporting; see its README.
 gpui-component = "=0.5.1"
 gpui-component-assets = "=0.5.1"
 gpui-terminal = { path = "../gpui-terminal" }

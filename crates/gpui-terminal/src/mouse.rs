@@ -299,6 +299,50 @@ pub fn mouse_button_report(
     Some(sequence.into_bytes())
 }
 
+/// Generate a mouse motion report escape sequence for SGR mode.
+///
+/// Motion events use the button code plus 32 (bit 5 marks motion), with code 3
+/// when no button is held. A report is only produced when the terminal mode
+/// asks for it: `MOUSE_MOTION` (1003) reports all motion, `MOUSE_DRAG` (1002)
+/// only motion while a button is held. Motion reports always use the press
+/// terminator (`M`).
+///
+/// # Arguments
+///
+/// * `button` - The button held during the motion, if any
+/// * `point` - The terminal grid coordinates of the pointer
+/// * `modifiers` - Modifier keys held during the event
+/// * `mode` - The current terminal mode flags
+pub fn mouse_motion_report(
+    button: Option<MouseButton>,
+    point: AlacPoint,
+    modifiers: u8,
+    mode: TermMode,
+) -> Option<Vec<u8>> {
+    let wanted = match button {
+        Some(_) => mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION),
+        None => mode.contains(TermMode::MOUSE_MOTION),
+    };
+    if !wanted {
+        return None;
+    }
+
+    let button_code: u8 = match button {
+        Some(MouseButton::Left) => 0,
+        Some(MouseButton::Middle) => 1,
+        Some(MouseButton::Right) => 2,
+        None => 3,
+        Some(_) => return None, // Ignore other buttons
+    };
+
+    let button_value = (button_code + 32) | modifiers;
+    let col = point.column.0 + 1;
+    let row = point.line.0 + 1;
+
+    let sequence = format!("\x1b[<{};{};{}M", button_value, col, row);
+    Some(sequence.into_bytes())
+}
+
 /// Generate scroll wheel report escape sequence.
 ///
 /// This function generates the escape sequence for scroll wheel events.
@@ -611,6 +655,45 @@ mod tests {
 
         let bytes = mouse_button_report(MouseButton::Left, true, point, 0, mode);
         assert!(bytes.is_none());
+    }
+
+    #[test]
+    fn test_mouse_motion_report_drag() {
+        let point = AlacPoint::new(Line(5), Column(10));
+        let mode = TermMode::MOUSE_DRAG;
+
+        let bytes = mouse_motion_report(Some(MouseButton::Left), point, 0, mode);
+        assert!(bytes.is_some());
+        let sequence = String::from_utf8(bytes.unwrap()).unwrap();
+        // Left (0) + motion bit (32) = 32; always 'M'
+        assert_eq!(sequence, "\x1b[<32;11;6M");
+
+        // Drag mode does not report motion without a held button
+        assert!(mouse_motion_report(None, point, 0, mode).is_none());
+    }
+
+    #[test]
+    fn test_mouse_motion_report_any_motion() {
+        let point = AlacPoint::new(Line(0), Column(0));
+        let mode = TermMode::MOUSE_MOTION;
+
+        // No button held: code 3 + 32 = 35
+        let bytes = mouse_motion_report(None, point, 0, mode);
+        assert!(bytes.is_some());
+        assert_eq!(String::from_utf8(bytes.unwrap()).unwrap(), "\x1b[<35;1;1M");
+
+        // Right button held: code 2 + 32 = 34
+        let bytes = mouse_motion_report(Some(MouseButton::Right), point, 0, mode);
+        assert_eq!(String::from_utf8(bytes.unwrap()).unwrap(), "\x1b[<34;1;1M");
+    }
+
+    #[test]
+    fn test_mouse_motion_report_click_only_mode() {
+        let point = AlacPoint::new(Line(0), Column(0));
+        // Click-only tracking (1000) must not produce motion reports
+        let mode = TermMode::MOUSE_REPORT_CLICK;
+        assert!(mouse_motion_report(Some(MouseButton::Left), point, 0, mode).is_none());
+        assert!(mouse_motion_report(None, point, 0, mode).is_none());
     }
 
     #[test]
