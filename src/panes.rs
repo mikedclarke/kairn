@@ -8,6 +8,7 @@ use gpui::{
     ParentElement, StatefulInteractiveElement, Styled, StyledText, TextLayout, Window, div, px,
     relative,
 };
+use gpui_component::h_flex;
 use gpui_component::input::Input;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 
@@ -223,6 +224,9 @@ impl Workspace {
         if let Some(banner) = self.render_orphan_banner(t, cx) {
             note = note.child(banner);
         }
+        for banner in self.render_conflict_banners(t, cx) {
+            note = note.child(banner);
+        }
         let editing_idx = self.line_edit.as_ref().map(|le| le.line_idx);
         self.line_layouts.borrow_mut().clear();
 
@@ -340,6 +344,61 @@ impl Workspace {
                         ))),
                 ),
         )
+    }
+
+    /// One banner per Syncthing conflict copy of the current note: without
+    /// this the conflicted version of a day is unreachable from every
+    /// surface, which is silent data loss after a sync clash.
+    fn render_conflict_banners(
+        &self,
+        t: &KairnTheme,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        self.conflicts
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let open = path.clone();
+                let hover = t.text;
+                div()
+                    .mb(px(10.))
+                    .px(px(12.))
+                    .py(px(8.))
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(t.amber.opacity(0.5))
+                    .bg(t.amber.opacity(0.08))
+                    .text_size(px(12.))
+                    .child(div().text_color(t.dim).child(
+                        "A sync conflict copy of this note exists; it may hold changes this version is missing.",
+                    ))
+                    .child(
+                        h_flex()
+                            .mt(px(4.))
+                            .gap(px(14.))
+                            .text_size(px(11.5))
+                            .child(
+                                div()
+                                    .id(("conflict-open", i))
+                                    .text_color(t.dim)
+                                    .cursor_pointer()
+                                    .hover(move |s| s.text_color(hover))
+                                    .child("Open the copy")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.open_note(open.clone(), cx);
+                                    })),
+                            )
+                            .child(div().text_color(t.faint).child(name)),
+                    )
+                    .into_any_element()
+            })
+            .collect()
     }
 
     /// The single-line input standing in for the line being edited. The

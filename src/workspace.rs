@@ -224,6 +224,8 @@ pub struct Workspace {
     doc_path: Option<PathBuf>,
     /// Lines elsewhere that link to the pane's document.
     pub mentions: Vec<notes::Mention>,
+    /// Syncthing conflict copies sitting next to the pane's document.
+    pub conflicts: Vec<PathBuf>,
     /// Days that have a daily note, for calendar indicators.
     pub note_days: HashSet<NaiveDate>,
     /// Every open task across the daily notes, newest first.
@@ -311,6 +313,7 @@ impl Workspace {
             doc_text: None,
             doc_path: None,
             mentions: Vec::new(),
+            conflicts: Vec::new(),
             note_days: HashSet::new(),
             open_tasks: Vec::new(),
             notes_tree: Vec::new(),
@@ -400,6 +403,17 @@ impl Workspace {
             Some(t) => notes::mentions_of(&self.notes_root, &t, path.as_deref()),
             None => Vec::new(),
         };
+        // For a day with no file yet, check where the file would be: the
+        // conflicted copy of a note that vanished is exactly the case that
+        // needs surfacing.
+        let conflict_probe = path.clone().or_else(|| match &self.view {
+            PaneView::Day => Some(notes::daily_path(&self.notes_root, self.selected_day)),
+            _ => None,
+        });
+        self.conflicts = conflict_probe
+            .as_deref()
+            .map(notes::conflict_copies)
+            .unwrap_or_default();
         self.doc_path = path;
     }
 
@@ -516,7 +530,7 @@ impl Workspace {
                     !p.components().any(|c| c.as_os_str() == ".kairn")
                         && !p
                             .file_name()
-                            .is_some_and(|n| n.to_string_lossy().ends_with(".kairn-tmp"))
+                            .is_some_and(|n| n.to_string_lossy().contains(".kairn-tmp"))
                 });
             if relevant {
                 let _ = tx.unbounded_send(());

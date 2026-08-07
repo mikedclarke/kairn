@@ -4,9 +4,10 @@
 //! notes (daily `YYYYMMDD.md`, weekly `YYYY-Wnn.md`, monthly `YYYY-MM.md`,
 //! quarterly `YYYY-Qn.md`, yearly `YYYY.md`), `Notes/` for everything else,
 //! and a hidden `.kairn/` folder for app data that syncs with the notes.
-//! Files are plain markdown; NotePlan must be able to read anything Kairn
-//! writes and vice versa, so pointing the root at an existing NotePlan
-//! directory just works.
+//! Dailies drive the calendar and task views; the other period notes are
+//! indexed for links, search, and mentions. Files are plain markdown;
+//! NotePlan must be able to read anything Kairn writes and vice versa, so
+//! pointing the root at an existing NotePlan directory just works.
 //!
 //! Task syntax follows NotePlan alongside standard markdown: a bare `* task`
 //! is an open task, `[x]`/`[>]`/`[-]` mark done, scheduled, and cancelled,
@@ -60,7 +61,7 @@ pub fn days_with_notes(root: &Path) -> HashSet<NaiveDate> {
     for entry in entries.flatten() {
         let path = entry.path();
         let ext = path.extension().and_then(|x| x.to_str());
-        if !matches!(ext, Some("md") | Some("txt")) {
+        if !matches!(ext, Some("md") | Some("txt")) || !path.is_file() {
             continue;
         }
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -74,6 +75,82 @@ pub fn days_with_notes(root: &Path) -> HashSet<NaiveDate> {
         }
     }
     days
+}
+
+/// Canonical form of a `Calendar/` period-note stem that isn't a daily:
+/// weekly `YYYY-Wnn`, monthly `YYYY-MM`, quarterly `YYYY-Qn`, or yearly
+/// `YYYY` (`w`/`q` accepted case-insensitively). `None` for anything else.
+pub fn period_stem(stem: &str) -> Option<String> {
+    let (year, rest) = stem.split_at_checked(4)?;
+    if !year.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if rest.is_empty() {
+        return Some(year.to_string());
+    }
+    let rest = rest.strip_prefix('-')?;
+    let upper = rest.to_ascii_uppercase();
+    let ok = if let Some(week) = upper.strip_prefix('W') {
+        week.len() == 2 && week.parse::<u8>().is_ok_and(|n| (1..=53).contains(&n))
+    } else if let Some(quarter) = upper.strip_prefix('Q') {
+        matches!(quarter, "1" | "2" | "3" | "4")
+    } else {
+        upper.len() == 2 && upper.parse::<u8>().is_ok_and(|n| (1..=12).contains(&n))
+    };
+    ok.then(|| format!("{year}-{upper}"))
+}
+
+/// Every non-daily period note in `Calendar/` with its canonical stem,
+/// newest period first.
+pub fn period_files(root: &Path) -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(root.join("Calendar")) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let ext = path.extension().and_then(|x| x.to_str());
+        if !matches!(ext, Some("md") | Some("txt")) || !path.is_file() {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if let Some(canon) = period_stem(stem) {
+            out.push((canon, path));
+        }
+    }
+    out.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    out
+}
+
+/// Syncthing conflict copies sitting next to a note: files named
+/// `{stem}.sync-conflict-…` in the same folder, the pattern Syncthing uses
+/// when two machines changed the file at once. These fail the daily-stem
+/// rule, so without this they would be unreachable from every surface.
+pub fn conflict_copies(path: &Path) -> Vec<PathBuf> {
+    let (Some(dir), Some(stem)) = (
+        path.parent(),
+        path.file_stem().and_then(|s| s.to_str()),
+    ) else {
+        return Vec::new();
+    };
+    let prefix = format!("{stem}.sync-conflict-");
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&prefix))
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 /// One open task found in a daily note, addressable for toggling.
@@ -300,6 +377,19 @@ pub fn resolve_wiki_target(root: &Path, title: &str) -> WikiTarget {
     if let Ok(date) = NaiveDate::parse_from_str(title, "%Y-%m-%d") {
         return WikiTarget::Day(date);
     }
+    // Weekly/monthly/quarterly/yearly titles live in Calendar/, like
+    // NotePlan's own period notes.
+    if let Some(canon) = period_stem(title) {
+        let md = root.join("Calendar").join(format!("{canon}.md"));
+        if md.exists() {
+            return WikiTarget::Note(md);
+        }
+        let txt = md.with_extension("txt");
+        if txt.exists() {
+            return WikiTarget::Note(txt);
+        }
+        return WikiTarget::Missing(md);
+    }
     let lower = title.to_lowercase();
     let files = notes_files(root);
     let best = files
@@ -413,6 +503,9 @@ pub fn mentions_of(root: &Path, title: &str, exclude: Option<&Path>) -> Vec<Ment
         let Some(path) = daily_file(root, date) else { continue };
         scan(&path, Some(date), &date.format("%-d %b %Y").to_string());
     }
+    for (name, path) in period_files(root) {
+        scan(&path, None, &name);
+    }
     for (_, path) in notes_files(root) {
         let name = path
             .file_stem()
@@ -485,6 +578,7 @@ pub fn search_notes(root: &Path, query: &str, limit: usize) -> Vec<SearchHit> {
         return Vec::new();
     }
     let files = notes_files(root);
+    let periods = period_files(root);
     let mut titled: Vec<(i64, SearchHit)> = files
         .iter()
         .filter_map(|(_, path)| {
@@ -497,6 +591,15 @@ pub fn search_notes(root: &Path, query: &str, limit: usize) -> Vec<SearchHit> {
                 snippet: None,
             }))
         })
+        .chain(periods.iter().filter_map(|(name, path)| {
+            let score = fuzzy_score(trimmed, name)?;
+            Some((score, SearchHit {
+                path: path.clone(),
+                date: None,
+                name: name.clone(),
+                snippet: None,
+            }))
+        }))
         .collect();
     titled.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
     let mut out: Vec<SearchHit> =
@@ -510,11 +613,15 @@ pub fn search_notes(root: &Path, query: &str, limit: usize) -> Vec<SearchHit> {
         .into_iter()
         .filter_map(|d| daily_file(root, d).map(|p| (p, Some(d))));
     let title_hits: HashSet<PathBuf> = out.iter().map(|h| h.path.clone()).collect();
+    let period_bodies = periods
+        .into_iter()
+        .filter(|(_, p)| !title_hits.contains(p))
+        .map(|(_, p)| (p, None));
     let notes = files
         .into_iter()
         .filter(|(_, p)| !title_hits.contains(p))
         .map(|(_, p)| (p, None));
-    for (path, date) in dailies.chain(notes) {
+    for (path, date) in dailies.chain(period_bodies).chain(notes) {
         if out.len() >= limit {
             break;
         }
@@ -557,13 +664,20 @@ pub fn append_line(path: &Path, line: &str) -> io::Result<usize> {
         Err(e) => return Err(e),
     };
     let idx = text.lines().count();
+    let crlf = text.contains("\r\n");
+    let ending = if crlf { "\r\n" } else { "\n" };
+    let line = if crlf {
+        line.replace('\n', "\r\n")
+    } else {
+        line.to_string()
+    };
     let trailing_newline = text.is_empty() || text.ends_with('\n');
     if !trailing_newline {
-        text.push('\n');
+        text.push_str(ending);
     }
-    text.push_str(line);
+    text.push_str(&line);
     if trailing_newline {
-        text.push('\n');
+        text.push_str(ending);
     }
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
@@ -591,12 +705,32 @@ pub fn create_note_if_absent(path: &Path, content: &str) -> io::Result<bool> {
 }
 
 fn atomic_write(path: &Path, content: &str) -> io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
-    let tmp = path.with_file_name(format!(".{}.kairn-tmp", name.to_string_lossy()));
-    fs::write(&tmp, content)?;
-    fs::rename(&tmp, path)
+    // The temp name carries pid + counter so two running instances (or two
+    // quick writes) never collide on it.
+    let tmp = path.with_file_name(format!(
+        ".{}.kairn-tmp.{}.{}",
+        name.to_string_lossy(),
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    let write = (|| {
+        fs::write(&tmp, content)?;
+        // Rename replaces the inode; carry the original's permissions over
+        // so a private note (0600) doesn't silently become world-readable.
+        if let Ok(meta) = fs::metadata(path) {
+            fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        fs::rename(&tmp, path)
+    })();
+    if write.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    write
 }
 
 /// Toggle one task line between open and done, writing in the line's own
@@ -612,9 +746,12 @@ pub fn toggle_task_line(line: &str, now: &str) -> Option<String> {
     let body = &rest[2..];
     let gap_len = body.len() - body.trim_start().len();
     let (gap, body) = body.split_at(gap_len);
+    // Trailing whitespace is content (markdown hard breaks); the stamp goes
+    // after it and reopening removes only the stamp and its separator space,
+    // so a toggle round-trips the line byte-for-byte.
     match bracket_state(body) {
         Some(TaskState::Open) => {
-            let content = body[3..].trim_end();
+            let content = &body[3..];
             Some(format!("{indent}{marker}{gap}[x]{content} @done({now})"))
         }
         Some(TaskState::Done) => {
@@ -622,9 +759,17 @@ pub fn toggle_task_line(line: &str, now: &str) -> Option<String> {
             Some(format!("{indent}{marker}{gap}[ ]{content}"))
         }
         Some(_) => None,
-        None if *marker == "- " || body.is_empty() => None,
-        None => Some(format!("{indent}{marker}{gap}[x] {} @done({now})", body.trim_end())),
+        None if *marker == "- " || body.is_empty() || looks_bracketed(body) => None,
+        None => Some(format!("{indent}{marker}{gap}[x] {body} @done({now})")),
     }
+}
+
+/// A `[c]`-shaped prefix whose state character isn't one Kairn knows
+/// (`[!]`, `[?]`…). Such lines render as-is and must not toggle: wrapping
+/// the whole body in a fresh bracket would corrupt them.
+fn looks_bracketed(body: &str) -> bool {
+    let mut chars = body.chars();
+    chars.next() == Some('[') && chars.next().is_some() && chars.next() == Some(']')
 }
 
 /// Remove the single trailing ` @done(...)` stamp, the one toggling appends.
@@ -680,6 +825,13 @@ fn edit_line_in_text(
     let line = content(segs[idx]);
     let ending = &segs[idx][line.len()..];
     let new_line = edit(line)?;
+    // A replacement that splits the line must split with the file's own
+    // ending; injecting a bare LF into a CRLF file leaves mixed endings.
+    let new_line = if text.contains("\r\n") {
+        new_line.replace('\n', "\r\n")
+    } else {
+        new_line
+    };
     let mut out = String::with_capacity(text.len() + 32);
     for (i, seg) in segs.iter().enumerate() {
         if i == idx {
@@ -933,14 +1085,18 @@ fn inline_spans(text: &str) -> Vec<Span> {
             }
         }
         if at_word_start && rest.starts_with('>') && rest.len() > 1 {
-            let token: &str = rest
-                .split(|c: char| c.is_whitespace())
-                .next()
-                .unwrap_or(rest);
-            if token.len() > 1 {
+            // Only the date-shaped run after `>` is the reference;
+            // trailing punctuation (`>2026-08-09.`) is plain text, so
+            // matching and click navigation see a clean date.
+            let token_len: usize = rest[1..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .map(|c| c.len_utf8())
+                .sum();
+            if token_len > 0 {
                 flush(&mut plain, &mut spans);
-                spans.push((SpanKind::DateRef, token.to_string()));
-                i += token.len();
+                spans.push((SpanKind::DateRef, rest[..1 + token_len].to_string()));
+                i += 1 + token_len;
                 continue;
             }
         }
@@ -1423,6 +1579,139 @@ mod tests {
             toggle_task_line("* [x] logged @done(2026-08-05) then more", now).as_deref(),
             Some("* [ ] logged @done(2026-08-05) then more")
         );
+    }
+
+    #[test]
+    fn period_stems() {
+        assert_eq!(period_stem("2026-W32").as_deref(), Some("2026-W32"));
+        assert_eq!(period_stem("2026-w32").as_deref(), Some("2026-W32"));
+        assert_eq!(period_stem("2026-08").as_deref(), Some("2026-08"));
+        assert_eq!(period_stem("2026-Q3").as_deref(), Some("2026-Q3"));
+        assert_eq!(period_stem("2026").as_deref(), Some("2026"));
+        for bad in ["20260807", "2026-W54", "2026-W1", "2026-13", "2026-Q5", "2026-", "plan", "202"] {
+            assert_eq!(period_stem(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn period_notes_are_reachable() {
+        let root = ScratchRoot::new("periods");
+        let weekly = root.write("Calendar/2026-W32.md", "## Focus\nship the review fixes\n");
+        root.write("Calendar/20260806.md", "* review [[2026-W32]]\n");
+
+        // Wiki links resolve to the period note, case-insensitively; a
+        // missing period resolves to the file it would be created at.
+        assert_eq!(
+            resolve_wiki_target(&root.0, "2026-W32"),
+            WikiTarget::Note(weekly.clone())
+        );
+        assert_eq!(
+            resolve_wiki_target(&root.0, "2026-w32"),
+            WikiTarget::Note(weekly.clone())
+        );
+        assert_eq!(
+            resolve_wiki_target(&root.0, "2026-Q4"),
+            WikiTarget::Missing(root.0.join("Calendar/2026-Q4.md"))
+        );
+
+        // Search finds it by title and by body content.
+        let hits = search_notes(&root.0, "2026-W32", 10);
+        assert!(hits.iter().any(|h| h.path == weekly), "title hit");
+        let hits = search_notes(&root.0, "review fixes", 10);
+        assert!(hits.iter().any(|h| h.path == weekly), "body hit");
+
+        // Mentions of the weekly note find the daily's link to it.
+        let mentions = mentions_of(&root.0, "2026-W32", Some(&weekly));
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].date, NaiveDate::from_ymd_opt(2026, 8, 6));
+    }
+
+    #[test]
+    fn day_scan_ignores_directories() {
+        let root = ScratchRoot::new("daydirs");
+        fs::create_dir_all(root.0.join("Calendar/20260805.md")).expect("mkdir");
+        root.write("Calendar/20260806.md", "* real\n");
+        let days = days_with_notes(&root.0);
+        assert_eq!(days.len(), 1);
+        assert!(days.contains(&NaiveDate::from_ymd_opt(2026, 8, 6).expect("valid")));
+    }
+
+    #[test]
+    fn conflict_copies_are_found() {
+        let root = ScratchRoot::new("conflict");
+        let day = root.write("Calendar/20260806.md", "* mine\n");
+        let copy = root.write(
+            "Calendar/20260806.sync-conflict-20260807-101112-AAAAAAA.md",
+            "* theirs\n",
+        );
+        root.write("Calendar/20260807.md", "* unrelated\n");
+
+        assert_eq!(conflict_copies(&day), vec![copy.clone()]);
+        // The copy itself has no copies, and unrelated days are untouched.
+        assert!(conflict_copies(&copy).is_empty());
+        assert!(conflict_copies(&root.0.join("Calendar/20260807.md")).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_keeps_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = ScratchRoot::new("perms");
+        let path = root.write("Notes/Private.md", "* secret\n");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        assert!(replace_line_on_disk(&path, 0, "* secret", "* edited").expect("io").is_some());
+        let mode = fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(fs::read_to_string(&path).expect("read"), "* edited\n");
+    }
+
+    #[test]
+    fn crlf_files_stay_crlf() {
+        // A replacement that splits a line uses the file's own ending.
+        assert_eq!(
+            edit_line_in_text("* one\r\n* two\r\n", 0, "* one", |_| {
+                Some("* one\n* [ ] rest".into())
+            }),
+            Some(("* one\r\n* [ ] rest\r\n* two\r\n".into(), 0))
+        );
+        // Appending matches the ending too, for separator and content.
+        let root = ScratchRoot::new("crlf");
+        let path = root.write("Notes/Dos.md", "* one\r\n");
+        append_line(&path, "* two").expect("io");
+        assert_eq!(fs::read_to_string(&path).expect("read"), "* one\r\n* two\r\n");
+    }
+
+    #[test]
+    fn toggle_round_trips_exactly() {
+        let now = "2026-08-07 12:00";
+        // Trailing spaces are markdown hard breaks: kept through a full
+        // toggle cycle.
+        let done = toggle_task_line("* task  ", now).expect("toggles");
+        assert_eq!(done, "* [x] task   @done(2026-08-07 12:00)");
+        assert_eq!(toggle_task_line(&done, now).as_deref(), Some("* [ ] task  "));
+        // Unknown bracket styles ([!], [?]) neither toggle nor corrupt.
+        assert_eq!(toggle_task_line("* [!] important", now), None);
+        assert_eq!(toggle_task_line("+ [?] maybe", now), None);
+    }
+
+    #[test]
+    fn dateref_sheds_trailing_punctuation() {
+        assert_eq!(
+            parse_line("* ship >2026-08-09."),
+            Line::Task {
+                state: TaskState::Open,
+                spans: vec![
+                    (SpanKind::Text, "ship ".into()),
+                    (SpanKind::DateRef, ">2026-08-09".into()),
+                    (SpanKind::Text, ".".into()),
+                ]
+            }
+        );
+        // Mention matching now sees the clean date.
+        let root = ScratchRoot::new("dateref");
+        root.write("Calendar/20260807.md", "* ship >2026-08-09.\n");
+        assert_eq!(mentions_of(&root.0, "2026-08-09", None).len(), 1);
     }
 
     #[test]
