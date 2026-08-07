@@ -115,6 +115,8 @@ pub struct Workspace {
     pub(crate) task_counts: [usize; 3],
     /// Recent writes by this instance, for watcher self-event suppression.
     pub(crate) self_writes: crate::vault_state::SelfWrites,
+    /// Daily-note text carried across reloads; unchanged files skip the read.
+    pub(crate) daily_cache: notes::DailyCache,
     _activity_timer: Task<()>,
     /// Watches the notes root so outside edits (agents, Syncthing, NotePlan
     /// elsewhere) appear without a restart. Dropped with the workspace.
@@ -211,6 +213,7 @@ impl Workspace {
             week_open_counts: [0; 7],
             task_counts: [0; 3],
             self_writes,
+            daily_cache: notes::DailyCache::default(),
             _activity_timer: activity_timer,
             _notes_watcher: notes_watcher,
             _notes_watch_task: notes_watch_task,

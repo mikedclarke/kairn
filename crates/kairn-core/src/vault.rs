@@ -51,11 +51,21 @@ pub struct VaultScan {
 }
 
 /// A daily note read into memory, so one read serves both the task scan and
-/// the mention scan.
+/// the mention scan. The text is shared so a cache can hand it out across
+/// reloads without copying.
 pub struct DayText {
     pub date: NaiveDate,
     pub path: PathBuf,
-    pub text: String,
+    pub text: std::sync::Arc<str>,
+}
+
+/// Daily-note text carried across reloads, invalidated per file by
+/// modification time and length: a reload stats every daily but re-reads
+/// only the files that actually changed. On a real NotePlan archive that
+/// turns hundreds of reads per click into a handful.
+#[derive(Default)]
+pub struct DailyCache {
+    map: HashMap<PathBuf, (std::time::SystemTime, u64, std::sync::Arc<str>)>,
 }
 
 impl VaultScan {
@@ -98,14 +108,37 @@ impl VaultScan {
 
     /// Every daily note read once, newest day first.
     pub fn read_dailies(&self) -> Vec<DayText> {
+        self.read_dailies_cached(&mut DailyCache::default())
+    }
+
+    /// [`Self::read_dailies`] through a cache that persists across reloads:
+    /// unchanged files (same mtime and length) reuse their text, changed or
+    /// new files are re-read, vanished files fall out of the cache.
+    pub fn read_dailies_cached(&self, cache: &mut DailyCache) -> Vec<DayText> {
         let mut days: Vec<(&NaiveDate, &PathBuf)> = self.days.iter().collect();
         days.sort_unstable_by(|a, b| b.0.cmp(a.0));
-        days.into_iter()
+        let dailies: Vec<DayText> = days
+            .into_iter()
             .filter_map(|(date, path)| {
-                let text = fs::read_to_string(path).ok()?;
+                let meta = fs::metadata(path).ok()?;
+                let (mtime, len) = (meta.modified().ok()?, meta.len());
+                let text = match cache.map.get(path) {
+                    Some((m, l, text)) if *m == mtime && *l == len => text.clone(),
+                    _ => {
+                        let text: std::sync::Arc<str> =
+                            fs::read_to_string(path).ok()?.into();
+                        cache
+                            .map
+                            .insert(path.clone(), (mtime, len, text.clone()));
+                        text
+                    }
+                };
                 Some(DayText { date: *date, path: path.clone(), text })
             })
-            .collect()
+            .collect();
+        let live: std::collections::HashSet<&PathBuf> = self.days.values().collect();
+        cache.map.retain(|path, _| live.contains(path));
+        dailies
     }
 }
 
@@ -458,6 +491,40 @@ pub(crate) fn contains_insensitive(haystack: &str, needle_lower: &str) -> bool {
 mod tests {
     use super::*;
     use crate::ScratchRoot;
+
+    #[test]
+    fn daily_cache_reuses_invalidates_and_evicts() {
+        let root = ScratchRoot::new("dailycache");
+        let a = root.write("Calendar/20260805.md", "* task a\n");
+        let b = root.write("Calendar/20260806.md", "* task b\n");
+
+        let mut cache = DailyCache::default();
+        let dailies = VaultScan::new(&root.0).read_dailies_cached(&mut cache);
+        assert_eq!(dailies.len(), 2);
+        assert_eq!(cache.map.len(), 2);
+        let first_arc = cache.map[&a].2.clone();
+
+        // Unchanged files hand back the same shared text, no fresh read.
+        let dailies = VaultScan::new(&root.0).read_dailies_cached(&mut cache);
+        assert!(std::sync::Arc::ptr_eq(
+            &dailies.iter().find(|d| d.path == a).expect("day a").text,
+            &first_arc
+        ));
+
+        // A changed file re-reads (length change invalidates regardless of
+        // mtime resolution).
+        std::fs::write(&b, "* task b\n* task b2\n").expect("rewrite");
+        let dailies = VaultScan::new(&root.0).read_dailies_cached(&mut cache);
+        let day_b = dailies.iter().find(|d| d.path == b).expect("day b");
+        assert!(day_b.text.contains("b2"));
+
+        // A vanished file falls out of the cache.
+        std::fs::remove_file(&b).expect("remove");
+        let dailies = VaultScan::new(&root.0).read_dailies_cached(&mut cache);
+        assert_eq!(dailies.len(), 1);
+        assert_eq!(cache.map.len(), 1);
+        assert!(cache.map.contains_key(&a));
+    }
 
     #[test]
     fn day_filenames() {

@@ -185,7 +185,7 @@ impl Workspace {
         // One walk of Calendar/ and Notes/ and one read of each daily,
         // shared by the task scan and the mention scan below.
         let scan = notes::VaultScan::new(&self.notes_root);
-        let dailies = scan.read_dailies();
+        let dailies = scan.read_dailies_cached(&mut self.daily_cache);
         self.dailies_skipped = scan.days.len() - dailies.len();
         self.open_tasks = notes::open_tasks_in(&dailies);
         self.notes_tree = notes::notes_tree(&self.notes_root, &self.notes_expanded);
