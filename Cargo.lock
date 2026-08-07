@@ -2406,7 +2406,6 @@ dependencies = [
 [[package]]
 name = "gpui-terminal"
 version = "0.1.0"
-source = "git+https://github.com/zortax/gpui-terminal?rev=51f0292938876c8da3de03f0139088591e3be518#51f0292938876c8da3de03f0139088591e3be518"
 dependencies = [
  "alacritty_terminal",
  "anyhow",

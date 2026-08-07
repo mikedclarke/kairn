@@ -11,11 +11,12 @@ path = "src/main.rs"
 kairn-core = { path = "../kairn-core" }
 gpui = "0.2.2"
 # Pre-1.0 ecosystem: gpui-component pinned exactly (it must resolve to the same gpui
-# as gpui-terminal); gpui-terminal pinned to an exact rev (post-0.1.0 cell sizing and
-# rendering fixes).
+# as gpui-terminal). gpui-terminal is vendored in-tree (crates/gpui-terminal, forked
+# from zortax/gpui-terminal @ 51f0292) so scrollback and mouse-wheel forwarding could
+# be implemented; see its README for the local changes.
 gpui-component = "=0.5.1"
 gpui-component-assets = "=0.5.1"
-gpui-terminal = { git = "https://github.com/zortax/gpui-terminal", rev = "51f0292938876c8da3de03f0139088591e3be518" }
+gpui-terminal = { path = "../gpui-terminal" }
 portable-pty = "0.9"
 notify = "8"
 futures = "0.3"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/kairn-core", "crates/kairn-app"]
+members = ["crates/kairn-core", "crates/kairn-app", "crates/gpui-terminal"]
 # Plain `cargo build`/`cargo run` at the root builds the app (binary `kairn`).
 # Use `cargo test --workspace` to cover every member.
 default-members = ["crates/kairn-app"]
