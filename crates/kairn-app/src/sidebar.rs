@@ -165,8 +165,8 @@ impl Workspace {
                 .child("＋ New session…")
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
-                        this.open_picker(point(ev.position.x, ev.position.y + px(12.)), cx);
+                    cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                        this.open_picker(point(ev.position.x, ev.position.y + px(12.)), window, cx);
                     }),
                 ),
         );

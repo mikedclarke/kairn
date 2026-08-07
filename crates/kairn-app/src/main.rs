@@ -1,8 +1,14 @@
+mod chrome;
+mod editing;
+mod keymap;
+mod overlays;
 mod panes;
 mod session;
 mod settings_dialog;
 mod sidebar;
 mod theme;
+mod ui;
+mod vault_state;
 mod workspace;
 
 use gpui::{AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};

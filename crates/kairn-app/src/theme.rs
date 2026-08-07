@@ -1,4 +1,4 @@
-use gpui::{App, Global, Hsla, Rgba, Window, rgb, rgba};
+use gpui::{App, Global, Hsla, Window, rgb, rgba};
 use gpui_component::theme::{Theme, ThemeMode};
 use gpui_terminal::ColorPalette;
 
@@ -32,11 +32,11 @@ impl Mode {
 }
 
 fn c(hex: u32) -> Hsla {
-    Rgba::from(rgb(hex)).into()
+    rgb(hex).into()
 }
 
 fn ca(hex: u32) -> Hsla {
-    Rgba::from(rgba(hex)).into()
+    rgba(hex).into()
 }
 
 /// The sage/amber palette from the locked design spec, one struct per mode.
