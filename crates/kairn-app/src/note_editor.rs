@@ -50,6 +50,7 @@ pub enum NoteEditorEvent {
     Conflicts(PathBuf, Vec<String>),
     OpenWikiLink(String),
     OpenDate(chrono::NaiveDate),
+    OpenUrl(String),
 }
 
 pub struct NoteEditor {
@@ -579,7 +580,7 @@ impl NoteEditor {
     ) {
         enum Click {
             Glyph { line_start: usize, toggles: bool },
-            Link(SpanKind, String),
+            Nav(notes::LinkTarget),
             Cursor(usize),
         }
         let click = {
@@ -620,11 +621,10 @@ impl NoteEditor {
                         let display_chars =
                             display.get(..display_ix).map_or(0, |s| s.chars().count());
                         // An exact hit on a link navigates; anywhere else edits.
-                        if let Some((kind, text)) =
-                            notes::span_at_display_char(raw_line, display_chars)
-                            && matches!(kind, SpanKind::WikiLink | SpanKind::DateRef)
+                        if let Some(target) =
+                            notes::link_target_at_display_char(raw_line, display_chars)
                         {
-                            click = Click::Link(kind, text);
+                            click = Click::Nav(target);
                             break;
                         }
                         notes::raw_col_for_display_char(raw_line, display_chars)
@@ -648,18 +648,21 @@ impl NoteEditor {
                     target: None,
                 });
             }
-            Click::Link(SpanKind::WikiLink, text) => {
+            Click::Nav(notes::LinkTarget::Wiki(title)) => {
                 cx.emit(NoteEditorEvent::OpenWikiLink(
-                    notes::wiki_link_title(&text).to_string(),
+                    notes::wiki_link_title(&title).to_string(),
                 ));
             }
-            Click::Link(_, text) => {
+            Click::Nav(notes::LinkTarget::Date(text)) => {
                 if let Some(date) = text
                     .strip_prefix('>')
                     .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
                 {
                     cx.emit(NoteEditorEvent::OpenDate(date));
                 }
+            }
+            Click::Nav(notes::LinkTarget::Url(url)) => {
+                cx.emit(NoteEditorEvent::OpenUrl(url));
             }
             Click::Cursor(target) => {
                 let target = target.min(self.text().len());
@@ -1216,13 +1219,15 @@ fn kind_style(line: &Line, t: &KairnTheme) -> (KindStyle, Glyph) {
 fn span_style(kind: SpanKind, base: Hsla, t: &KairnTheme) -> (Hsla, Option<Hsla>, FontWeight, FontStyle) {
     match kind {
         SpanKind::Text => (base, None, FontWeight::NORMAL, FontStyle::Normal),
-        SpanKind::WikiLink => (t.accent, None, FontWeight::NORMAL, FontStyle::Normal),
+        SpanKind::WikiLink | SpanKind::Link | SpanKind::Url => {
+            (t.accent, None, FontWeight::NORMAL, FontStyle::Normal)
+        }
         SpanKind::Tag | SpanKind::DateRef => (t.amber, None, FontWeight::NORMAL, FontStyle::Normal),
         SpanKind::Mention => (t.faint, None, FontWeight::NORMAL, FontStyle::Normal),
         SpanKind::Highlight => (t.text, Some(t.amber.opacity(0.28)), FontWeight::NORMAL, FontStyle::Normal),
         SpanKind::Bold => (base, None, FontWeight::BOLD, FontStyle::Normal),
         SpanKind::Italic => (base, None, FontWeight::NORMAL, FontStyle::Italic),
-        SpanKind::Marker => (t.faint, None, FontWeight::NORMAL, FontStyle::Normal),
+        SpanKind::Marker | SpanKind::Hidden => (t.faint, None, FontWeight::NORMAL, FontStyle::Normal),
     }
 }
 
@@ -1284,49 +1289,98 @@ fn shape_entry(
         color: Some(style.color),
     });
 
+    let spans = match &parsed {
+        Line::Heading { spans, .. }
+        | Line::Task { spans, .. }
+        | Line::Bullet { spans }
+        | Line::Quote { spans }
+        | Line::Text { spans } => spans.as_slice(),
+        Line::Rule | Line::Blank => &[],
+    };
     let (display, runs, indent, glyph) = if active {
-        // The cursor line shows its raw markdown in the line's own style,
-        // markers and all: what NotePlan does, and what makes the mapping
-        // between clicks, cursor, and bytes exact while editing.
+        // The cursor line shows its raw markdown, every byte visible so the
+        // mapping between clicks, cursor, and bytes is exact, but keeps the
+        // span styling: markers faint, content styled (what NotePlan does).
+        // While an IME composition is marked, plain runs with the marked
+        // range underlined take over.
         let mut runs = Vec::new();
-        let mut push = |len: usize, underline: bool| {
-            if len == 0 {
-                return;
+        if let Some(m) = &marked_local {
+            let mut push = |len: usize, underline: bool| {
+                if len == 0 {
+                    return;
+                }
+                runs.push(TextRun {
+                    len,
+                    font: base_font.clone(),
+                    color: style.color,
+                    background_color: None,
+                    underline: underline.then_some(UnderlineStyle {
+                        thickness: px(1.),
+                        color: Some(style.color),
+                        wavy: false,
+                    }),
+                    strikethrough: None,
+                });
+            };
+            push(m.start.min(raw.len()), false);
+            push(m.end.min(raw.len()).saturating_sub(m.start.min(raw.len())), true);
+            push(raw.len().saturating_sub(m.end.min(raw.len())), false);
+        } else {
+            let mut push = |len: usize, kind: Option<SpanKind>| {
+                if len == 0 {
+                    return;
+                }
+                let (color, bg, weight, font_style) = match kind {
+                    Some(k) => span_style(k, style.color, t),
+                    // The line's own prefix (list marker, task bracket)
+                    // and any bytes past the spans.
+                    None => (t.faint, None, FontWeight::NORMAL, FontStyle::Normal),
+                };
+                let mut font = base_font.clone();
+                if weight > font.weight {
+                    font.weight = weight;
+                }
+                font.style = font_style;
+                runs.push(TextRun {
+                    len,
+                    font,
+                    color,
+                    background_color: bg,
+                    underline: None,
+                    strikethrough: None,
+                });
+            };
+            let start = notes::spans_start_col(raw).min(raw.len());
+            push(start, None);
+            let mut covered = start;
+            for (kind, s) in spans {
+                let len = s.len().min(raw.len().saturating_sub(covered));
+                push(len, Some(*kind));
+                covered += len;
             }
-            runs.push(TextRun {
-                len,
-                font: base_font.clone(),
-                color: style.color,
-                background_color: None,
-                underline: underline.then_some(UnderlineStyle {
-                    thickness: px(1.),
-                    color: Some(style.color),
-                    wavy: false,
-                }),
-                strikethrough: None,
-            });
-        };
-        match &marked_local {
-            Some(m) => {
-                push(m.start.min(raw.len()), false);
-                push(m.end.min(raw.len()).saturating_sub(m.start.min(raw.len())), true);
-                push(raw.len().saturating_sub(m.end.min(raw.len())), false);
+            if covered < raw.len() {
+                let len = raw.len() - covered;
+                let mut font = base_font.clone();
+                font.style = FontStyle::Normal;
+                runs.push(TextRun {
+                    len,
+                    font,
+                    color: style.color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                });
             }
-            None => push(raw.len(), false),
         }
         (SharedString::from(raw.to_string()), runs, px(0.), Glyph::None)
     } else {
-        let spans = match &parsed {
-            Line::Heading { spans, .. }
-            | Line::Task { spans, .. }
-            | Line::Bullet { spans }
-            | Line::Quote { spans }
-            | Line::Text { spans } => spans.as_slice(),
-            Line::Rule | Line::Blank => &[],
-        };
         let mut display = String::new();
         let mut runs = Vec::new();
         for (kind, text) in spans {
+            // Hidden spans hold raw bytes the styled line does not render.
+            if *kind == SpanKind::Hidden {
+                continue;
+            }
             let piece = if style.uppercase { text.to_uppercase() } else { text.clone() };
             let (color, bg, weight, font_style) = span_style(*kind, style.color, t);
             let mut font = base_font.clone();

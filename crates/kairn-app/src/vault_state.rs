@@ -143,6 +143,7 @@ impl Workspace {
                     this.open_wiki_link_quiet(&title, cx);
                 }
                 NoteEditorEvent::OpenDate(date) => this.select_day(*date, cx),
+                NoteEditorEvent::OpenUrl(url) => cx.open_url(url),
             },
         ));
         self.note_editor = Some(editor);

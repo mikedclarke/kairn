@@ -834,7 +834,11 @@ fn section_heading_spans(
     idx: usize,
     layouts: &LineLayouts,
 ) -> impl IntoElement {
-    let label: String = spans.iter().map(|(_, s)| s.as_str()).collect();
+    let label: String = spans
+        .iter()
+        .filter(|(kind, _)| !matches!(kind, SpanKind::Hidden))
+        .map(|(_, s)| s.as_str())
+        .collect();
     let styled = StyledText::new(label.to_uppercase());
     layouts.borrow_mut().insert(idx, styled.layout().clone());
     div()
@@ -930,11 +934,15 @@ fn spans_text(t: &KairnTheme, spans: &[Span]) -> StyledText {
     let mut text = String::new();
     let mut highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = Vec::new();
     for (kind, s) in spans {
+        // Hidden spans are raw bytes the styled line does not render.
+        if matches!(kind, SpanKind::Hidden) {
+            continue;
+        }
         let start = text.len();
         text.push_str(s);
         let style = match kind {
             SpanKind::Text => None,
-            SpanKind::WikiLink => Some(HighlightStyle {
+            SpanKind::WikiLink | SpanKind::Link | SpanKind::Url => Some(HighlightStyle {
                 color: Some(t.accent),
                 ..Default::default()
             }),
@@ -959,7 +967,7 @@ fn spans_text(t: &KairnTheme, spans: &[Span]) -> StyledText {
                 font_style: Some(gpui::FontStyle::Italic),
                 ..Default::default()
             }),
-            SpanKind::Marker => Some(HighlightStyle {
+            SpanKind::Marker | SpanKind::Hidden => Some(HighlightStyle {
                 color: Some(t.faint),
                 ..Default::default()
             }),

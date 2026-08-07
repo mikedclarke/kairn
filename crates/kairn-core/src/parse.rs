@@ -39,9 +39,17 @@ pub enum SpanKind {
     Bold,
     /// Italic content: `_italic_`.
     Italic,
-    /// An emphasis delimiter (`*`, `**`, `_`), kept visible but faded so the
-    /// rendered line maps 1:1 onto the raw markdown.
+    /// A dimmed-but-visible marker: the `#` prefix of a heading.
     Marker,
+    /// The text half of a `[text](url)` markdown link; the url lives in the
+    /// hidden span that follows.
+    Link,
+    /// A bare http(s) URL, clickable as-is.
+    Url,
+    /// Raw bytes a styled line does not render: emphasis delimiters,
+    /// wiki-link brackets, highlight markers, the `[`/`](url)` halves of a
+    /// markdown link. They reveal only on the cursor line.
+    Hidden,
 }
 
 pub type Span = (SpanKind, String);
@@ -62,7 +70,12 @@ pub fn parse_line(line: &str) -> Line {
         let level = 1 + rest.chars().take_while(|&c| c == '#').count() as u8;
         let text = rest.trim_start_matches('#');
         if let Some(text) = text.strip_prefix(' ') {
-            return Line::Heading { level, spans: inline_spans(text) };
+            // The hash prefix renders dimmed, not hidden, so it leads the
+            // span list as a visible marker covering the raw prefix.
+            let mut spans =
+                vec![(SpanKind::Marker, line[..line.len() - text.len()].to_string())];
+            spans.extend(inline_spans(text));
+            return Line::Heading { level, spans };
         }
     }
     if let Some(rest) = trimmed.strip_prefix("> ") {
@@ -143,8 +156,24 @@ fn inline_spans(text: &str) -> Vec<Span> {
             && let Some(end) = rest.find("]]")
         {
             flush(&mut plain, &mut spans);
-            spans.push((SpanKind::WikiLink, rest[..end + 2].to_string()));
+            spans.push((SpanKind::Hidden, "[[".to_string()));
+            spans.push((SpanKind::WikiLink, rest[2..end].to_string()));
+            spans.push((SpanKind::Hidden, "]]".to_string()));
             i += end + 2;
+            continue;
+        }
+        // `[text](url)`: the text renders styled and clickable, the
+        // brackets and url stay hidden.
+        if rest.starts_with('[')
+            && let Some(mid) = rest.find("](")
+            && mid > 1
+            && let Some(close) = rest[mid + 2..].find(')')
+        {
+            flush(&mut plain, &mut spans);
+            spans.push((SpanKind::Hidden, "[".to_string()));
+            spans.push((SpanKind::Link, rest[1..mid].to_string()));
+            spans.push((SpanKind::Hidden, rest[mid..mid + 2 + close + 1].to_string()));
+            i += mid + 2 + close + 1;
             continue;
         }
         if rest.starts_with("==")
@@ -152,7 +181,9 @@ fn inline_spans(text: &str) -> Vec<Span> {
             && end > 0
         {
             flush(&mut plain, &mut spans);
+            spans.push((SpanKind::Hidden, "==".to_string()));
             spans.push((SpanKind::Highlight, rest[2..end + 2].to_string()));
+            spans.push((SpanKind::Hidden, "==".to_string()));
             i += end + 4;
             continue;
         }
@@ -160,11 +191,28 @@ fn inline_spans(text: &str) -> Vec<Span> {
         if let Some((marker, kind, consumed)) = emphasis_at(rest, at_word_start) {
             let content = &rest[marker.len()..consumed - marker.len()];
             flush(&mut plain, &mut spans);
-            spans.push((SpanKind::Marker, marker.to_string()));
+            spans.push((SpanKind::Hidden, marker.to_string()));
             spans.push((kind, content.to_string()));
-            spans.push((SpanKind::Marker, marker.to_string()));
+            spans.push((SpanKind::Hidden, marker.to_string()));
             i += consumed;
             continue;
+        }
+        if at_word_start && (rest.starts_with("http://") || rest.starts_with("https://")) {
+            let mut len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            while len > 0
+                && matches!(
+                    rest.as_bytes()[len - 1],
+                    b'.' | b',' | b';' | b':' | b'!' | b'?' | b')' | b']' | b'}' | b'\'' | b'"'
+                )
+            {
+                len -= 1;
+            }
+            if len > "https://".len() {
+                flush(&mut plain, &mut spans);
+                spans.push((SpanKind::Url, rest[..len].to_string()));
+                i += len;
+                continue;
+            }
         }
         if at_word_start && (rest.starts_with('#') || rest.starts_with('@')) {
             let token: &str = rest
@@ -250,16 +298,12 @@ fn emphasis_at(rest: &str, at_word_start: bool) -> Option<(&'static str, SpanKin
 /// rendered content, for dispatching clicks on links.
 pub fn span_at_display_char(raw: &str, display_chars: usize) -> Option<Span> {
     let line = parse_line(raw);
-    let spans = match &line {
-        Line::Heading { spans, .. }
-        | Line::Task { spans, .. }
-        | Line::Bullet { spans }
-        | Line::Quote { spans }
-        | Line::Text { spans } => spans,
-        Line::Rule | Line::Blank => return None,
-    };
+    let spans = line_spans(&line)?;
     let mut seen = 0usize;
     for (kind, s) in spans {
+        if *kind == SpanKind::Hidden {
+            continue;
+        }
         let chars = s.chars().count();
         if display_chars < seen + chars {
             return Some((*kind, s.clone()));
@@ -267,6 +311,63 @@ pub fn span_at_display_char(raw: &str, display_chars: usize) -> Option<Span> {
         seen += chars;
     }
     None
+}
+
+/// A navigation target a rendered line position can follow.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkTarget {
+    /// `[[title]]`: the inner text, brackets stripped.
+    Wiki(String),
+    /// `>YYYY-MM-DD`: the full token including the `>`.
+    Date(String),
+    /// A URL: bare, or the hidden half of a `[text](url)` link.
+    Url(String),
+}
+
+/// The link under `display_chars` characters of rendered content, if any.
+pub fn link_target_at_display_char(raw: &str, display_chars: usize) -> Option<LinkTarget> {
+    let line = parse_line(raw);
+    let spans = line_spans(&line)?;
+    let mut seen = 0usize;
+    for (ix, (kind, s)) in spans.iter().enumerate() {
+        if *kind == SpanKind::Hidden {
+            continue;
+        }
+        let chars = s.chars().count();
+        if display_chars < seen + chars {
+            return match kind {
+                SpanKind::WikiLink => Some(LinkTarget::Wiki(s.clone())),
+                SpanKind::DateRef => Some(LinkTarget::Date(s.clone())),
+                SpanKind::Url => Some(LinkTarget::Url(s.clone())),
+                // The markdown link's url sits in its hidden suffix span.
+                SpanKind::Link => spans[ix + 1..].iter().find_map(|(k, h)| {
+                    (*k == SpanKind::Hidden && h.starts_with("](") && h.ends_with(')'))
+                        .then(|| LinkTarget::Url(h[2..h.len() - 1].to_string()))
+                }),
+                _ => None,
+            };
+        }
+        seen += chars;
+    }
+    None
+}
+
+/// [`spans_start`] for callers that only hold the raw line: where the
+/// span list begins, for laying span styles over raw text.
+pub fn spans_start_col(raw: &str) -> usize {
+    let line = parse_line(raw);
+    spans_start(raw, &line)
+}
+
+fn line_spans(line: &Line) -> Option<&Vec<Span>> {
+    match line {
+        Line::Heading { spans, .. }
+        | Line::Task { spans, .. }
+        | Line::Bullet { spans }
+        | Line::Quote { spans }
+        | Line::Text { spans } => Some(spans),
+        Line::Rule | Line::Blank => None,
+    }
 }
 
 /// Byte offset in `raw` where the rendered content begins: past indentation,
@@ -304,24 +405,30 @@ pub fn content_start_col(raw: &str) -> usize {
     content_start(raw, &parse_line(raw))
 }
 
+/// Byte offset in `raw` where the line's span list begins: headings lead
+/// with their visible hash-marker span (from column zero), everything else
+/// starts at the rendered content.
+fn spans_start(raw: &str, line: &Line) -> usize {
+    match line {
+        Line::Heading { .. } => 0,
+        _ => content_start(raw, line),
+    }
+}
+
 /// Byte offset in `raw` for a cursor sitting `display_chars` characters into
-/// the line's rendered content (the concatenation of its spans; `==`
-/// highlight markers are invisible when rendered). Past the end of the
-/// content lands at the end of the line.
+/// the line's rendered content (the concatenation of its visible spans;
+/// [`SpanKind::Hidden`] spans occupy raw bytes but no rendered characters).
+/// Past the end of the content lands at the end of the line.
 pub fn raw_col_for_display_char(raw: &str, display_chars: usize) -> usize {
     let line = parse_line(raw);
-    let spans = match &line {
-        Line::Heading { spans, .. }
-        | Line::Task { spans, .. }
-        | Line::Bullet { spans }
-        | Line::Quote { spans }
-        | Line::Text { spans } => spans,
-        Line::Rule | Line::Blank => return raw.len(),
-    };
-    let mut raw_pos = content_start(raw, &line);
+    let Some(spans) = line_spans(&line) else { return raw.len() };
+    let mut raw_pos = spans_start(raw, &line);
     let mut remaining = display_chars;
     for (kind, s) in spans {
-        let marker = if *kind == SpanKind::Highlight { 2 } else { 0 };
+        if *kind == SpanKind::Hidden {
+            raw_pos += s.len();
+            continue;
+        }
         let chars = s.chars().count();
         if remaining <= chars {
             let byte = s
@@ -329,41 +436,39 @@ pub fn raw_col_for_display_char(raw: &str, display_chars: usize) -> usize {
                 .nth(remaining)
                 .map(|(i, _)| i)
                 .unwrap_or(s.len());
-            return raw_pos + marker + byte;
+            return raw_pos + byte;
         }
         remaining -= chars;
-        raw_pos += s.len() + marker * 2;
+        raw_pos += s.len();
     }
     raw.len()
 }
 
 /// Inverse of [`raw_col_for_display_char`]: the rendered-content character
 /// index for a byte offset into `raw`. Offsets inside the line's prefix or
-/// a stripped highlight marker clamp to the nearest rendered character.
+/// a hidden span clamp to the nearest rendered character.
 pub fn display_char_for_raw_col(raw: &str, raw_col: usize) -> usize {
     let line = parse_line(raw);
-    let spans = match &line {
-        Line::Heading { spans, .. }
-        | Line::Task { spans, .. }
-        | Line::Bullet { spans }
-        | Line::Quote { spans }
-        | Line::Text { spans } => spans,
-        Line::Rule | Line::Blank => return 0,
-    };
-    let mut raw_pos = content_start(raw, &line);
+    let Some(spans) = line_spans(&line) else { return 0 };
+    let mut raw_pos = spans_start(raw, &line);
     let mut display = 0usize;
     for (kind, s) in spans {
-        let marker = if *kind == SpanKind::Highlight { 2 } else { 0 };
-        let span_start = raw_pos + marker;
-        if raw_col < span_start {
+        if raw_col < raw_pos {
             return display;
         }
-        if raw_col < span_start + s.len() {
-            let local = raw_col - span_start;
+        if *kind == SpanKind::Hidden {
+            if raw_col < raw_pos + s.len() {
+                return display;
+            }
+            raw_pos += s.len();
+            continue;
+        }
+        if raw_col < raw_pos + s.len() {
+            let local = raw_col - raw_pos;
             return display + s.char_indices().take_while(|(i, _)| *i < local).count();
         }
         display += s.chars().count();
-        raw_pos = span_start + s.len() + marker;
+        raw_pos += s.len();
     }
     display
 }
@@ -405,7 +510,13 @@ mod tests {
     fn structure() {
         assert_eq!(
             parse_line("## Today"),
-            Line::Heading { level: 2, spans: plain("Today") }
+            Line::Heading {
+                level: 2,
+                spans: vec![
+                    (SpanKind::Marker, "## ".into()),
+                    (SpanKind::Text, "Today".into()),
+                ]
+            }
         );
         assert_eq!(parse_line("---"), Line::Rule);
         assert_eq!(parse_line("   "), Line::Blank);
@@ -419,7 +530,9 @@ mod tests {
             Line::Text {
                 spans: vec![
                     (SpanKind::Text, "see ".into()),
-                    (SpanKind::WikiLink, "[[kairn prd]]".into()),
+                    (SpanKind::Hidden, "[[".into()),
+                    (SpanKind::WikiLink, "kairn prd".into()),
+                    (SpanKind::Hidden, "]]".into()),
                     (SpanKind::Text, " for ".into()),
                     (SpanKind::Tag, "#plans".into()),
                     (SpanKind::Text, " ".into()),
@@ -441,15 +554,16 @@ mod tests {
 
     #[test]
     fn emphasis() {
-        // NotePlan flavour: single asterisks are bold, markers stay visible.
+        // NotePlan flavour: single asterisks are bold; the delimiters are
+        // hidden on styled lines and reveal on the cursor line.
         assert_eq!(
             parse_line("a *bold* word"),
             Line::Text {
                 spans: vec![
                     (SpanKind::Text, "a ".into()),
-                    (SpanKind::Marker, "*".into()),
+                    (SpanKind::Hidden, "*".into()),
                     (SpanKind::Bold, "bold".into()),
-                    (SpanKind::Marker, "*".into()),
+                    (SpanKind::Hidden, "*".into()),
                     (SpanKind::Text, " word".into()),
                 ]
             }
@@ -458,9 +572,9 @@ mod tests {
             parse_line("**Other clients — only if there's a gap**"),
             Line::Text {
                 spans: vec![
-                    (SpanKind::Marker, "**".into()),
+                    (SpanKind::Hidden, "**".into()),
                     (SpanKind::Bold, "Other clients — only if there's a gap".into()),
-                    (SpanKind::Marker, "**".into()),
+                    (SpanKind::Hidden, "**".into()),
                 ]
             }
         );
@@ -469,9 +583,9 @@ mod tests {
             Line::Text {
                 spans: vec![
                     (SpanKind::Text, "stay ".into()),
-                    (SpanKind::Marker, "_".into()),
+                    (SpanKind::Hidden, "_".into()),
                     (SpanKind::Italic, "calm".into()),
-                    (SpanKind::Marker, "_".into()),
+                    (SpanKind::Hidden, "_".into()),
                     (SpanKind::Text, " now".into()),
                 ]
             }
@@ -482,9 +596,9 @@ mod tests {
             Line::Task {
                 state: TaskState::Open,
                 spans: vec![
-                    (SpanKind::Marker, "*".into()),
+                    (SpanKind::Hidden, "*".into()),
                     (SpanKind::Bold, "this is just a note".into()),
-                    (SpanKind::Marker, "*".into()),
+                    (SpanKind::Hidden, "*".into()),
                 ]
             }
         );
@@ -500,9 +614,10 @@ mod tests {
         // Unclosed markers.
         assert_eq!(parse_line("a *dangling star"), Line::Text { spans: plain("a *dangling star") });
         assert_eq!(parse_line("just ** stars"), Line::Text { spans: plain("just ** stars") });
-        // Display text still maps 1:1 onto raw content for cursor math.
+        // Display text maps onto raw content for cursor math, skipping
+        // the hidden delimiters.
         let raw = "* a *bold* word";
-        assert_eq!(raw_col_for_display_char(raw, 3), 5);
+        assert_eq!(raw_col_for_display_char(raw, 3), 6);
         assert_eq!(span_at_display_char(raw, 3), Some((SpanKind::Bold, "bold".into())));
     }
 
@@ -510,7 +625,15 @@ mod tests {
     fn highlight() {
         assert_eq!(
             parse_line("### ==Todays Tasks=="),
-            Line::Heading { level: 3, spans: vec![(SpanKind::Highlight, "Todays Tasks".into())] }
+            Line::Heading {
+                level: 3,
+                spans: vec![
+                    (SpanKind::Marker, "### ".into()),
+                    (SpanKind::Hidden, "==".into()),
+                    (SpanKind::Highlight, "Todays Tasks".into()),
+                    (SpanKind::Hidden, "==".into()),
+                ]
+            }
         );
     }
 
@@ -549,10 +672,11 @@ mod tests {
         assert_eq!(raw_col_for_display_char("* [ ] buy milk", 99), 14);
         // Bare task marker and indentation.
         assert_eq!(raw_col_for_display_char("  * buy", 1), 5);
-        // Heading.
-        assert_eq!(raw_col_for_display_char("## Today", 2), 5);
-        // Wiki links render with their brackets: offsets line up.
-        assert_eq!(raw_col_for_display_char("see [[kairn]] now", 5), 5);
+        // Heading: the dimmed hash marker renders, so offsets are identity.
+        assert_eq!(raw_col_for_display_char("## Today", 2), 2);
+        assert_eq!(raw_col_for_display_char("## Today", 4), 4);
+        // Wiki-link brackets are hidden: display char 5 is 'a' in "kairn".
+        assert_eq!(raw_col_for_display_char("see [[kairn]] now", 5), 7);
         // Highlight markers are stripped when rendered: clicking on the
         // first highlighted char lands inside the markers.
         assert_eq!(raw_col_for_display_char("== hot ==x", 0), 2);
@@ -571,8 +695,9 @@ mod tests {
         assert_eq!(display_char_for_raw_col("* [ ] buy milk", 3), 0);
         assert_eq!(display_char_for_raw_col("* [ ] buy milk", 10), 4);
         assert_eq!(display_char_for_raw_col("* [ ] buy milk", 14), 8);
-        assert_eq!(display_char_for_raw_col("## Today", 5), 2);
-        assert_eq!(display_char_for_raw_col("see [[kairn]] now", 5), 5);
+        assert_eq!(display_char_for_raw_col("## Today", 5), 5);
+        // Inside the hidden brackets: clamp to the link start.
+        assert_eq!(display_char_for_raw_col("see [[kairn]] now", 5), 4);
         // Inside a stripped highlight marker: clamp to the highlight start.
         assert_eq!(display_char_for_raw_col("== hot ==x", 1), 0);
         assert_eq!(display_char_for_raw_col("== hot ==x", 8), 5);
@@ -588,6 +713,8 @@ mod tests {
             "  - [x] done >2026-08-09",
             "## Section ==hot==",
             "see [[kairn]] and @mike",
+            "* [the video](https://youtu.be/x) later",
+            "docs at https://kairnai.com/docs, see there",
             "plain text line",
         ] {
             let chars = {
@@ -618,22 +745,87 @@ mod tests {
     #[test]
     fn span_under_display_char() {
         let raw = "* [ ] see [[kairn]] now";
-        // Content renders as "see [[kairn]] now": char 0 is in the text span.
+        // Content renders as "see kairn now": char 0 is in the text span.
         assert_eq!(
             span_at_display_char(raw, 0),
             Some((SpanKind::Text, "see ".into()))
         );
-        // Char 4 is the first bracket of the link.
+        // Char 4 is the 'k' of the link, brackets hidden.
         assert_eq!(
             span_at_display_char(raw, 4),
-            Some((SpanKind::WikiLink, "[[kairn]]".into()))
+            Some((SpanKind::WikiLink, "kairn".into()))
         );
         assert_eq!(
-            span_at_display_char(raw, 13),
+            span_at_display_char(raw, 9),
             Some((SpanKind::Text, " now".into()))
         );
         // Past the end: nothing.
         assert_eq!(span_at_display_char(raw, 99), None);
         assert_eq!(span_at_display_char("---", 0), None);
+    }
+
+    #[test]
+    fn markdown_links() {
+        assert_eq!(
+            parse_line("* [the video](https://youtu.be/x) later"),
+            Line::Task {
+                state: TaskState::Open,
+                spans: vec![
+                    (SpanKind::Hidden, "[".into()),
+                    (SpanKind::Link, "the video".into()),
+                    (SpanKind::Hidden, "](https://youtu.be/x)".into()),
+                    (SpanKind::Text, " later".into()),
+                ]
+            }
+        );
+        // Bare brackets without an adjacent `](` stay plain text.
+        assert_eq!(
+            parse_line("[sic] (an aside)"),
+            Line::Text { spans: plain("[sic] (an aside)") }
+        );
+    }
+
+    #[test]
+    fn bare_urls() {
+        assert_eq!(
+            parse_line("docs at https://kairnai.com/docs, see there"),
+            Line::Text {
+                spans: vec![
+                    (SpanKind::Text, "docs at ".into()),
+                    (SpanKind::Url, "https://kairnai.com/docs".into()),
+                    (SpanKind::Text, ", see there".into()),
+                ]
+            }
+        );
+        // A scheme with nothing after it is not a link.
+        assert_eq!(
+            parse_line("https:// nothing"),
+            Line::Text { spans: plain("https:// nothing") }
+        );
+    }
+
+    #[test]
+    fn link_targets() {
+        let raw =
+            "* see [[kairn]] at https://kairnai.com or [the video](https://youtu.be/x) >2026-08-12";
+        // Renders as "see kairn at https://kairnai.com or the video >2026-08-12".
+        assert_eq!(link_target_at_display_char(raw, 0), None);
+        assert_eq!(
+            link_target_at_display_char(raw, 4),
+            Some(LinkTarget::Wiki("kairn".into()))
+        );
+        assert_eq!(
+            link_target_at_display_char(raw, 13),
+            Some(LinkTarget::Url("https://kairnai.com".into()))
+        );
+        assert_eq!(
+            link_target_at_display_char(raw, 36),
+            Some(LinkTarget::Url("https://youtu.be/x".into()))
+        );
+        assert_eq!(
+            link_target_at_display_char(raw, 46),
+            Some(LinkTarget::Date(">2026-08-12".into()))
+        );
+        assert_eq!(link_target_at_display_char("---", 0), None);
     }
 }
