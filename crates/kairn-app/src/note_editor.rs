@@ -145,7 +145,15 @@ pub(crate) struct ShapedEntry {
 struct ShapeCache {
     width: Pixels,
     dark: bool,
-    entries: HashMap<(String, bool), Rc<ShapedEntry>>,
+    /// Inactive lines only, keyed by content (the active line's shaping also
+    /// depends on IME state, and there is exactly one, so it never caches).
+    entries: HashMap<String, Rc<ShapedEntry>>,
+}
+
+impl ShapeCache {
+    /// Far above any real note's distinct lines; guards against a pathological
+    /// document (or a long editing session) growing the map without limit.
+    const CAPACITY: usize = 8192;
 }
 
 fn now_ms() -> u64 {
@@ -198,7 +206,6 @@ impl NoteEditor {
         if !conflicts.is_empty() {
             cx.emit(NoteEditorEvent::Conflicts(self.path.clone(), conflicts));
         }
-        self.cache.borrow_mut().entries.clear();
         cx.notify();
     }
 
@@ -229,7 +236,6 @@ impl NoteEditor {
                 }
                 if !conflicts.is_empty() {
                     cx.emit(NoteEditorEvent::Conflicts(self.path.clone(), conflicts));
-                    self.cache.borrow_mut().entries.clear();
                 }
             }
             // A file that never existed (template seed, fresh note) or was
@@ -267,7 +273,6 @@ impl NoteEditor {
         self.selection_anchor = None;
         self.reset_blink(cx);
         self.follow_cursor.set(true);
-        self.cache.borrow_mut().entries.clear();
         self.schedule_autosave(cx);
         cx.notify();
     }
@@ -862,8 +867,13 @@ impl NoteEditor {
         t: &KairnTheme,
         window: &mut Window,
     ) -> Rc<ShapedEntry> {
-        let key = (raw.to_string(), active);
-        if let Some(hit) = self.cache.borrow().entries.get(&key) {
+        // The active line is never cached: its shaping also depends on the
+        // IME marked range, which the content key can't see, and there is
+        // exactly one such line. Everything else is keyed purely by content,
+        // which is what lets a keystroke reshape one line, not the note.
+        if !active
+            && let Some(hit) = self.cache.borrow().entries.get(raw)
+        {
             return hit.clone();
         }
         let entry = Rc::new(shape_entry(
@@ -880,7 +890,15 @@ impl NoteEditor {
             t,
             window,
         ));
-        self.cache.borrow_mut().entries.insert(key, entry.clone());
+        if !active {
+            let mut cache = self.cache.borrow_mut();
+            // Content keys never invalidate, they just stop being hit; the
+            // bound keeps edited-away lines from pinning memory forever.
+            if cache.entries.len() >= ShapeCache::CAPACITY {
+                cache.entries.clear();
+            }
+            cache.entries.insert(raw.to_string(), entry.clone());
+        }
         entry
     }
 
@@ -1519,12 +1537,17 @@ impl Element for NoteEditorElement {
         let t = cx.kairn().clone();
         let (focus_handle, cursor, blink_visible, selection, text, drag_target) = {
             let ed = self.editor.read(cx);
+            let selection = ed.selection();
+            // The document text is only consulted for mapping a selection's
+            // raw offsets onto styled display text; don't clone it per frame
+            // otherwise.
+            let text = selection.is_some().then(|| ed.text().to_string());
             (
                 ed.focus_handle.clone(),
                 ed.cursor,
                 ed.blink_visible,
-                ed.selection(),
-                ed.text().to_string(),
+                selection,
+                text,
                 ed.glyph_drag.as_ref().filter(|d| d.moved).and_then(|d| d.target),
             )
         };
@@ -1560,9 +1583,16 @@ impl Element for NoteEditorElement {
         let layout = layout.borrow();
         let Some(layout) = layout.as_ref() else { return };
         let focused = focus_handle.is_focused(window);
+        let viewport_bottom = window.viewport_size().height;
 
         for slot in &layout.slots {
             let block_top = bounds.origin.y + slot.y;
+            // The element is far taller than the scroll viewport on long
+            // notes; slots outside the window contribute nothing visible,
+            // so skip their draw calls entirely.
+            if block_top + slot.height < px(0.) || block_top > viewport_bottom {
+                continue;
+            }
             let text_origin = slot.text_origin_in(&bounds);
 
             // Selection, painted under the text. Offsets are raw bytes;
@@ -1580,7 +1610,11 @@ impl Element for NoteEditorElement {
                             let (s_ix, e_ix) = if slot.entry.active {
                                 (s_raw, e_raw)
                             } else {
-                                let raw_line = &text[slot.raw_start..line_end];
+                                // `text` is always present when a selection is.
+                                let raw_line = text
+                                    .as_deref()
+                                    .map(|t| &t[slot.raw_start..line_end])
+                                    .unwrap_or("");
                                 let display = &slot.entry.display;
                                 let to_ix = |raw_col: usize| {
                                     let ch =
