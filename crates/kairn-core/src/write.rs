@@ -13,9 +13,18 @@ use crate::tasks::toggle_task_line;
 use crate::vault::{daily_file, daily_path};
 
 /// Append a captured line to a day's note as an open task, creating the file
-/// if the day has none yet. Returns the file written.
+/// if the day has none yet. A day from today onward that is created here
+/// starts from the daily template, matching what the app shows for an empty
+/// day, so a capture never flattens the template layout the user was
+/// looking at. Returns the file written.
 pub fn append_to_day(root: &Path, date: NaiveDate, text: &str) -> io::Result<PathBuf> {
     let path = daily_file(root, date).unwrap_or_else(|| daily_path(root, date));
+    if !path.exists()
+        && date >= Local::now().date_naive()
+        && let Some(seed) = crate::template::daily_template(root)
+    {
+        create_note_if_absent(&path, &seed)?;
+    }
     append_line(&path, &format!("* {}", text.trim()))?;
     Ok(path)
 }
@@ -502,6 +511,23 @@ mod tests {
         // Real input lands as an open task.
         let path = capture(&root.0, date, "call the bank").expect("io").expect("written");
         assert_eq!(fs::read_to_string(&path).expect("read"), "* call the bank\n");
+    }
+
+    #[test]
+    fn capture_seeds_new_days_from_template() {
+        let root = ScratchRoot::new("capture-seed");
+        root.write("Notes/@Templates/Daily.md", "### Tasks\n\n### Notes\n");
+        // A capture into a brand-new future day lands under the template.
+        let future = Local::now().date_naive() + chrono::Days::new(1);
+        let path = capture(&root.0, future, "pack bags").expect("io").expect("written");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "### Tasks\n\n### Notes\n* pack bags\n"
+        );
+        // A past day is never dressed up with today's template.
+        let past = chrono::NaiveDate::from_ymd_opt(2020, 1, 2).expect("valid");
+        let past_path = capture(&root.0, past, "old note").expect("io").expect("written");
+        assert_eq!(fs::read_to_string(&past_path).expect("read"), "* old note\n");
     }
 
     #[cfg(unix)]
