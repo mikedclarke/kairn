@@ -191,21 +191,16 @@ pub struct Workspace {
     capture_open: bool,
     capture_input: Option<gpui::Entity<InputState>>,
     _capture_sub: Option<gpui::Subscription>,
-    /// Writing-mode editor over the pane document's raw markdown. Exists only
-    /// while the Writing layout is active.
-    pub editor: Option<gpui::Entity<InputState>>,
-    /// File the editor writes to; concrete even when the day has no file yet.
-    editor_doc: Option<PathBuf>,
-    /// The editor holds changes not yet on disk.
-    editor_dirty: bool,
-    /// Disk changed under a clean editor; the next render re-syncs it.
-    editor_stale: bool,
-    _editor_sub: Option<gpui::Subscription>,
     _autosave: Option<Task<()>>,
-    /// In-place edit of one line of the pane document (the NotePlan-style
-    /// live editing path; the Writing layout's full editor is separate).
+    /// In-place edit of one line of the pane document: the only editing
+    /// model. The Writing layout is a focused-width view of the same
+    /// line-rendered note, not a separate editor.
     pub line_edit: Option<LineEdit>,
     _line_edit_sub: Option<gpui::Subscription>,
+    /// A line edit whose target vanished from the file before it could be
+    /// saved: (file it was bound for, the user's text). Rendered as a banner
+    /// so typed text is never silently dropped.
+    pub orphaned: Option<(PathBuf, String)>,
     /// Text layout of each rendered note line from the latest render, for
     /// mapping a click position to a character. Interior-mutable because it
     /// is filled in while rendering.
@@ -277,6 +272,13 @@ impl Workspace {
         notes::ensure_layout(&notes_root);
         let (notes_watcher, notes_watch_task) = Self::watch_notes(notes_root.clone(), cx);
 
+        // Closing the window must not drop a pending line edit.
+        let flush = cx.weak_entity();
+        window.on_window_should_close(cx, move |_, cx| {
+            flush.update(cx, |ws, cx| ws.commit_line_edit(true, cx)).ok();
+            true
+        });
+
         let mut this = Self {
             settings,
             focus_handle: cx.focus_handle(),
@@ -291,14 +293,10 @@ impl Workspace {
             capture_open: false,
             capture_input: None,
             _capture_sub: None,
-            editor: None,
-            editor_doc: None,
-            editor_dirty: false,
-            editor_stale: false,
-            _editor_sub: None,
             _autosave: None,
             line_edit: None,
             _line_edit_sub: None,
+            orphaned: None,
             line_layouts: RefCell::new(HashMap::new()),
             picker_open: false,
             picker_pos: point(px(0.), px(0.)),
@@ -406,19 +404,24 @@ impl Workspace {
     }
 
     /// Open whatever a wiki link points at: a day, an existing note, or a
-    /// brand-new note created wiki-style on first click.
+    /// brand-new note created wiki-style on first click. Creation never
+    /// overwrites: if the file exists by the time we write, it is opened
+    /// as-is (links arrive in synced files and race external writers).
     pub fn open_wiki_link(&mut self, title: &str, window: &mut Window, cx: &mut Context<Self>) {
         match notes::resolve_wiki_target(&self.notes_root, title) {
             notes::WikiTarget::Day(date) => self.select_day(date, cx),
             notes::WikiTarget::Note(path) => self.open_note(path, cx),
             notes::WikiTarget::Missing(path) => {
-                match notes::write_note(&path, &format!("# {title}\n")) {
-                    Ok(()) => self.open_note(path, cx),
+                match notes::create_note_if_absent(&path, &format!("# {title}\n")) {
+                    Ok(_) => self.open_note(path, cx),
                     Err(e) => {
                         eprintln!("kairn: could not create {}: {e}", path.display());
                         window.push_notification("Could not create the linked note, see stderr.", cx);
                     }
                 }
+            }
+            notes::WikiTarget::Invalid => {
+                window.push_notification("That link can't name a note inside the notes folder.", cx);
             }
         }
     }
@@ -539,9 +542,6 @@ impl Workspace {
                 while rx.try_recv().is_ok() {}
                 let ok = this.update(cx, |ws, cx| {
                     ws.reload_notes();
-                    if ws.editor.is_some() && !ws.editor_dirty {
-                        ws.editor_stale = true;
-                    }
                     cx.notify();
                 });
                 if ok.is_err() {
@@ -684,7 +684,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if matches!(self.view, PaneView::Tasks(_)) || self.layout == LayoutMode::Writing {
+        if matches!(self.view, PaneView::Tasks(_)) {
             return;
         }
         self.commit_line_edit(true, cx);
@@ -759,22 +759,22 @@ impl Workspace {
         let value = le.input.read(cx).value().to_string();
         if value != le.expected {
             let written = if le.appending {
-                let mut text = self.doc_text.clone().unwrap_or_default();
-                if !text.is_empty() && !text.ends_with('\n') {
-                    text.push('\n');
-                }
-                text.push_str(&value);
-                notes::write_note(&le.path, &text).map(|_| true)
+                // Appending re-reads the file, so a pane snapshot gone stale
+                // (an agent or sync wrote meanwhile) is never clobbered.
+                notes::append_line(&le.path, &value).map(Some)
             } else {
                 notes::replace_line_on_disk(&le.path, le.line_idx, &le.expected, &value)
             };
             match written {
-                Ok(true) => {
+                Ok(Some(idx)) => {
                     le.expected = value;
                     le.appending = false;
+                    le.line_idx = idx;
                 }
-                Ok(false) => {
-                    // The line vanished under us; drop the edit, show reality.
+                Ok(None) => {
+                    // The line vanished or moved ambiguously under the edit;
+                    // keep the user's text visible instead of dropping it.
+                    self.orphaned = Some((le.path.clone(), value));
                     self.reload_notes();
                     cx.notify();
                     return;
@@ -796,8 +796,10 @@ impl Workspace {
     fn on_line_edit_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(le) = self.line_edit.take() else { return };
         self._autosave = None;
-        let cursor = le.input.read(cx).cursor();
         let value = le.input.read(cx).value().to_string();
+        // A split inside the list marker or task bracket would corrupt the
+        // line; the earliest split point is the start of the content.
+        let cursor = le.input.read(cx).cursor().max(notes::content_start_col(&value));
         let (combined, next_col) = if cursor < value.len() {
             let (head, tail) = value.split_at(cursor);
             let prefix = notes::continuation_prefix(head);
@@ -813,22 +815,19 @@ impl Workspace {
             (format!("{value}\n{prefix}"), None)
         };
         let written = if le.appending {
-            let mut text = self.doc_text.clone().unwrap_or_default();
-            if !text.is_empty() && !text.ends_with('\n') {
-                text.push('\n');
-            }
-            text.push_str(&combined);
-            notes::write_note(&le.path, &text).map(|_| true)
+            notes::append_line(&le.path, &combined).map(Some)
         } else {
             notes::replace_line_on_disk(&le.path, le.line_idx, &le.expected, &combined)
         };
-        let next = le.line_idx + 1;
         match written {
-            Ok(true) => {
+            Ok(Some(idx)) => {
                 self.reload_notes();
-                self.edit_line_at(next, next_col, window, cx);
+                self.edit_line_at(idx + 1, next_col, window, cx);
             }
-            Ok(false) => {
+            Ok(None) => {
+                if value != le.expected {
+                    self.orphaned = Some((le.path.clone(), value));
+                }
                 self.reload_notes();
                 cx.notify();
             }
@@ -947,7 +946,7 @@ impl Workspace {
             // The appended line was never written; fold its text (if any)
             // onto the last real line.
             if value.is_empty() {
-                Ok(true)
+                Ok(Some(prev_idx))
             } else {
                 notes::replace_line_on_disk(&path, prev_idx, &prev_line, &merged)
             }
@@ -955,11 +954,14 @@ impl Workspace {
             notes::join_lines_on_disk(&path, prev_idx, &prev_line, &expected, &merged)
         };
         match written {
-            Ok(true) => {
+            Ok(Some(idx)) => {
                 self.reload_notes();
-                self.edit_line_at(prev_idx, Some(junction), window, cx);
+                self.edit_line_at(idx, Some(junction), window, cx);
             }
-            Ok(false) => {
+            Ok(None) => {
+                if value != expected {
+                    self.orphaned = Some((path, value));
+                }
                 self.reload_notes();
                 cx.notify();
             }
@@ -1005,11 +1007,14 @@ impl Workspace {
         let junction = value.chars().count();
         let merged = format!("{value}{next_line}");
         match notes::join_lines_on_disk(&path, idx, &expected, &next_line, &merged) {
-            Ok(true) => {
+            Ok(Some(resolved)) => {
                 self.reload_notes();
-                self.edit_line_at(idx, Some(junction), window, cx);
+                self.edit_line_at(resolved, Some(junction), window, cx);
             }
-            Ok(false) => {
+            Ok(None) => {
+                if value != expected {
+                    self.orphaned = Some((path, value));
+                }
                 self.reload_notes();
                 cx.notify();
             }
@@ -1020,119 +1025,24 @@ impl Workspace {
         }
     }
 
-    /// Keep the writing-mode editor in step with the layout and the pane
-    /// document. Runs at the top of every render (the one place a `Window` is
-    /// reliably in hand for `InputState::set_value`): creates the editor on
-    /// entering Writing, flushes and drops it on leaving, swaps content when
-    /// the document changes, and re-syncs after external file changes.
-    fn sync_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.layout == LayoutMode::Writing && self.line_edit.is_some() {
-            self.commit_line_edit(true, cx);
-        }
-        if self.layout != LayoutMode::Writing {
-            if self.editor.is_some() {
-                if self.editor_dirty {
-                    self.save_editor(cx);
-                }
-                self.editor = None;
-                self.editor_doc = None;
-                self._editor_sub = None;
-                self._autosave = None;
-                self.editor_dirty = false;
-                self.editor_stale = false;
-            }
-            return;
-        }
+    fn on_save_note(&mut self, _: &SaveNote, _: &mut Window, cx: &mut Context<Self>) {
+        // Flush a pending line edit now instead of waiting for the autosave.
+        self.commit_line_edit(false, cx);
+    }
 
-        // Editing a generated task view makes no sense; fall back to the day.
-        if matches!(self.view, PaneView::Tasks(_)) {
-            self.view = PaneView::Day;
+    /// Dismiss the orphaned-line banner, optionally appending its text to
+    /// the note it was bound for so nothing typed is lost.
+    pub fn resolve_orphan(&mut self, append: bool, cx: &mut Context<Self>) {
+        let Some((path, text)) = self.orphaned.take() else { return };
+        if append {
+            if let Err(e) = notes::append_line(&path, &text) {
+                eprintln!("kairn: could not save {}: {e}", path.display());
+                self.orphaned = Some((path, text));
+                return;
+            }
             self.reload_notes();
         }
-
-        let target = match &self.doc_path {
-            Some(p) => p.clone(),
-            None => match &self.view {
-                PaneView::Day => notes::daily_path(&self.notes_root, self.selected_day),
-                _ => return,
-            },
-        };
-        // A file that exists but couldn't be read must not be edited from an
-        // empty buffer: autosave would clobber it.
-        if self.doc_text.is_none() && target.exists() {
-            return;
-        }
-
-        match self.editor.clone() {
-            None => {
-                let disk = self.doc_text.clone().unwrap_or_default();
-                let state = cx.new(|cx| {
-                    InputState::new(window, cx).multi_line(true).default_value(disk)
-                });
-                self._editor_sub = Some(cx.subscribe_in(
-                    &state,
-                    window,
-                    |this, state, ev: &InputEvent, _window, cx| {
-                        if !matches!(ev, InputEvent::Change) {
-                            return;
-                        }
-                        let value = state.read(cx).value();
-                        if value.as_ref() != this.doc_text.as_deref().unwrap_or("") {
-                            this.editor_dirty = true;
-                            this._autosave = Some(cx.spawn(async move |this, cx| {
-                                cx.background_executor()
-                                    .timer(Duration::from_millis(800))
-                                    .await;
-                                let _ = this.update(cx, |ws, cx| ws.save_editor(cx));
-                            }));
-                        }
-                    },
-                ));
-                state.update(cx, |s, cx| s.focus(window, cx));
-                self.editor = Some(state);
-                self.editor_doc = Some(target);
-                self.editor_dirty = false;
-                self.editor_stale = false;
-            }
-            Some(editor) => {
-                let switched = self.editor_doc.as_ref() != Some(&target);
-                if switched && self.editor_dirty {
-                    self.save_editor(cx);
-                }
-                let resync = self.editor_stale
-                    && !self.editor_dirty
-                    && editor.read(cx).value().as_ref() != self.doc_text.as_deref().unwrap_or("");
-                if switched || resync {
-                    let disk = self.doc_text.clone().unwrap_or_default();
-                    editor.update(cx, |s, cx| s.set_value(disk, window, cx));
-                    self.editor_doc = Some(target);
-                    self.editor_dirty = false;
-                }
-                self.editor_stale = false;
-            }
-        }
-    }
-
-    /// Write the editor's buffer to its file (atomic, trailing newline
-    /// ensured) and refresh everything derived from the notes.
-    fn save_editor(&mut self, cx: &mut Context<Self>) {
-        let (Some(editor), Some(path)) = (&self.editor, &self.editor_doc) else {
-            return;
-        };
-        let value = editor.read(cx).value().to_string();
-        match notes::write_note(path, &value) {
-            Ok(()) => self.editor_dirty = false,
-            Err(e) => eprintln!("kairn: could not save {}: {e}", path.display()),
-        }
-        self.reload_notes();
         cx.notify();
-    }
-
-    fn on_save_note(&mut self, _: &SaveNote, _: &mut Window, cx: &mut Context<Self>) {
-        if self.editor_dirty {
-            self._autosave = None;
-            self.save_editor(cx);
-        }
     }
 
     // ----- capture -----
@@ -1393,9 +1303,7 @@ impl Workspace {
     }
 
     fn on_quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
-        if self.editor_dirty {
-            self.save_editor(cx);
-        }
+        self.commit_line_edit(true, cx);
         cx.quit();
     }
 
@@ -1863,10 +1771,11 @@ fn switcher_backdrop(
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.kairn().clone();
-        self.sync_editor(window, cx);
 
         let mut body = div().flex().flex_1().min_h(px(0.));
-        if self.sidebar_open {
+        // Writing is the focused layout: the note at a comfortable measure,
+        // no sidebar.
+        if self.sidebar_open && self.layout != LayoutMode::Writing {
             body = body.child(self.render_sidebar(&t, cx));
         }
         body = body.child(self.render_main(&t, window, cx));

@@ -80,21 +80,6 @@ impl Workspace {
             .bg(t.bg)
             .child(self.render_week_strip(t, cx));
 
-        // Writing mode with a live editor: the raw markdown, autosaved.
-        if writing && let Some(editor) = self.editor.clone() {
-            return pane.child(
-                div()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .w_full()
-                    .max_w(px(760.))
-                    .mx_auto()
-                    .px(px(24.))
-                    .py(px(20.))
-                    .child(Input::new(&editor).h_full().appearance(false)),
-            );
-        }
-
         pane.child(
             div()
                 .id("note-scroll")
@@ -235,6 +220,9 @@ impl Workspace {
         };
 
         let mut note = note_frame(t, writing, masthead, subline);
+        if let Some(banner) = self.render_orphan_banner(t, cx) {
+            note = note.child(banner);
+        }
         let editing_idx = self.line_edit.as_ref().map(|le| le.line_idx);
         self.line_layouts.borrow_mut().clear();
 
@@ -297,6 +285,61 @@ impl Workspace {
                 .child("writing mode · click any line to edit in place"),
         )
         .into_any_element()
+    }
+
+    /// A line edit whose target line vanished from the file before saving:
+    /// the typed text is shown until the user restores or dismisses it,
+    /// never silently dropped.
+    fn render_orphan_banner(
+        &self,
+        t: &KairnTheme,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let (_, text) = self.orphaned.as_ref()?;
+        let action = |label: &'static str, id: &'static str| {
+            let hover = t.text;
+            div()
+                .id(id)
+                .text_color(t.dim)
+                .cursor_pointer()
+                .hover(move |s| s.text_color(hover))
+                .child(label)
+        };
+        Some(
+            div()
+                .mb(px(10.))
+                .px(px(12.))
+                .py(px(8.))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(t.amber.opacity(0.5))
+                .bg(t.amber.opacity(0.08))
+                .text_size(px(12.))
+                .child(
+                    div()
+                        .text_color(t.dim)
+                        .child("This line changed on disk before your edit could be saved:"),
+                )
+                .child(div().my(px(4.)).text_color(t.text).child(text.clone()))
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(14.))
+                        .text_size(px(11.5))
+                        .child(action("Put it back at the end of its note", "orphan-append").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.resolve_orphan(true, cx);
+                            }),
+                        ))
+                        .child(action("Discard", "orphan-discard").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.resolve_orphan(false, cx);
+                            },
+                        ))),
+                ),
+        )
     }
 
     /// The single-line input standing in for the line being edited. The

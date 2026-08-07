@@ -226,6 +226,9 @@ pub enum WikiTarget {
     Note(PathBuf),
     /// No note has this title yet; the path one would be created at.
     Missing(PathBuf),
+    /// The title cannot name a note (path escapes, hidden components).
+    /// Links are untrusted input from synced files; never create from these.
+    Invalid,
 }
 
 /// The note title inside a wiki-link span: brackets stripped, any
@@ -289,25 +292,69 @@ fn notes_files(root: &Path) -> Vec<(usize, PathBuf)> {
 
 /// Resolve a wiki-link title: an ISO date goes to that day, anything else
 /// matches a note stem case-insensitively anywhere under `Notes/` (the
-/// shallowest match wins), and an unknown title yields the path a new note
-/// would be created at.
+/// shallowest match wins), a folder-qualified title like `Projects/Kairn`
+/// matches its full path under `Notes/`, and an unknown title yields the
+/// path a new note would be created at, provided the title stays under the
+/// notes root.
 pub fn resolve_wiki_target(root: &Path, title: &str) -> WikiTarget {
     if let Ok(date) = NaiveDate::parse_from_str(title, "%Y-%m-%d") {
         return WikiTarget::Day(date);
     }
     let lower = title.to_lowercase();
-    let best = notes_files(root)
-        .into_iter()
+    let files = notes_files(root);
+    let best = files
+        .iter()
         .filter(|(_, p)| {
             p.file_stem()
                 .and_then(|s| s.to_str())
                 .is_some_and(|s| s.to_lowercase() == lower)
         })
         .min_by(|a, b| a.cmp(b));
-    match best {
-        Some((_, p)) => WikiTarget::Note(p),
-        None => WikiTarget::Missing(root.join("Notes").join(format!("{title}.md"))),
+    if let Some((_, p)) = best {
+        return WikiTarget::Note(p.clone());
     }
+    if title.contains('/') {
+        let notes_dir = root.join("Notes");
+        let hit = files.iter().find(|(_, p)| {
+            p.strip_prefix(&notes_dir).ok().is_some_and(|rel| {
+                rel.with_extension("")
+                    .to_str()
+                    .is_some_and(|s| s.to_lowercase() == lower)
+            })
+        });
+        if let Some((_, p)) = hit {
+            return WikiTarget::Note(p.clone());
+        }
+    }
+    match creatable_note_path(root, title) {
+        Some(path) => WikiTarget::Missing(path),
+        None => WikiTarget::Invalid,
+    }
+}
+
+/// The path a new note for `title` would be created at, or `None` when the
+/// title cannot safely name a file under `Notes/`: empty or dot-leading
+/// components (`.`, `..`, hidden files the scans would never show) and
+/// backslashes are rejected, so a link in a synced note can never write
+/// outside the notes root.
+fn creatable_note_path(root: &Path, title: &str) -> Option<PathBuf> {
+    if title.contains('\\') {
+        return None;
+    }
+    let components: Vec<&str> = title.split('/').map(str::trim).collect();
+    if components
+        .iter()
+        .any(|part| part.is_empty() || part.starts_with('.'))
+    {
+        return None;
+    }
+    let mut path = root.join("Notes");
+    let (last, dirs) = components.split_last()?;
+    for dir in dirs {
+        path.push(dir);
+    }
+    path.push(format!("{last}.md"));
+    Some(path)
 }
 
 /// A line in another note that references this one.
@@ -494,33 +541,52 @@ pub fn search_notes(root: &Path, query: &str, limit: usize) -> Vec<SearchHit> {
 /// if the day has none yet. Returns the file written.
 pub fn append_to_day(root: &Path, date: NaiveDate, text: &str) -> io::Result<PathBuf> {
     let path = daily_file(root, date).unwrap_or_else(|| daily_path(root, date));
-    let mut content = match fs::read_to_string(&path) {
+    append_line(&path, &format!("* {}", text.trim()))?;
+    Ok(path)
+}
+
+/// Append `line` (which may contain newlines) to a note, re-reading the file
+/// first so a buffer that went stale since render can never clobber content
+/// written meanwhile. A missing file is created. The file's own trailing
+/// newline convention is preserved. Returns the index the appended text
+/// starts at.
+pub fn append_line(path: &Path, line: &str) -> io::Result<usize> {
+    let mut text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
     };
-    if !content.is_empty() && !content.ends_with('\n') {
-        content.push('\n');
+    let idx = text.lines().count();
+    let trailing_newline = text.is_empty() || text.ends_with('\n');
+    if !trailing_newline {
+        text.push('\n');
     }
-    content.push_str("* ");
-    content.push_str(text.trim());
-    content.push('\n');
+    text.push_str(line);
+    if trailing_newline {
+        text.push('\n');
+    }
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    atomic_write(&path, &content)?;
-    Ok(path)
+    atomic_write(path, &text)?;
+    Ok(idx)
 }
 
-/// Write a whole note, atomically, ensuring a trailing newline.
-pub fn write_note(path: &Path, content: &str) -> io::Result<()> {
+/// Create a note only if nothing exists at `path`; an existing file is left
+/// untouched (a wiki link in a synced note must never overwrite a real
+/// note). Returns whether the file was created.
+pub fn create_note_if_absent(path: &Path, content: &str) -> io::Result<bool> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    if content.is_empty() || content.ends_with('\n') {
-        atomic_write(path, content)
-    } else {
-        atomic_write(path, &format!("{content}\n"))
+    match fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            file.write_all(content.as_bytes())?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -552,8 +618,8 @@ pub fn toggle_task_line(line: &str, now: &str) -> Option<String> {
             Some(format!("{indent}{marker}{gap}[x]{content} @done({now})"))
         }
         Some(TaskState::Done) => {
-            let content = strip_done_stamps(&body[3..]);
-            Some(format!("{indent}{marker}{gap}[ ]{}", content.trim_end()))
+            let content = strip_trailing_done_stamp(&body[3..]);
+            Some(format!("{indent}{marker}{gap}[ ]{content}"))
         }
         Some(_) => None,
         None if *marker == "- " || body.is_empty() => None,
@@ -561,31 +627,37 @@ pub fn toggle_task_line(line: &str, now: &str) -> Option<String> {
     }
 }
 
-/// Remove every well-formed ` @done(...)` from a line's content.
-fn strip_done_stamps(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(pos) = rest.find("@done(") {
-        let Some(close) = rest[pos..].find(')') else { break };
-        let before = &rest[..pos];
-        out.push_str(before.strip_suffix(' ').unwrap_or(before));
-        rest = &rest[pos + close + 1..];
+/// Remove the single trailing ` @done(...)` stamp, the one toggling appends.
+/// Stamps anywhere else in the line are content the user (or NotePlan) wrote
+/// and stay untouched, as does anything merely containing the substring.
+fn strip_trailing_done_stamp(s: &str) -> &str {
+    let trimmed = s.trim_end();
+    let Some(pos) = trimmed.rfind("@done(") else {
+        return s;
+    };
+    let stamp = &trimmed[pos..];
+    if !stamp.ends_with(')') || stamp[..stamp.len() - 1].contains(')') {
+        return s;
     }
-    out.push_str(rest);
-    out
+    let before = &trimmed[..pos];
+    before.strip_suffix(' ').unwrap_or(before)
 }
 
 /// Rewrite one line of a note's full text. `expected` is the line as it read
 /// when rendered: if the text has changed underneath us and the line has
-/// moved, it is found again by content; if it's gone, `None` (the caller
-/// reloads rather than guessing). `edit` maps the current line to its
-/// replacement (which may span multiple lines); line endings are preserved.
+/// moved, it is found again by content, but only when the match is
+/// unambiguous. Duplicate matches (blank lines above all) mean the right
+/// line cannot be known, so nothing is edited and the caller reloads rather
+/// than guessing. `edit` maps the current line to its replacement (which may
+/// span multiple lines); line endings are preserved. Returns the new text
+/// and the index the edit actually landed on, so a caller tracking the line
+/// can stay honest after relocation.
 fn edit_line_in_text(
     text: &str,
     line_idx: usize,
     expected: &str,
     edit: impl FnOnce(&str) -> Option<String>,
-) -> Option<String> {
+) -> Option<(String, usize)> {
     fn content(seg: &str) -> &str {
         let s = seg.strip_suffix('\n').unwrap_or(seg);
         s.strip_suffix('\r').unwrap_or(s)
@@ -594,7 +666,16 @@ fn edit_line_in_text(
     let idx = if segs.get(line_idx).is_some_and(|s| content(s) == expected) {
         line_idx
     } else {
-        segs.iter().position(|s| content(s) == expected)?
+        let mut matches = segs
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| content(s) == expected)
+            .map(|(i, _)| i);
+        let only = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        only
     };
     let line = content(segs[idx]);
     let ending = &segs[idx][line.len()..];
@@ -608,7 +689,7 @@ fn edit_line_in_text(
             out.push_str(seg);
         }
     }
-    Some(out)
+    Some((out, idx))
 }
 
 /// Toggle the task at `line_idx` between open and done. See
@@ -620,37 +701,40 @@ pub fn toggle_task_in_text(
     now: &str,
 ) -> Option<String> {
     edit_line_in_text(text, line_idx, expected, |line| toggle_task_line(line, now))
+        .map(|(new_text, _)| new_text)
 }
 
 /// Replace the line at `line_idx` with `new_line` (which may contain
 /// newlines, splitting the line). Relocates by content like toggling; `None`
-/// when the line is gone. Writes atomically. Returns whether a change landed.
+/// when the line is gone or ambiguous. Writes atomically. Returns the index
+/// the replacement landed on, `None` when nothing was written.
 pub fn replace_line_on_disk(
     path: &Path,
     line_idx: usize,
     expected: &str,
     new_line: &str,
-) -> io::Result<bool> {
+) -> io::Result<Option<usize>> {
     let text = fs::read_to_string(path)?;
-    let Some(new_text) =
+    let Some((new_text, idx)) =
         edit_line_in_text(&text, line_idx, expected, |_| Some(new_line.to_string()))
     else {
-        return Ok(false);
+        return Ok(None);
     };
     atomic_write(path, &new_text)?;
-    Ok(true)
+    Ok(Some(idx))
 }
 
 /// Replace two adjacent lines with one `replacement` line. The pair is
-/// verified (or found again) by content like [`edit_line_in_text`]; `None`
-/// when the adjacent pair no longer exists.
+/// verified (or found again, requiring a unique match) by content like
+/// [`edit_line_in_text`]; `None` when the adjacent pair no longer exists or
+/// is ambiguous. Returns the new text and the index the pair was found at.
 fn join_lines_in_text(
     text: &str,
     first_idx: usize,
     expected_first: &str,
     expected_second: &str,
     replacement: &str,
-) -> Option<String> {
+) -> Option<(String, usize)> {
     fn content(seg: &str) -> &str {
         let s = seg.strip_suffix('\n').unwrap_or(seg);
         s.strip_suffix('\r').unwrap_or(s)
@@ -663,7 +747,12 @@ fn join_lines_in_text(
     let idx = if pair_at(first_idx) {
         first_idx
     } else {
-        (0..segs.len().saturating_sub(1)).find(|&i| pair_at(i))?
+        let mut matches = (0..segs.len().saturating_sub(1)).filter(|&i| pair_at(i));
+        let only = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        only
     };
     let second = segs[idx + 1];
     let ending = &second[content(second).len()..];
@@ -676,26 +765,27 @@ fn join_lines_in_text(
             out.push_str(seg);
         }
     }
-    Some(out)
+    Some((out, idx))
 }
 
 /// Join two adjacent lines of a note into `replacement`, atomically. Returns
-/// whether a change landed (`false` when the pair is gone from the file).
+/// the index the pair was found at, `None` when the pair is gone from the
+/// file (or matched more than once) and nothing was written.
 pub fn join_lines_on_disk(
     path: &Path,
     first_idx: usize,
     expected_first: &str,
     expected_second: &str,
     replacement: &str,
-) -> io::Result<bool> {
+) -> io::Result<Option<usize>> {
     let text = fs::read_to_string(path)?;
-    let Some(new_text) =
+    let Some((new_text, idx)) =
         join_lines_in_text(&text, first_idx, expected_first, expected_second, replacement)
     else {
-        return Ok(false);
+        return Ok(None);
     };
     atomic_write(path, &new_text)?;
-    Ok(true)
+    Ok(Some(idx))
 }
 
 /// The list prefix a new line under `line` should start with, NotePlan-style:
@@ -890,6 +980,13 @@ fn content_start(raw: &str, line: &Line) -> usize {
     }
 }
 
+/// Byte offset in `raw` where the rendered content begins, for clamping
+/// edits: a split inside the list marker or task bracket would corrupt the
+/// line. Rules and blank lines report their full length.
+pub fn content_start_col(raw: &str) -> usize {
+    content_start(raw, &parse_line(raw))
+}
+
 /// Byte offset in `raw` for a cursor sitting `display_chars` characters into
 /// the line's rendered content (the concatenation of its spans; `==`
 /// highlight markers are invisible when rendered). Past the end of the
@@ -1024,10 +1121,11 @@ mod tests {
             toggle_task_line("* [x] shipped @done(2026-08-06 18:00)", now).as_deref(),
             Some("* [ ] shipped")
         );
+        // Only the trailing stamp is Kairn's; earlier ones are user content.
         assert_eq!(
             toggle_task_line("- [x] paid @done(2026-08-05) again @done(2026-08-06)", now)
                 .as_deref(),
-            Some("- [ ] paid again")
+            Some("- [ ] paid @done(2026-08-05) again")
         );
         // Not toggleable: bullets, scheduled, cancelled, plain text.
         assert_eq!(toggle_task_line("- just a bullet", now), None);
@@ -1075,16 +1173,36 @@ mod tests {
     fn edit_line_replaces_and_splits() {
         let text = "# Day\n* one\n* two\n";
         assert_eq!(
-            edit_line_in_text(text, 1, "* one", |_| Some("* one edited".into())).as_deref(),
-            Some("# Day\n* one edited\n* two\n")
+            edit_line_in_text(text, 1, "* one", |_| Some("* one edited".into())),
+            Some(("# Day\n* one edited\n* two\n".into(), 1))
         );
         // A replacement containing a newline splits the line in place.
         assert_eq!(
-            edit_line_in_text(text, 1, "* one", |_| Some("* one\n* [ ] ".into())).as_deref(),
-            Some("# Day\n* one\n* [ ] \n* two\n")
+            edit_line_in_text(text, 1, "* one", |_| Some("* one\n* [ ] ".into())),
+            Some(("# Day\n* one\n* [ ] \n* two\n".into(), 1))
         );
         // Vanished line: no edit.
         assert_eq!(edit_line_in_text(text, 1, "* gone", |_| Some("x".into())), None);
+    }
+
+    #[test]
+    fn edit_line_relocation_is_unique_or_nothing() {
+        // The file shifted and the line matches exactly once: relocated, and
+        // the caller learns the resolved index.
+        let shifted = "new\n# Day\n* one\n* two\n";
+        assert_eq!(
+            edit_line_in_text(shifted, 1, "* one", |_| Some("* one!".into())),
+            Some(("new\n# Day\n* one!\n* two\n".into(), 2))
+        );
+        // The line moved AND has duplicates (blank lines are the everyday
+        // case): the right one cannot be known, so nothing is edited.
+        let dupes = "x\ntext\n\nmore\n\nend\n";
+        assert_eq!(edit_line_in_text(dupes, 1, "", |_| Some("typed".into())), None);
+        // A duplicate elsewhere is fine while the index still matches.
+        assert_eq!(
+            edit_line_in_text(dupes, 2, "", |_| Some("typed".into())),
+            Some(("x\ntext\ntyped\nmore\n\nend\n".into(), 2))
+        );
     }
 
     #[test]
@@ -1092,21 +1210,24 @@ mod tests {
         let text = "# Day\n* one\n* two\n* three\n";
         // Straightforward adjacent pair.
         assert_eq!(
-            join_lines_in_text(text, 1, "* one", "* two", "* onetwo").as_deref(),
-            Some("# Day\n* onetwo\n* three\n")
+            join_lines_in_text(text, 1, "* one", "* two", "* onetwo"),
+            Some(("# Day\n* onetwo\n* three\n".into(), 1))
         );
-        // Pair moved since render: found again by content.
+        // Pair moved since render: found again by content, index resolved.
         let shifted = "new\n# Day\n* one\n* two\n* three\n";
         assert_eq!(
-            join_lines_in_text(shifted, 1, "* one", "* two", "* onetwo").as_deref(),
-            Some("new\n# Day\n* onetwo\n* three\n")
+            join_lines_in_text(shifted, 1, "* one", "* two", "* onetwo"),
+            Some(("new\n# Day\n* onetwo\n* three\n".into(), 2))
         );
         // Second line changed underneath: nothing is written.
         assert_eq!(join_lines_in_text(text, 1, "* one", "* other", "x"), None);
+        // The pair moved and appears twice: ambiguous, nothing is written.
+        let twice = "pad\n* a\n* b\npad\n* a\n* b\n";
+        assert_eq!(join_lines_in_text(twice, 0, "* a", "* b", "* ab"), None);
         // Joining the last pair with no trailing newline keeps it that way.
         assert_eq!(
-            join_lines_in_text("* a\n* b", 0, "* a", "* b", "* ab").as_deref(),
-            Some("* ab")
+            join_lines_in_text("* a\n* b", 0, "* a", "* b", "* ab"),
+            Some(("* ab".into(), 0))
         );
     }
 
@@ -1213,6 +1334,106 @@ mod tests {
             resolve_wiki_target(&root.0, "Ghost"),
             WikiTarget::Missing(root.0.join("Notes/Ghost.md"))
         );
+    }
+
+    #[test]
+    fn wiki_resolution_folder_titles_and_escapes() {
+        let root = ScratchRoot::new("resolve-safe");
+        let nested = root.write("Notes/Projects/Kairn.md", "# a year of notes\n");
+
+        // A folder-qualified title resolves to the existing nested note
+        // instead of "missing" (which used to truncate it on click).
+        assert_eq!(
+            resolve_wiki_target(&root.0, "Projects/Kairn"),
+            WikiTarget::Note(nested.clone())
+        );
+        assert_eq!(
+            resolve_wiki_target(&root.0, "projects/kairn"),
+            WikiTarget::Note(nested)
+        );
+        // An unknown folder-qualified title creates inside Notes/.
+        assert_eq!(
+            resolve_wiki_target(&root.0, "Projects/New Idea"),
+            WikiTarget::Missing(root.0.join("Notes/Projects/New Idea.md"))
+        );
+        // Titles that would escape the notes root or hide the file never
+        // yield a creatable path: links are untrusted input.
+        for title in [
+            "../Calendar/20260807",
+            "..",
+            ".",
+            "a/../../etc/passwd",
+            "a//b",
+            ".hidden",
+            "dir/.hidden",
+            "back\\slash",
+            "",
+        ] {
+            assert_eq!(resolve_wiki_target(&root.0, title), WikiTarget::Invalid, "{title:?}");
+        }
+    }
+
+    #[test]
+    fn create_note_never_clobbers() {
+        let root = ScratchRoot::new("create");
+        let path = root.write("Notes/Existing.md", "# a year of notes\n");
+
+        assert!(!create_note_if_absent(&path, "# Existing\n").expect("io"));
+        assert_eq!(fs::read_to_string(&path).expect("read"), "# a year of notes\n");
+
+        let fresh = root.0.join("Notes/Fresh.md");
+        assert!(create_note_if_absent(&fresh, "# Fresh\n").expect("io"));
+        assert_eq!(fs::read_to_string(&fresh).expect("read"), "# Fresh\n");
+    }
+
+    #[test]
+    fn append_line_rereads_the_file() {
+        let root = ScratchRoot::new("append");
+        // The file grew after our snapshot was taken; the append must land
+        // after the line another writer added, clobbering nothing.
+        let path = root.write("Calendar/20260807.md", "* ours\n* theirs\n");
+        assert_eq!(append_line(&path, "* typed").expect("io"), 2);
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "* ours\n* theirs\n* typed\n"
+        );
+        // A file with no trailing newline keeps its convention.
+        let bare = root.write("Notes/Bare.md", "one");
+        assert_eq!(append_line(&bare, "two").expect("io"), 1);
+        assert_eq!(fs::read_to_string(&bare).expect("read"), "one\ntwo");
+        // A missing file is created.
+        let fresh = root.0.join("Calendar/20260808.md");
+        assert_eq!(append_line(&fresh, "* first").expect("io"), 0);
+        assert_eq!(fs::read_to_string(&fresh).expect("read"), "* first\n");
+    }
+
+    #[test]
+    fn reopen_leaves_user_stamps_and_links_alone() {
+        let now = "2026-08-07 12:00";
+        // A wiki link containing the stamp substring must survive verbatim.
+        assert_eq!(
+            toggle_task_line("* [x] see [[log @done(old)]] @done(2026-08-06 18:00)", now)
+                .as_deref(),
+            Some("* [ ] see [[log @done(old)]]")
+        );
+        // A done task with no stamp at all reopens cleanly.
+        assert_eq!(toggle_task_line("* [x] no stamp", now).as_deref(), Some("* [ ] no stamp"));
+        // A stamp mid-line (not trailing) is content and stays.
+        assert_eq!(
+            toggle_task_line("* [x] logged @done(2026-08-05) then more", now).as_deref(),
+            Some("* [ ] logged @done(2026-08-05) then more")
+        );
+    }
+
+    #[test]
+    fn content_start_cols() {
+        assert_eq!(content_start_col("* [ ] buy milk"), 6);
+        assert_eq!(content_start_col("  * buy"), 4);
+        assert_eq!(content_start_col("## Today"), 3);
+        assert_eq!(content_start_col("> quoted"), 2);
+        assert_eq!(content_start_col("plain"), 0);
+        assert_eq!(content_start_col("---"), 3);
+        assert_eq!(content_start_col("   "), 3);
     }
 
     #[test]
