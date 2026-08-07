@@ -11,11 +11,31 @@ use gpui_component::{
 };
 
 use kairn_core::settings::SshHost;
-use crate::theme::Mode;
+use crate::keymap::keybind_list;
+use crate::theme::{KairnThemeExt as _, Mode};
+use crate::ui::kbd;
 use crate::workspace::Workspace;
+
+/// Settings sections, one tab each; more arrive as the page grows
+/// (templates, theming…).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    General,
+    Ssh,
+    Keybinds,
+}
+
+impl Tab {
+    const ALL: [(Tab, &'static str); 3] = [
+        (Tab::General, "General"),
+        (Tab::Ssh, "SSH hosts"),
+        (Tab::Keybinds, "Keybinds"),
+    ];
+}
 
 pub struct SettingsEditor {
     workspace: WeakEntity<Workspace>,
+    tab: Tab,
     notes_root: Entity<InputState>,
     rows: Vec<HostRow>,
 }
@@ -75,7 +95,7 @@ impl SettingsEditor {
         if rows.is_empty() {
             rows.push(HostRow::new(None, window, cx));
         }
-        Self { workspace, notes_root, rows }
+        Self { workspace, tab: Tab::General, notes_root, rows }
     }
 
     fn collect_hosts(&self, cx: &Context<Self>) -> Vec<SshHost> {
@@ -116,15 +136,18 @@ impl SettingsEditor {
             .opacity(0.55)
             .child(label.to_uppercase())
     }
-}
 
-impl Render for SettingsEditor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_general(&self, cx: &mut Context<Self>) -> gpui::Div {
         let mode = self
             .workspace
             .upgrade()
             .map(|ws| ws.read(cx).mode())
             .unwrap_or(Mode::Dark);
+        let daily_forward = self
+            .workspace
+            .upgrade()
+            .map(|ws| ws.read(cx).settings.daily_forward)
+            .unwrap_or(true);
         let resolved = self
             .workspace
             .upgrade()
@@ -141,8 +164,18 @@ impl Render for SettingsEditor {
                 cx.notify();
             }))
         };
+        let daily_button = |id: &'static str, label: &'static str, forward: bool| {
+            let btn = Button::new(id).label(label);
+            let btn = if forward == daily_forward { btn.primary() } else { btn.outline() };
+            btn.on_click(cx.listener(move |this, _, _, cx| {
+                let _ = this.workspace.update(cx, |ws, cx| {
+                    ws.set_daily_forward(forward, cx);
+                });
+                cx.notify();
+            }))
+        };
 
-        let mut root = v_flex()
+        v_flex()
             .gap_2()
             .w_full()
             .child(Self::section("Notes folder"))
@@ -158,8 +191,17 @@ impl Render for SettingsEditor {
                     .child(theme_button("theme-dark", "Dark", Mode::Dark))
                     .child(theme_button("theme-light", "Light", Mode::Light)),
             )
-            .child(Self::section("SSH hosts"));
+            .child(Self::section("Sidebar daily list"))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(daily_button("daily-forward", "Today + next 2 days", true))
+                    .child(daily_button("daily-back", "Today + previous 2 days", false)),
+            )
+    }
 
+    fn render_ssh(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let mut root = v_flex().gap_2().w_full().child(Self::section("SSH hosts"));
         for (i, row) in self.rows.iter().enumerate() {
             root = root.child(
                 h_flex()
@@ -179,38 +221,82 @@ impl Render for SettingsEditor {
                     ),
             );
         }
-
         root.child(
-            h_flex()
-                .gap_2()
-                .mt_2()
-                .child(
-                    Button::new("host-add")
-                        .outline()
-                        .label("Add host")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.rows.push(HostRow::new(None, window, cx));
-                            cx.notify();
-                        })),
-                )
-                .child(div().flex_1())
-                .child(
-                    Button::new("settings-cancel")
-                        .ghost()
-                        .label("Cancel")
-                        .on_click(cx.listener(|_, _, window, cx| {
-                            window.close_dialog(cx);
-                        })),
-                )
-                .child(
-                    Button::new("settings-save")
-                        .primary()
-                        .label("Save")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.save(window, cx);
-                        })),
-                ),
+            h_flex().child(
+                Button::new("host-add")
+                    .outline()
+                    .label("Add host")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.rows.push(HostRow::new(None, window, cx));
+                        cx.notify();
+                    })),
+            ),
         )
+    }
+
+    fn render_keybinds(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let t = cx.kairn().clone();
+        let mut root = v_flex().gap_1().w_full();
+        for (group, binds) in keybind_list() {
+            root = root.child(Self::section(group));
+            for (chord, what) in binds {
+                root = root.child(
+                    h_flex()
+                        .items_center()
+                        .py(px(2.))
+                        .child(div().flex_1().text_size(px(12.5)).child(what))
+                        .child(kbd(&t, chord)),
+                );
+            }
+        }
+        root
+    }
+}
+
+impl Render for SettingsEditor {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let tabs = h_flex().gap_1().children(Tab::ALL.map(|(tab, label)| {
+            let btn = Button::new(label).label(label);
+            let btn = if tab == self.tab { btn.primary() } else { btn.ghost() };
+            btn.on_click(cx.listener(move |this, _, _, cx| {
+                this.tab = tab;
+                cx.notify();
+            }))
+        }));
+
+        let content = match self.tab {
+            Tab::General => self.render_general(cx),
+            Tab::Ssh => self.render_ssh(cx),
+            Tab::Keybinds => self.render_keybinds(cx),
+        };
+
+        v_flex()
+            .gap_2()
+            .w_full()
+            .child(tabs)
+            .child(content)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .mt_2()
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("settings-cancel")
+                            .ghost()
+                            .label("Cancel")
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                window.close_dialog(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("settings-save")
+                            .primary()
+                            .label("Save")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.save(window, cx);
+                            })),
+                    ),
+            )
     }
 }
 

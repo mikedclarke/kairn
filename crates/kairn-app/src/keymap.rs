@@ -113,6 +113,50 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
+/// Every binding the app answers to, grouped for the settings Keybinds tab:
+/// `(group, [(chord label, what it does)])`. Kept next to [`init`] so the
+/// two lists can't drift apart silently.
+pub fn keybind_list() -> Vec<(&'static str, Vec<(String, &'static str)>)> {
+    vec![
+        (
+            "App",
+            vec![
+                (chord("J"), "Jump to a session, day, or note"),
+                (chord("\\"), "Show or hide the sidebar"),
+                (chord(","), "Open Settings"),
+                (chord_shift("K"), "Capture a thought into today's note"),
+                (chord("Q"), "Quit"),
+            ],
+        ),
+        (
+            "Layout",
+            vec![
+                (chord_shift("⏎"), "Full-screen terminal on/off"),
+                (chord_alt("⏎"), "Writing mode on/off"),
+            ],
+        ),
+        (
+            "Sessions",
+            vec![
+                (chord("N"), "New local shell"),
+                (chord("1–9"), "Switch to session 1–9"),
+            ],
+        ),
+        (
+            "Notes",
+            vec![
+                (chord("S"), "Save the open note now"),
+                (chord("Z"), "Undo"),
+                (chord_shift("Z"), "Redo"),
+                (chord("C"), "Copy"),
+                (chord("X"), "Cut"),
+                (chord("V"), "Paste"),
+                (chord("A"), "Select all"),
+            ],
+        ),
+    ]
+}
+
 // Every keybinding hint in the app goes through the chord family below, so
 // labels stay platform-correct: mac glyphs on macOS, plain modifier words on
 // Linux (where letter chords ride Ctrl+Shift, matching `init`).

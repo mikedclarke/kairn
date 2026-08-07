@@ -72,6 +72,9 @@ pub struct NoteEditor {
     /// line.
     glyph_drag: Option<GlyphDrag>,
     ime_marked: Option<Range<usize>>,
+    /// The clickable span under the pointer, underlined so links read as
+    /// links: the line's start offset and the span's display-char range.
+    hovered_link: Option<(usize, Range<usize>)>,
     focus_handle: FocusHandle,
     pub scroll_handle: ScrollHandle,
     /// Focus as of the last frame; edge-detected in prepaint (the blink
@@ -189,6 +192,7 @@ impl NoteEditor {
             selecting: false,
             glyph_drag: None,
             ime_marked: None,
+            hovered_link: None,
             focus_handle: cx.focus_handle(),
             scroll_handle: ScrollHandle::new(),
             focused: false,
@@ -225,6 +229,7 @@ impl NoteEditor {
         self.selection_anchor = None;
         self.selecting = false;
         self.glyph_drag = None;
+        self.hovered_link = None;
     }
 
     /// Write the buffer now if it holds unsaved edits: the flush point for
@@ -281,6 +286,7 @@ impl NoteEditor {
 
     fn after_edit(&mut self, cx: &mut Context<Self>) {
         self.selection_anchor = None;
+        self.hovered_link = None;
         self.reset_blink(cx);
         self.follow_cursor.set(true);
         self.schedule_autosave(cx);
@@ -845,6 +851,49 @@ impl NoteEditor {
         self.text().len()
     }
 
+    /// The clickable span under a window position, for hover styling:
+    /// only styled (inactive) lines participate — the cursor line shows raw
+    /// markdown where nothing navigates on click.
+    fn hover_target(&self, pos: Point<Pixels>) -> Option<(usize, Range<usize>)> {
+        let layout = self.layout.borrow();
+        let layout = layout.as_ref()?;
+        if !layout.bounds.contains(&pos) {
+            return None;
+        }
+        for slot in &layout.slots {
+            let top = layout.bounds.origin.y + slot.y;
+            if pos.y < top || pos.y >= top + slot.height {
+                continue;
+            }
+            if slot.entry.active {
+                return None;
+            }
+            let origin = slot.text_origin_in(&layout.bounds);
+            let local = point(pos.x - origin.x, pos.y - origin.y);
+            let ix = slot
+                .entry
+                .wrapped
+                .as_ref()?
+                .index_for_position(local, slot.entry.line_height)
+                .ok()?;
+            let chars = slot.entry.display.get(..ix).map_or(0, |s| s.chars().count());
+            let raw_line = &self.text()[slot.raw_start..slot.raw_start + slot.raw_len];
+            let range = notes::link_display_range(raw_line, chars)?;
+            return Some((slot.raw_start, range));
+        }
+        None
+    }
+
+    /// Mouse movement with no button down: track the hovered link, repainting
+    /// only when it actually changes.
+    fn on_hover_move(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        let target = self.hover_target(pos);
+        if target != self.hovered_link {
+            self.hovered_link = target;
+            cx.notify();
+        }
+    }
+
     fn toggle_task_in(&mut self, raw_range: Range<usize>, cx: &mut Context<Self>) {
         let line = self.text()[raw_range.clone()].to_string();
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
@@ -904,7 +953,11 @@ impl NoteEditor {
         let mut start = 0usize;
         for raw in text.split('\n') {
             let active = start == cursor_line.start;
-            let entry = self.entry_for(raw, active, width, &t, window);
+            let hover = self
+                .hovered_link
+                .as_ref()
+                .and_then(|(ls, range)| (*ls == start).then(|| range.clone()));
+            let entry = self.entry_for(raw, active, hover, width, &t, window);
             let height = entry.pad_top + entry.text_height + entry.pad_bottom;
             slots.push(LineSlot { raw_start: start, raw_len: raw.len(), y, height, entry });
             y += height;
@@ -920,15 +973,19 @@ impl NoteEditor {
         &self,
         raw: &str,
         active: bool,
+        hover: Option<Range<usize>>,
         width: Pixels,
         t: &KairnTheme,
         window: &mut Window,
     ) -> Rc<ShapedEntry> {
         // The active line is never cached: its shaping also depends on the
         // IME marked range, which the content key can't see, and there is
-        // exactly one such line. Everything else is keyed purely by content,
-        // which is what lets a keystroke reshape one line, not the note.
-        if !active
+        // exactly one such line. A hover-underlined line stays out of the
+        // cache too — the underline isn't part of the content key. Everything
+        // else is keyed purely by content, which is what lets a keystroke
+        // reshape one line, not the note.
+        let cacheable = !active && hover.is_none();
+        if cacheable
             && let Some(hit) = self.cache.borrow().entries.get(raw)
         {
             return hit.clone();
@@ -944,10 +1001,11 @@ impl NoteEditor {
                 (active && r.start >= line.start && r.end <= line.end)
                     .then(|| r.start - line.start..r.end - line.start)
             }),
+            hover,
             t,
             window,
         ));
-        if !active {
+        if cacheable {
             let mut cache = self.cache.borrow_mut();
             // Content keys never invalidate, they just stop being hit; the
             // bound keeps edited-away lines from pinning memory forever.
@@ -1202,9 +1260,9 @@ impl gpui::EntityInputHandler for NoteEditor {
 
 // --- shaping ---------------------------------------------------------------
 
-/// Per-kind metrics, matching the retired per-line renderer so the flag flip
-/// is visually seamless: body 13px at 1.58 line height, H1 serif 19, section
-/// headings 11 uppercase, task/bullet indents from the glyph column.
+/// Per-kind metrics: body 13px at 1.58 line height, headings on the
+/// standard markdown scale (`#` biggest, deeper levels smaller, serif for
+/// the top two), task/bullet indents from the glyph column.
 struct KindStyle {
     size: Pixels,
     line_height: Pixels,
@@ -1214,7 +1272,6 @@ struct KindStyle {
     color: Hsla,
     weight: FontWeight,
     serif: bool,
-    uppercase: bool,
 }
 
 fn kind_style(line: &Line, t: &KairnTheme) -> (KindStyle, Glyph) {
@@ -1227,35 +1284,36 @@ fn kind_style(line: &Line, t: &KairnTheme) -> (KindStyle, Glyph) {
         color,
         weight: FontWeight::NORMAL,
         serif: false,
-        uppercase: false,
     };
     match line {
-        Line::Heading { level: 1, .. } => (
-            KindStyle {
-                size: px(19.),
-                line_height: px(27.),
-                pad_top: px(18.),
-                pad_bottom: px(6.),
-                weight: FontWeight::BOLD,
-                serif: true,
-                ..body(t.text)
-            },
-            Glyph::None,
-        ),
-        Line::Heading { .. } => (
-            KindStyle {
-                size: px(11.),
-                line_height: px(17.),
-                pad_top: px(18.),
-                pad_bottom: px(8.),
+        Line::Heading { level, .. } => {
+            // Standard markdown scale: `#` biggest down to `#####` smallest,
+            // deeper levels treated as 5. Sizes sit against the 13px body.
+            let heading = |size: f32, lh: f32, pad_top: f32, pad_bottom: f32| KindStyle {
+                size: px(size),
+                line_height: px(lh),
+                pad_top: px(pad_top),
+                pad_bottom: px(pad_bottom),
                 weight: FontWeight::SEMIBOLD,
-                uppercase: true,
-                ..body(t.faint)
-            },
-            Glyph::None,
-        ),
-        Line::Task { state, .. } => {
+                ..body(t.text)
+            };
+            let style = match level {
+                1 => KindStyle {
+                    weight: FontWeight::BOLD,
+                    serif: true,
+                    ..heading(20., 28., 18., 6.)
+                },
+                2 => KindStyle { serif: true, ..heading(17., 24., 16., 5.) },
+                3 => heading(15., 22., 14., 4.),
+                4 => heading(13.5, 21., 12., 3.),
+                _ => KindStyle { color: t.dim, ..heading(13., 20.5, 10., 2.) },
+            };
+            (style, Glyph::None)
+        }
+        Line::Task { state, spans } => {
             let color = match state {
+                // A `!`-prefixed open task runs hot so it stands out.
+                TaskState::Open if notes::task_priority(spans) > 0 => t.red,
                 TaskState::Open => t.text,
                 TaskState::Scheduled => t.dim,
                 TaskState::Done | TaskState::Cancelled => t.faint,
@@ -1302,7 +1360,7 @@ fn span_style(kind: SpanKind, base: Hsla, t: &KairnTheme) -> (Hsla, Option<Hsla>
         SpanKind::Highlight => (t.text, Some(t.amber.opacity(0.28)), FontWeight::NORMAL, FontStyle::Normal),
         SpanKind::Bold => (base, None, FontWeight::BOLD, FontStyle::Normal),
         SpanKind::Italic => (base, None, FontWeight::NORMAL, FontStyle::Italic),
-        SpanKind::Marker | SpanKind::Hidden => (t.faint, None, FontWeight::NORMAL, FontStyle::Normal),
+        SpanKind::Hidden => (t.faint, None, FontWeight::NORMAL, FontStyle::Normal),
     }
 }
 
@@ -1311,6 +1369,7 @@ fn shape_entry(
     active: bool,
     width: Pixels,
     marked_local: Option<Range<usize>>,
+    hover_local: Option<Range<usize>>,
     t: &KairnTheme,
     window: &mut Window,
 ) -> ShapedEntry {
@@ -1451,27 +1510,37 @@ fn shape_entry(
     } else {
         let mut display = String::new();
         let mut runs = Vec::new();
+        let mut chars_seen = 0usize;
         for (kind, text) in spans {
             // Hidden spans hold raw bytes the styled line does not render.
             if *kind == SpanKind::Hidden {
                 continue;
             }
-            let piece = if style.uppercase { text.to_uppercase() } else { text.clone() };
             let (color, bg, weight, font_style) = span_style(*kind, style.color, t);
             let mut font = base_font.clone();
             if weight > font.weight {
                 font.weight = weight;
             }
             font.style = font_style;
+            // The hovered link underlines so it reads as clickable.
+            let chars = text.chars().count();
+            let hovered = hover_local
+                .as_ref()
+                .is_some_and(|h| chars_seen < h.end && chars_seen + chars > h.start);
             runs.push(TextRun {
-                len: piece.len(),
+                len: text.len(),
                 font,
                 color,
                 background_color: bg,
-                underline: None,
+                underline: hovered.then_some(UnderlineStyle {
+                    thickness: px(1.),
+                    color: Some(color),
+                    wavy: false,
+                }),
                 strikethrough: strike,
             });
-            display.push_str(&piece);
+            display.push_str(text);
+            chars_seen += chars;
         }
         (SharedString::from(display), runs, style.indent, glyph)
     };
@@ -1615,16 +1684,23 @@ impl Element for NoteEditorElement {
             cx,
         );
         // Drag tracking lives at the window level so a selection or line
-        // drag keeps following the pointer outside the element's bounds.
+        // drag keeps following the pointer outside the element's bounds;
+        // buttonless moves feed link-hover styling instead.
         window.on_mouse_event({
             let editor = self.editor.clone();
             move |event: &MouseMoveEvent, phase, _window, cx| {
-                if phase != DispatchPhase::Bubble
-                    || event.pressed_button != Some(MouseButton::Left)
-                {
+                if phase != DispatchPhase::Bubble {
                     return;
                 }
-                editor.update(cx, |ed, cx| ed.on_drag_move(event, cx));
+                match event.pressed_button {
+                    Some(MouseButton::Left) => {
+                        editor.update(cx, |ed, cx| ed.on_drag_move(event, cx));
+                    }
+                    None => {
+                        editor.update(cx, |ed, cx| ed.on_hover_move(event.position, cx));
+                    }
+                    Some(_) => {}
+                }
             }
         });
         window.on_mouse_event({

@@ -51,39 +51,78 @@ pub fn open_tasks_in_vault(root: &Path) -> Vec<TaskRef> {
 /// the list only when dated, so a reference note full of bullet-style task
 /// lines doesn't swamp the Open view with undated noise.
 pub fn open_tasks_in(dailies: &[DayText], notes: &[NoteText]) -> Vec<TaskRef> {
+    scan_tasks(dailies, notes).open
+}
+
+/// Per-day task tallies for calendar indicators, by due date.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DayTaskStats {
+    pub open: usize,
+    pub done: usize,
+}
+
+/// The result of one pass over every note line: the open tasks (see
+/// [`open_tasks_in`]) plus per-day open/done tallies, so calendar
+/// indicators don't cost a second parse of the whole vault.
+pub struct TaskScan {
+    pub open: Vec<TaskRef>,
+    pub day_stats: std::collections::HashMap<NaiveDate, DayTaskStats>,
+}
+
+/// One parse of every daily and note line, producing both the open-task
+/// list and the per-day tallies. Done and cancelled tasks count toward
+/// their due day (token, or the daily's own date); cancelled counts as
+/// done — it no longer needs attention.
+pub fn scan_tasks(dailies: &[DayText], notes: &[NoteText]) -> TaskScan {
     let mut tasks = Vec::new();
+    let mut day_stats: std::collections::HashMap<NaiveDate, DayTaskStats> =
+        std::collections::HashMap::new();
     for day in dailies {
         for (line_idx, raw) in day.text.lines().enumerate() {
-            if let Line::Task { state: TaskState::Open, spans } = parse_line(raw) {
-                tasks.push(TaskRef {
-                    path: day.path.clone(),
-                    due: due_token(&spans).unwrap_or(day.date),
-                    file_date: Some(day.date),
-                    line_idx,
-                    line: raw.to_string(),
-                    spans,
-                });
+            let Line::Task { state, spans } = parse_line(raw) else { continue };
+            let due = due_token(&spans).unwrap_or(day.date);
+            let stats = day_stats.entry(due).or_default();
+            match state {
+                TaskState::Open => {
+                    stats.open += 1;
+                    tasks.push(TaskRef {
+                        path: day.path.clone(),
+                        due,
+                        file_date: Some(day.date),
+                        line_idx,
+                        line: raw.to_string(),
+                        spans,
+                    });
+                }
+                TaskState::Scheduled => {}
+                TaskState::Done | TaskState::Cancelled => stats.done += 1,
             }
         }
     }
     for note in notes {
         for (line_idx, raw) in note.text.lines().enumerate() {
-            if let Line::Task { state: TaskState::Open, spans } = parse_line(raw)
-                && let Some(due) = due_token(&spans)
-            {
-                tasks.push(TaskRef {
-                    path: note.path.clone(),
-                    due,
-                    file_date: None,
-                    line_idx,
-                    line: raw.to_string(),
-                    spans,
-                });
+            let Line::Task { state, spans } = parse_line(raw) else { continue };
+            let Some(due) = due_token(&spans) else { continue };
+            let stats = day_stats.entry(due).or_default();
+            match state {
+                TaskState::Open => {
+                    stats.open += 1;
+                    tasks.push(TaskRef {
+                        path: note.path.clone(),
+                        due,
+                        file_date: None,
+                        line_idx,
+                        line: raw.to_string(),
+                        spans,
+                    });
+                }
+                TaskState::Scheduled => {}
+                TaskState::Done | TaskState::Cancelled => stats.done += 1,
             }
         }
     }
     tasks.sort_by(|a, b| b.due.cmp(&a.due).then_with(|| a.path.cmp(&b.path)));
-    tasks
+    TaskScan { open: tasks, day_stats }
 }
 
 /// The filters the task views (and the CLI's `task list`) run over the open
@@ -246,6 +285,42 @@ mod tests {
         let mut sorted = dues.clone();
         sorted.sort_by(|a, b| b.cmp(a));
         assert_eq!(dues, sorted);
+    }
+
+    #[test]
+    fn day_stats_tally_open_and_done_by_due_date() {
+        let root = ScratchRoot::new("daystats");
+        root.write(
+            "Calendar/20260805.md",
+            "* open here\n* [x] done here\n+ [-] cancelled here\n* moved out >2026-08-20\n",
+        );
+        root.write("Calendar/20260806.md", "* [x] all done\n* [x] both of them\n");
+        root.write("Notes/Project.md", "* [x] dated done >2026-08-06\n");
+
+        let scan = VaultScan::new(&root.0);
+        let dailies = scan.read_dailies();
+        let notes = scan.read_notes_cached(&mut Default::default());
+        let result = scan_tasks(&dailies, &notes);
+
+        // Open list unchanged by the tallies.
+        assert_eq!(result.open.len(), 2);
+        // 2026-08-05: one open, one done, one cancelled (counts as done);
+        // the >date task moved its open count to the 20th.
+        assert_eq!(
+            result.day_stats[&d(2026, 8, 5)],
+            DayTaskStats { open: 1, done: 2 }
+        );
+        assert_eq!(
+            result.day_stats[&d(2026, 8, 20)],
+            DayTaskStats { open: 1, done: 0 }
+        );
+        // 2026-08-06: two done in the daily plus a dated done from a note.
+        assert_eq!(
+            result.day_stats[&d(2026, 8, 6)],
+            DayTaskStats { open: 0, done: 3 }
+        );
+        // A day with no tasks has no entry at all.
+        assert!(!result.day_stats.contains_key(&d(2026, 8, 7)));
     }
 
     #[test]

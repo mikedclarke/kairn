@@ -6,8 +6,8 @@ use gpui::{
 };
 use gpui_component::{TitleBar, h_flex};
 
-use crate::keymap::{Capture, ToggleSidebar, ToggleSwitcher, ToggleThemeMode, chord, chord_alt, chord_shift};
-use crate::theme::KairnTheme;
+use crate::keymap::{ToggleSidebar, ToggleSwitcher, chord};
+use crate::theme::{self, KairnTheme};
 use crate::ui::kbd;
 use crate::workspace::Workspace;
 
@@ -33,20 +33,14 @@ impl Workspace {
             .child(div().flex_1().child("Jump to session, day, or note"))
             .child(kbd(t, chord("J")));
 
-        let capture_btn = titlebar_button(t, "capture-btn", cx).child(
-            h_flex()
-                .gap(px(6.))
-                .child("Capture")
-                .child(kbd(t, chord_shift("K"))),
-        );
-        let capture_btn = capture_btn.on_click(cx.listener(|this, _, window, cx| {
-            this.on_capture(&Capture, window, cx);
-        }));
-
-        let theme_btn = titlebar_button(t, "theme-btn", cx)
-            .child("◐")
+        // Open/close the terminal pane, so it isn't always stuck on screen.
+        let terminal_open = self.layout.shows_terminal();
+        let terminal_btn = titlebar_button(t, "terminal-btn", cx)
+            .font_family(theme::mono_font())
+            .text_color(if terminal_open { t.accent } else { t.dim })
+            .child(">_")
             .on_click(cx.listener(|this, _, window, cx| {
-                this.on_toggle_theme(&ToggleThemeMode, window, cx);
+                this.toggle_terminal_pane(window, cx);
             }));
 
         let sidebar_btn = titlebar_button(t, "sidebar-btn", cx)
@@ -75,76 +69,42 @@ impl Workspace {
                     .gap(px(8.))
                     .pr(px(8.))
                     .child(jump_hint)
-                    .child(capture_btn)
-                    .child(theme_btn),
+                    .child(terminal_btn),
             )
     }
 
-    pub(crate) fn render_statusbar(&self, t: &KairnTheme, cx: &App) -> impl IntoElement {
-        let running = self.sessions.iter().filter(|s| s.busy).count();
-        let hints = [
-            format!("{} sidebar", chord("\\")),
-            format!("{} sessions", chord("1–9")),
-            format!("{} jump", chord("J")),
-            format!("{} capture", chord_shift("K")),
-            format!("{} terminal", chord_shift("⏎")),
-            format!("{} writing", chord_alt("⏎")),
-        ];
+    /// Warnings only: each of these is a rare state the user must know
+    /// about. With nothing wrong there is no bar at all — the space belongs
+    /// to the app.
+    pub(crate) fn render_statusbar(&self, t: &KairnTheme, cx: &App) -> Option<impl IntoElement> {
         let _ = cx;
-        let mut bar = h_flex()
-            .h(px(26.))
-            .flex_none()
-            .px(px(14.))
-            .gap(px(18.))
-            .bg(t.panel)
-            .border_t_1()
-            .border_color(t.border)
-            .text_size(px(11.5))
-            .text_color(t.dim)
-            .child(
-                h_flex()
-                    .gap(px(5.))
-                    .child(
-                        div()
-                            .w(px(6.))
-                            .h(px(6.))
-                            .rounded_full()
-                            .bg(if running > 0 { t.accent } else { t.faint }),
-                    )
-                    .child(format!(
-                        "{} session{}",
-                        self.sessions.len(),
-                        if self.sessions.len() == 1 { "" } else { "s" }
-                    )),
-            )
-            .child(format!("{running} running"));
-        // Quiet unless something is genuinely wrong; each of these is a
-        // rare state the user must know about, not chrome churn.
+        let mut warnings: Vec<String> = Vec::new();
         if self._notes_watcher.is_none() && !self.root_missing {
-            bar = bar.child(div().text_color(t.amber).child("file watching off"));
+            warnings.push("file watching off".to_string());
         }
         if self.dailies_skipped > 0 {
-            bar = bar.child(
-                div()
-                    .text_color(t.amber)
-                    .child(format!("{} unreadable day notes", self.dailies_skipped)),
-            );
+            warnings.push(format!("{} unreadable day notes", self.dailies_skipped));
         }
         if self.settings.degraded {
-            bar = bar.child(
-                div()
-                    .text_color(t.amber)
-                    .child("settings on defaults after a corrupt file; apply Settings to fix"),
-            );
+            warnings
+                .push("settings on defaults after a corrupt file; apply Settings to fix".to_string());
         }
-        bar.child(
-                h_flex()
-                    .flex_1()
-                    .justify_end()
-                    .gap(px(18.))
-                    .text_color(t.faint)
-                    .children(hints),
-            )
+        if warnings.is_empty() {
+            return None;
+        }
+        Some(
+            h_flex()
+                .h(px(26.))
+                .flex_none()
+                .px(px(14.))
+                .gap(px(18.))
+                .bg(t.panel)
+                .border_t_1()
+                .border_color(t.border)
+                .text_size(px(11.5))
+                .text_color(t.amber)
+                .children(warnings),
+        )
     }
 }
 

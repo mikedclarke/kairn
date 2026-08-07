@@ -35,6 +35,13 @@ pub struct Settings {
     pub notes_root: Option<String>,
     #[serde(default)]
     pub ssh_hosts: Vec<SshHost>,
+    /// The sidebar Daily section looks forward (today plus the next two
+    /// days) when true, back (today plus the previous two) when false.
+    #[serde(default = "default_true")]
+    pub daily_forward: bool,
+    /// Sidebar sections the user has collapsed, by their header labels.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidebar_collapsed: Vec<String>,
     /// Set when the settings file existed but couldn't be parsed. While
     /// degraded, [`Settings::save`] refuses to run: auto-saving defaults
     /// over a corrupt file is how SSH hosts and the notes root get wiped.
@@ -47,12 +54,18 @@ fn default_theme() -> String {
     "dark".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: default_theme(),
             notes_root: None,
             ssh_hosts: Vec::new(),
+            daily_forward: true,
+            sidebar_collapsed: Vec::new(),
             degraded: false,
         }
     }

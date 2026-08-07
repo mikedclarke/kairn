@@ -212,7 +212,9 @@ impl Workspace {
         let dailies = scan.read_dailies_cached(&mut self.daily_cache);
         self.dailies_skipped = scan.days.len() - dailies.len();
         let note_texts = scan.read_notes_cached(&mut self.note_cache);
-        self.open_tasks = notes::open_tasks_in(&dailies, &note_texts);
+        let task_scan = notes::scan_tasks(&dailies, &note_texts);
+        self.open_tasks = task_scan.open;
+        self.day_stats = task_scan.day_stats;
         self.notes_tree = notes::notes_tree(&self.notes_root, &self.notes_expanded);
         self.agent_activity = notes::recent_activity(&self.notes_root, 6);
         let today = Local::now().date_naive();

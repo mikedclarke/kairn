@@ -39,16 +39,15 @@ pub enum SpanKind {
     Bold,
     /// Italic content: `_italic_`.
     Italic,
-    /// A dimmed-but-visible marker: the `#` prefix of a heading.
-    Marker,
     /// The text half of a `[text](url)` markdown link; the url lives in the
     /// hidden span that follows.
     Link,
     /// A bare http(s) URL, clickable as-is.
     Url,
     /// Raw bytes a styled line does not render: emphasis delimiters,
-    /// wiki-link brackets, highlight markers, the `[`/`](url)` halves of a
-    /// markdown link. They reveal only on the cursor line.
+    /// wiki-link brackets, highlight markers, heading hashes, the
+    /// `[`/`](url)` halves of a markdown link. They reveal only on the
+    /// cursor line.
     Hidden,
 }
 
@@ -70,10 +69,11 @@ pub fn parse_line(line: &str) -> Line {
         let level = 1 + rest.chars().take_while(|&c| c == '#').count() as u8;
         let text = rest.trim_start_matches('#');
         if let Some(text) = text.strip_prefix(' ') {
-            // The hash prefix renders dimmed, not hidden, so it leads the
-            // span list as a visible marker covering the raw prefix.
+            // The hash prefix is hidden on styled lines (NotePlan hides
+            // markdown syntax) and reveals on the cursor line like every
+            // other marker; it leads the span list covering the raw prefix.
             let mut spans =
-                vec![(SpanKind::Marker, line[..line.len() - text.len()].to_string())];
+                vec![(SpanKind::Hidden, line[..line.len() - text.len()].to_string())];
             spans.extend(inline_spans(text));
             return Line::Heading { level, spans };
         }
@@ -352,6 +352,43 @@ pub fn link_target_at_display_char(raw: &str, display_chars: usize) -> Option<Li
     None
 }
 
+/// The display-character range of the clickable span (wiki link, markdown
+/// link, bare URL, or `>date` reference) sitting under `display_chars`
+/// characters of rendered content: what hover styling underlines. `None`
+/// when the position isn't over anything clickable.
+pub fn link_display_range(raw: &str, display_chars: usize) -> Option<std::ops::Range<usize>> {
+    let line = parse_line(raw);
+    let spans = line_spans(&line)?;
+    let mut seen = 0usize;
+    for (kind, s) in spans {
+        if *kind == SpanKind::Hidden {
+            continue;
+        }
+        let chars = s.chars().count();
+        if display_chars < seen + chars {
+            return matches!(
+                kind,
+                SpanKind::WikiLink | SpanKind::Link | SpanKind::Url | SpanKind::DateRef
+            )
+            .then(|| seen..seen + chars);
+        }
+        seen += chars;
+    }
+    None
+}
+
+/// NotePlan-style task priority: the count of leading `!` marks (up to 3)
+/// at the start of a task's content, e.g. `* ! urgent thing`. Zero for
+/// unmarked tasks. Priority tasks render red so they stand out.
+pub fn task_priority(spans: &[Span]) -> u8 {
+    let first = spans
+        .iter()
+        .find(|(kind, _)| *kind != SpanKind::Hidden)
+        .map(|(_, s)| s.trim_start())
+        .unwrap_or("");
+    first.chars().take_while(|&c| c == '!').count().min(3) as u8
+}
+
 /// [`spans_start`] for callers that only hold the raw line: where the
 /// span list begins, for laying span styles over raw text.
 pub fn spans_start_col(raw: &str) -> usize {
@@ -513,7 +550,7 @@ mod tests {
             Line::Heading {
                 level: 2,
                 spans: vec![
-                    (SpanKind::Marker, "## ".into()),
+                    (SpanKind::Hidden, "## ".into()),
                     (SpanKind::Text, "Today".into()),
                 ]
             }
@@ -628,13 +665,28 @@ mod tests {
             Line::Heading {
                 level: 3,
                 spans: vec![
-                    (SpanKind::Marker, "### ".into()),
+                    (SpanKind::Hidden, "### ".into()),
                     (SpanKind::Hidden, "==".into()),
                     (SpanKind::Highlight, "Todays Tasks".into()),
                     (SpanKind::Hidden, "==".into()),
                 ]
             }
         );
+    }
+
+    #[test]
+    fn task_priorities() {
+        let pri = |raw: &str| match parse_line(raw) {
+            Line::Task { spans, .. } => task_priority(&spans),
+            _ => 0,
+        };
+        assert_eq!(pri("* ! urgent thing"), 1);
+        assert_eq!(pri("* !! more urgent"), 2);
+        assert_eq!(pri("- [ ] !!! on fire"), 3);
+        assert_eq!(pri("* !!!!! capped"), 3);
+        assert_eq!(pri("* plain task"), 0);
+        // A `!` later in the line is punctuation, not priority.
+        assert_eq!(pri("* ship it! today"), 0);
     }
 
     #[test]
@@ -672,9 +724,9 @@ mod tests {
         assert_eq!(raw_col_for_display_char("* [ ] buy milk", 99), 14);
         // Bare task marker and indentation.
         assert_eq!(raw_col_for_display_char("  * buy", 1), 5);
-        // Heading: the dimmed hash marker renders, so offsets are identity.
-        assert_eq!(raw_col_for_display_char("## Today", 2), 2);
-        assert_eq!(raw_col_for_display_char("## Today", 4), 4);
+        // Heading: the hash marker is hidden, content starts past it.
+        assert_eq!(raw_col_for_display_char("## Today", 0), 3);
+        assert_eq!(raw_col_for_display_char("## Today", 2), 5);
         // Wiki-link brackets are hidden: display char 5 is 'a' in "kairn".
         assert_eq!(raw_col_for_display_char("see [[kairn]] now", 5), 7);
         // Highlight markers are stripped when rendered: clicking on the
@@ -695,7 +747,9 @@ mod tests {
         assert_eq!(display_char_for_raw_col("* [ ] buy milk", 3), 0);
         assert_eq!(display_char_for_raw_col("* [ ] buy milk", 10), 4);
         assert_eq!(display_char_for_raw_col("* [ ] buy milk", 14), 8);
-        assert_eq!(display_char_for_raw_col("## Today", 5), 5);
+        assert_eq!(display_char_for_raw_col("## Today", 5), 2);
+        // Inside the hidden hashes: clamp to the content start.
+        assert_eq!(display_char_for_raw_col("## Today", 1), 0);
         // Inside the hidden brackets: clamp to the link start.
         assert_eq!(display_char_for_raw_col("see [[kairn]] now", 5), 4);
         // Inside a stripped highlight marker: clamp to the highlight start.

@@ -24,8 +24,18 @@ use kairn_core::settings::Settings;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LayoutMode {
     Split,
+    /// The note pane at full width with the sidebar: the terminal closed
+    /// via the titlebar toggle, not the focused Writing layout.
+    NotesFull,
     TerminalFull,
     Writing,
+}
+
+impl LayoutMode {
+    /// Whether the terminal pane is on screen in this layout.
+    pub fn shows_terminal(self) -> bool {
+        matches!(self, LayoutMode::Split | LayoutMode::TerminalFull)
+    }
 }
 
 /// What the note pane is showing.
@@ -85,6 +95,9 @@ pub struct Workspace {
     pub root_missing: bool,
     /// Daily-note file per date, for calendar indicators and lookups.
     pub note_days: HashMap<NaiveDate, PathBuf>,
+    /// Per-day open/done task tallies (by due date) for the calendar's
+    /// NotePlan-style day indicators.
+    pub day_stats: HashMap<NaiveDate, notes::DayTaskStats>,
     /// Every open task across the daily notes, newest first.
     pub open_tasks: Vec<notes::TaskRef>,
     /// Visible rows of the sidebar Notes browser.
@@ -190,6 +203,7 @@ impl Workspace {
             dailies_skipped: 0,
             root_missing,
             note_days: HashMap::new(),
+            day_stats: HashMap::new(),
             open_tasks: Vec::new(),
             notes_tree: Vec::new(),
             notes_expanded: HashSet::new(),
@@ -240,7 +254,8 @@ impl Workspace {
             return;
         }
         self.active_session = idx;
-        if self.layout == LayoutMode::Writing {
+        // Activating a session must show its terminal.
+        if !self.layout.shows_terminal() {
             self.layout = LayoutMode::Split;
         }
         self.focus_active_terminal(window, cx);
@@ -298,6 +313,51 @@ impl Workspace {
         } else {
             LayoutMode::Writing
         };
+        cx.notify();
+    }
+
+    /// The titlebar toggle: close the terminal (full-width notes) or bring
+    /// it back to the split.
+    pub(crate) fn toggle_terminal_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.layout.shows_terminal() {
+            self.layout = LayoutMode::NotesFull;
+        } else {
+            self.layout = LayoutMode::Split;
+            self.focus_active_terminal(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Whether a sidebar section is collapsed, by its header label.
+    pub fn section_collapsed(&self, label: &str) -> bool {
+        self.settings.sidebar_collapsed.iter().any(|s| s == label)
+    }
+
+    /// Collapse or expand a sidebar section, persisted like every other
+    /// setting.
+    pub fn toggle_section(&mut self, label: &str, cx: &mut Context<Self>) {
+        match self.settings.sidebar_collapsed.iter().position(|s| s == label) {
+            Some(i) => {
+                self.settings.sidebar_collapsed.remove(i);
+            }
+            None => self.settings.sidebar_collapsed.push(label.to_string()),
+        }
+        if let Err(e) = self.settings.save() {
+            eprintln!("kairn: failed to save settings: {e}");
+        }
+        cx.notify();
+    }
+
+    /// Point the sidebar Daily section forward (today + next two days) or
+    /// back (today + previous two).
+    pub fn set_daily_forward(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if self.settings.daily_forward == forward {
+            return;
+        }
+        self.settings.daily_forward = forward;
+        if let Err(e) = self.settings.save() {
+            eprintln!("kairn: failed to save settings: {e}");
+        }
         cx.notify();
     }
 
@@ -419,7 +479,7 @@ impl Render for Workspace {
             .on_key_down(cx.listener(Self::on_key_down))
             .child(self.render_titlebar(&t, cx))
             .child(body)
-            .child(self.render_statusbar(&t, cx))
+            .children(self.render_statusbar(&t, cx))
             .children(self.render_picker(&t, window, cx))
             .children(self.render_switcher(&t, cx))
             .children(self.render_capture(&t, cx))

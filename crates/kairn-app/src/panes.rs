@@ -7,7 +7,7 @@ use gpui::{
 use gpui_component::h_flex;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 
-use kairn_core::{Span, SpanKind};
+use kairn_core::{Span, SpanKind, task_priority};
 use crate::theme::{self, KairnTheme};
 use crate::workspace::{LayoutMode, PaneView, TaskQuery, Workspace, chord};
 
@@ -22,6 +22,7 @@ impl Workspace {
         match self.layout {
             LayoutMode::TerminalFull => container.child(self.render_terminal_pane(t, cx)),
             LayoutMode::Writing => container.child(self.render_note_pane(t, true, cx)),
+            LayoutMode::NotesFull => container.child(self.render_note_pane(t, false, cx)),
             LayoutMode::Split => container.child(
                 h_resizable("main-split")
                     .child(
@@ -274,16 +275,7 @@ impl Workspace {
                     date.format("%-d"),
                     date.format("%B")
                 );
-                let relative_label = match (date - today).num_days() {
-                    0 => Some("today"),
-                    1 => Some("tomorrow"),
-                    -1 => Some("yesterday"),
-                    _ => None,
-                };
-                let mut subline = match relative_label {
-                    Some(label) => format!("Week {} · {}", date.iso_week().week(), label),
-                    None => format!("Week {}", date.iso_week().week()),
-                };
+                let mut subline = format!("Week {}", date.iso_week().week());
                 // Open tasks from earlier days are still carried into this
                 // one; the count keeps the masthead honest about the load.
                 let carried = self.open_tasks.iter().filter(|task| task.due < date).count();
@@ -293,8 +285,19 @@ impl Workspace {
                 (masthead, subline, "No note for this day yet.")
             }
         };
+        // The relative day sits in the masthead itself, NotePlan-style, so
+        // "where am I" reads at a glance.
+        let badge = match &self.view {
+            PaneView::Day => match (self.selected_day - today).num_days() {
+                0 => Some("Today"),
+                1 => Some("Tomorrow"),
+                -1 => Some("Yesterday"),
+                _ => None,
+            },
+            _ => None,
+        };
 
-        let mut note = note_frame(t, writing, masthead, subline);
+        let mut note = note_frame(t, writing, masthead, badge, subline);
         if let Some(banner) = self.render_orphan_banner(t, cx) {
             note = note.child(banner);
         }
@@ -494,7 +497,7 @@ impl Workspace {
     ) -> AnyElement {
         let count = self.task_count(query);
         let subline = format!("{count} open");
-        let mut note = note_frame(t, writing, query.title().to_string(), subline);
+        let mut note = note_frame(t, writing, query.title().to_string(), None, subline);
 
         if count == 0 {
             note = note.child(div().mt(px(10.)).text_color(t.faint).child("Nothing here."));
@@ -520,7 +523,9 @@ impl Workspace {
                     (path, stem)
                 });
             let nav_note = source_note.as_ref().map(|(path, _)| path.clone());
-            let spans = spans_el(t, &task.spans, t.text);
+            // `!`-priority tasks run hot in the views too.
+            let base = if task_priority(&task.spans) > 0 { t.red } else { t.text };
+            let spans = spans_el(t, &task.spans, base);
             let task = task.clone();
             let checkbox = div()
                 .id(("task-view-box", i))
@@ -578,29 +583,54 @@ impl Workspace {
     }
 }
 
-/// The shared pane scaffold: serif masthead, faint subline, rule.
-fn note_frame(t: &KairnTheme, writing: bool, masthead: String, subline: String) -> gpui::Div {
-    div()
-        .px(px(38.))
-        .py(px(26.))
-        .line_height(relative(1.58))
-        .when(writing, |d| d.max_w(px(720.)).mx_auto().pt(px(44.)))
+/// The shared pane scaffold: serif masthead (with an optional relative-day
+/// badge beside it), faint subline, rule.
+fn note_frame(
+    t: &KairnTheme,
+    writing: bool,
+    masthead: String,
+    badge: Option<&'static str>,
+    subline: String,
+) -> gpui::Div {
+    let mut head = h_flex()
+        .items_center()
+        .gap(px(10.))
+        .mb(px(2.))
         .child(
             div()
                 .font_family(theme::serif_font())
                 .text_size(px(27.))
                 .font_weight(gpui::FontWeight::BOLD)
-                .mb(px(3.))
                 .child(masthead),
-        )
+        );
+    if let Some(badge) = badge {
+        head = head.child(
+            div()
+                .px(px(7.))
+                .py(px(1.))
+                .rounded(px(5.))
+                .bg(t.amber.opacity(0.16))
+                .text_size(px(10.5))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(t.amber)
+                .child(badge.to_uppercase()),
+        );
+    }
+    div()
+        .px(px(38.))
+        .pt(px(18.))
+        .pb(px(26.))
+        .line_height(relative(1.58))
+        .when(writing, |d| d.max_w(px(720.)).mx_auto().pt(px(44.)))
+        .child(head)
         .child(
             div()
                 .text_size(px(12.))
                 .text_color(t.faint)
-                .mb(px(12.))
+                .mb(px(4.))
                 .child(subline),
         )
-        .child(div().my(px(14.)).h(px(1.)).bg(t.border))
+        .child(div().my(px(8.)).h(px(1.)).bg(t.border))
 }
 
 fn week_nav(t: &KairnTheme, id: &'static str, glyph: &'static str) -> gpui::Stateful<gpui::Div> {
@@ -654,7 +684,7 @@ fn spans_text(t: &KairnTheme, spans: &[Span]) -> StyledText {
                 font_style: Some(gpui::FontStyle::Italic),
                 ..Default::default()
             }),
-            SpanKind::Marker | SpanKind::Hidden => Some(HighlightStyle {
+            SpanKind::Hidden => Some(HighlightStyle {
                 color: Some(t.faint),
                 ..Default::default()
             }),
