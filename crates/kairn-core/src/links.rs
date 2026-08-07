@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
 
-use crate::parse::{Line, SpanKind, Span, parse_line};
-use crate::vault::{daily_file, days_with_notes, notes_files, period_files, period_stem};
+use crate::parse::{Line, Span, SpanKind, parse_line};
+use crate::vault::{DayText, VaultScan, contains_insensitive, notes_files, period_stem};
 
 /// What a `[[wiki link]]` target refers to.
 #[derive(Clone, Debug, PartialEq)]
@@ -125,16 +125,28 @@ pub struct Mention {
 /// itself is excluded; dailies come newest first, then period notes, then
 /// notes in tree order.
 pub fn mentions_of(root: &Path, title: &str, exclude: Option<&Path>) -> Vec<Mention> {
+    let scan = VaultScan::new(root);
+    let dailies = scan.read_dailies();
+    mentions_in(&scan, &dailies, title, exclude)
+}
+
+/// [`mentions_of`] over an existing scan and already-read dailies, so a
+/// caller refreshing everything at once walks and reads each file once.
+pub fn mentions_in(
+    scan: &VaultScan,
+    dailies: &[DayText],
+    title: &str,
+    exclude: Option<&Path>,
+) -> Vec<Mention> {
     let lower = title.to_lowercase();
     let mut out = Vec::new();
-    let mut scan = |path: &Path, date: Option<NaiveDate>, name: &str| {
+    let mut scan_text = |path: &Path, text: &str, date: Option<NaiveDate>, name: &str| {
         if Some(path) == exclude {
             return;
         }
-        let Ok(text) = std::fs::read_to_string(path) else { return };
         for raw in text.lines() {
-            // Cheap gate; the span check below is authoritative.
-            if !raw.to_lowercase().contains(&lower) {
+            // Cheap allocation-free gate; the span check is authoritative.
+            if !contains_insensitive(raw, &lower) {
                 continue;
             }
             let spans = match parse_line(raw) {
@@ -160,22 +172,26 @@ pub fn mentions_of(root: &Path, title: &str, exclude: Option<&Path>) -> Vec<Ment
             }
         }
     };
-    let mut days: Vec<NaiveDate> = days_with_notes(root).into_iter().collect();
-    days.sort_unstable_by(|a, b| b.cmp(a));
-    for date in days {
-        let Some(path) = daily_file(root, date) else { continue };
-        scan(&path, Some(date), &date.format("%-d %b %Y").to_string());
+    for day in dailies {
+        scan_text(
+            &day.path,
+            &day.text,
+            Some(day.date),
+            &day.date.format("%-d %b %Y").to_string(),
+        );
     }
-    for (name, path) in period_files(root) {
-        scan(&path, None, &name);
+    for (name, path) in &scan.periods {
+        let Ok(text) = std::fs::read_to_string(path) else { continue };
+        scan_text(path, &text, None, name);
     }
-    for (_, path) in notes_files(root) {
+    for (_, path) in &scan.notes {
         let name = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_string();
-        scan(&path, None, &name);
+        let Ok(text) = std::fs::read_to_string(path) else { continue };
+        scan_text(path, &text, None, &name);
     }
     out
 }

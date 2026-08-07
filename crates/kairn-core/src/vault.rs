@@ -1,7 +1,7 @@
 //! The notes root on disk: layout, day and period-note discovery, the
 //! Notes/ tree, conflict copies, and search across everything.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -38,29 +38,80 @@ pub fn daily_file(root: &Path, date: NaiveDate) -> Option<PathBuf> {
     txt.exists().then_some(txt)
 }
 
+/// One shot of the vault's file lists: a single `Calendar/` scan and one
+/// `Notes/` walk, shared by everything derived from them (tasks, mentions,
+/// search) instead of each doing its own walks and `exists()` probes.
+pub struct VaultScan {
+    /// Daily-note file per date (`.md` preferred over NotePlan's `.txt`).
+    pub days: HashMap<NaiveDate, PathBuf>,
+    /// Non-daily period notes with their canonical stems, newest first.
+    pub periods: Vec<(String, PathBuf)>,
+    /// Every note file under `Notes/` with its depth, tree order.
+    pub(crate) notes: Vec<(usize, PathBuf)>,
+}
+
+/// A daily note read into memory, so one read serves both the task scan and
+/// the mention scan.
+pub struct DayText {
+    pub date: NaiveDate,
+    pub path: PathBuf,
+    pub text: String,
+}
+
+impl VaultScan {
+    pub fn new(root: &Path) -> Self {
+        let mut days: HashMap<NaiveDate, PathBuf> = HashMap::new();
+        let mut periods = Vec::new();
+        if let Ok(entries) = fs::read_dir(root.join("Calendar")) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let ext = path.extension().and_then(|x| x.to_str());
+                let is_md = matches!(ext, Some("md"));
+                if !(is_md || matches!(ext, Some("txt"))) || !path.is_file() {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if stem.len() == 8
+                    && stem.bytes().all(|b| b.is_ascii_digit())
+                    && let Ok(date) = NaiveDate::parse_from_str(stem, "%Y%m%d")
+                {
+                    match days.entry(date) {
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert(path);
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut o) => {
+                            if is_md {
+                                o.insert(path);
+                            }
+                        }
+                    }
+                } else if let Some(canon) = period_stem(stem) {
+                    periods.push((canon, path));
+                }
+            }
+        }
+        periods.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        Self { days, periods, notes: notes_files(root) }
+    }
+
+    /// Every daily note read once, newest day first.
+    pub fn read_dailies(&self) -> Vec<DayText> {
+        let mut days: Vec<(&NaiveDate, &PathBuf)> = self.days.iter().collect();
+        days.sort_unstable_by(|a, b| b.0.cmp(a.0));
+        days.into_iter()
+            .filter_map(|(date, path)| {
+                let text = fs::read_to_string(path).ok()?;
+                Some(DayText { date: *date, path: path.clone(), text })
+            })
+            .collect()
+    }
+}
+
 /// Every date with a daily note, from one scan of `Calendar/`.
 pub fn days_with_notes(root: &Path) -> HashSet<NaiveDate> {
-    let mut days = HashSet::new();
-    let Ok(entries) = fs::read_dir(root.join("Calendar")) else {
-        return days;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let ext = path.extension().and_then(|x| x.to_str());
-        if !matches!(ext, Some("md") | Some("txt")) || !path.is_file() {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if stem.len() == 8
-            && stem.bytes().all(|b| b.is_ascii_digit())
-            && let Ok(date) = NaiveDate::parse_from_str(stem, "%Y%m%d")
-        {
-            days.insert(date);
-        }
-    }
-    days
+    VaultScan::new(root).days.into_keys().collect()
 }
 
 /// Canonical form of a `Calendar/` period-note stem that isn't a daily:
@@ -89,25 +140,7 @@ pub fn period_stem(stem: &str) -> Option<String> {
 /// Every non-daily period note in `Calendar/` with its canonical stem,
 /// newest period first.
 pub fn period_files(root: &Path) -> Vec<(String, PathBuf)> {
-    let mut out = Vec::new();
-    let Ok(entries) = fs::read_dir(root.join("Calendar")) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let ext = path.extension().and_then(|x| x.to_str());
-        if !matches!(ext, Some("md") | Some("txt")) || !path.is_file() {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if let Some(canon) = period_stem(stem) {
-            out.push((canon, path));
-        }
-    }
-    out.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    out
+    VaultScan::new(root).periods
 }
 
 /// Syncthing conflict copies sitting next to a note: files named
@@ -284,13 +317,19 @@ pub struct SearchHit {
 /// (ties by name), then one plain-substring body match per file (dailies
 /// newest first, then period notes, then notes), capped at `limit`.
 pub fn search_notes(root: &Path, query: &str, limit: usize) -> Vec<SearchHit> {
+    search_in(&VaultScan::new(root), query, limit)
+}
+
+/// [`search_notes`] over an existing scan, so a caller that already walked
+/// the vault doesn't walk it again.
+pub fn search_in(scan: &VaultScan, query: &str, limit: usize) -> Vec<SearchHit> {
     let trimmed = query.trim();
     let q = trimmed.to_lowercase();
     if q.is_empty() {
         return Vec::new();
     }
-    let files = notes_files(root);
-    let periods = period_files(root);
+    let files = &scan.notes;
+    let periods = &scan.periods;
     let mut titled: Vec<(i64, SearchHit)> = files
         .iter()
         .filter_map(|(_, path)| {
@@ -319,26 +358,24 @@ pub fn search_notes(root: &Path, query: &str, limit: usize) -> Vec<SearchHit> {
     if out.len() >= limit {
         return out;
     }
-    let mut days: Vec<NaiveDate> = days_with_notes(root).into_iter().collect();
-    days.sort_unstable_by(|a, b| b.cmp(a));
-    let dailies = days
-        .into_iter()
-        .filter_map(|d| daily_file(root, d).map(|p| (p, Some(d))));
+    let mut days: Vec<(&NaiveDate, &PathBuf)> = scan.days.iter().collect();
+    days.sort_unstable_by(|a, b| b.0.cmp(a.0));
+    let dailies = days.into_iter().map(|(d, p)| (p.clone(), Some(*d)));
     let title_hits: HashSet<PathBuf> = out.iter().map(|h| h.path.clone()).collect();
     let period_bodies = periods
-        .into_iter()
+        .iter()
         .filter(|(_, p)| !title_hits.contains(p))
-        .map(|(_, p)| (p, None));
+        .map(|(_, p)| (p.clone(), None));
     let notes = files
-        .into_iter()
+        .iter()
         .filter(|(_, p)| !title_hits.contains(p))
-        .map(|(_, p)| (p, None));
+        .map(|(_, p)| (p.clone(), None));
     for (path, date) in dailies.chain(period_bodies).chain(notes) {
         if out.len() >= limit {
             break;
         }
         let Ok(text) = fs::read_to_string(&path) else { continue };
-        let Some(line) = text.lines().find(|l| l.to_lowercase().contains(&q)) else {
+        let Some(line) = text.lines().find(|l| contains_insensitive(l, &q)) else {
             continue;
         };
         let name = match date {
@@ -352,6 +389,24 @@ pub fn search_notes(root: &Path, query: &str, limit: usize) -> Vec<SearchHit> {
         out.push(SearchHit { path, date, name, snippet: Some(line.trim().to_string()) });
     }
     out
+}
+
+/// Case-insensitive substring test against an already-lowercased needle,
+/// without allocating a lowercased copy of every line: ASCII needles use a
+/// windowed byte comparison, anything else falls back to `to_lowercase`.
+pub(crate) fn contains_insensitive(haystack: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if needle_lower.is_ascii() {
+        let n = needle_lower.as_bytes();
+        haystack
+            .as_bytes()
+            .windows(n.len())
+            .any(|w| w.eq_ignore_ascii_case(n))
+    } else {
+        haystack.to_lowercase().contains(needle_lower)
+    }
 }
 
 #[cfg(test)]

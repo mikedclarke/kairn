@@ -82,8 +82,8 @@ pub struct Workspace {
     pub mentions: Vec<notes::Mention>,
     /// Syncthing conflict copies sitting next to the pane's document.
     pub conflicts: Vec<PathBuf>,
-    /// Days that have a daily note, for calendar indicators.
-    pub note_days: HashSet<NaiveDate>,
+    /// Daily-note file per date, for calendar indicators and lookups.
+    pub note_days: HashMap<NaiveDate, PathBuf>,
     /// Every open task across the daily notes, newest first.
     pub open_tasks: Vec<notes::TaskRef>,
     /// Visible rows of the sidebar Notes browser.
@@ -92,6 +92,11 @@ pub struct Workspace {
     pub(crate) notes_expanded: HashSet<PathBuf>,
     /// Open-task counts for Monday..Sunday of the selected day's week.
     pub week_open_counts: [usize; 7],
+    /// Open-task counts for the Today/Open/Overdue views, from the last
+    /// reload; renders read these instead of re-scanning per frame.
+    pub(crate) task_counts: [usize; 3],
+    /// Recent writes by this instance, for watcher self-event suppression.
+    pub(crate) self_writes: crate::vault_state::SelfWrites,
     _activity_timer: Task<()>,
     /// Watches the notes root so outside edits (agents, Syncthing, NotePlan
     /// elsewhere) appear without a restart. Dropped with the workspace.
@@ -128,7 +133,9 @@ impl Workspace {
 
         let notes_root = settings.notes_root();
         notes::ensure_layout(&notes_root);
-        let (notes_watcher, notes_watch_task) = Self::watch_notes(notes_root.clone(), cx);
+        let self_writes = crate::vault_state::SelfWrites::default();
+        let (notes_watcher, notes_watch_task) =
+            Self::watch_notes(notes_root.clone(), self_writes.clone(), cx);
 
         // Closing the window must not drop a pending line edit.
         let flush = cx.weak_entity();
@@ -161,11 +168,13 @@ impl Workspace {
             doc_path: None,
             mentions: Vec::new(),
             conflicts: Vec::new(),
-            note_days: HashSet::new(),
+            note_days: HashMap::new(),
             open_tasks: Vec::new(),
             notes_tree: Vec::new(),
             notes_expanded: HashSet::new(),
             week_open_counts: [0; 7],
+            task_counts: [0; 3],
+            self_writes,
             _activity_timer: activity_timer,
             _notes_watcher: notes_watcher,
             _notes_watch_task: notes_watch_task,

@@ -2,8 +2,11 @@
 //! the reload pipeline, task toggling, the file watcher, and applying
 //! settings changes.
 
-use std::path::PathBuf;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::hash::{Hash as _, Hasher as _};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use chrono::{Datelike, Days, Local, NaiveDate};
 use gpui::{Context, Task, Window};
@@ -13,7 +16,41 @@ use kairn_core::TaskQuery;
 
 use crate::workspace::{PaneView, Workspace};
 
+/// Paths this instance just wrote, with when and a hash of what was
+/// written: the file watcher uses it to skip reload storms caused by our
+/// own atomic-write renames, without going blind to real external edits.
+pub(crate) type SelfWrites = Arc<parking_lot::Mutex<HashMap<PathBuf, (Instant, u64)>>>;
+
+fn file_hash(path: &Path) -> Option<u64> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+/// Whether an event for `path` matches a write this instance made moments
+/// ago and the file still holds exactly what we wrote. Any mismatch means
+/// an external writer got there too, and the event must reload.
+fn is_recent_self_write(self_writes: &SelfWrites, path: &Path) -> bool {
+    let mut map = self_writes.lock();
+    map.retain(|_, (when, _)| when.elapsed() < Duration::from_secs(10));
+    let Some((when, hash)) = map.get(path) else {
+        return false;
+    };
+    when.elapsed() < Duration::from_secs(2) && file_hash(path) == Some(*hash)
+}
+
 impl Workspace {
+    /// Record a write this instance just made, so the watcher event it
+    /// triggers doesn't cost a second full reload.
+    pub(crate) fn note_self_write(&self, path: &Path) {
+        if let Some(hash) = file_hash(path) {
+            self.self_writes
+                .lock()
+                .insert(path.to_path_buf(), (Instant::now(), hash));
+        }
+    }
+
     pub fn select_day(&mut self, day: NaiveDate, cx: &mut Context<Self>) {
         self.commit_line_edit(true, cx);
         self.selected_day = day;
@@ -53,12 +90,30 @@ impl Workspace {
         self.open_tasks.iter().filter(move |t| query.matches(t.date, today))
     }
 
+    /// Open-task count for a view, computed once per reload rather than
+    /// re-scanned every frame.
+    pub fn task_count(&self, query: TaskQuery) -> usize {
+        let idx = match query {
+            TaskQuery::Today => 0,
+            TaskQuery::Open => 1,
+            TaskQuery::Overdue => 2,
+        };
+        self.task_counts[idx]
+    }
+
     /// Re-read the pane's document and everything the sidebar derives from
     /// the notes: calendar indicators, open-task counts, the Notes tree.
     pub fn reload_notes(&mut self) {
-        self.note_days = notes::days_with_notes(&self.notes_root);
-        self.open_tasks = notes::open_tasks_in_dailies(&self.notes_root);
+        // One walk of Calendar/ and Notes/ and one read of each daily,
+        // shared by the task scan and the mention scan below.
+        let scan = notes::VaultScan::new(&self.notes_root);
+        let dailies = scan.read_dailies();
+        self.open_tasks = notes::open_tasks_in(&dailies);
         self.notes_tree = notes::notes_tree(&self.notes_root, &self.notes_expanded);
+        let today = Local::now().date_naive();
+        self.task_counts = [TaskQuery::Today, TaskQuery::Open, TaskQuery::Overdue].map(|q| {
+            self.open_tasks.iter().filter(|t| q.matches(t.date, today)).count()
+        });
         let monday = self.selected_day
             - Days::new(self.selected_day.weekday().num_days_from_monday() as u64);
         for (i, count) in self.week_open_counts.iter_mut().enumerate() {
@@ -66,7 +121,7 @@ impl Workspace {
             *count = self.open_tasks.iter().filter(|t| t.date == day).count();
         }
         let path = match &self.view {
-            PaneView::Day => notes::daily_file(&self.notes_root, self.selected_day),
+            PaneView::Day => scan.days.get(&self.selected_day).cloned(),
             PaneView::Note(p) => Some(p.clone()),
             PaneView::Tasks(_) => None,
         };
@@ -84,7 +139,7 @@ impl Workspace {
             PaneView::Tasks(_) => None,
         };
         self.mentions = match title {
-            Some(t) => notes::mentions_of(&self.notes_root, &t, path.as_deref()),
+            Some(t) => notes::mentions_in(&scan, &dailies, &t, path.as_deref()),
             None => Vec::new(),
         };
         // For a day with no file yet, check where the file would be: the
@@ -99,6 +154,7 @@ impl Workspace {
             .map(notes::conflict_copies)
             .unwrap_or_default();
         self.doc_path = path;
+        self.note_days = scan.days;
     }
 
     /// Open whatever a wiki link points at: a day, an existing note, or a
@@ -111,7 +167,10 @@ impl Workspace {
             notes::WikiTarget::Note(path) => self.open_note(path, cx),
             notes::WikiTarget::Missing(path) => {
                 match notes::create_note_if_absent(&path, &format!("# {title}\n")) {
-                    Ok(_) => self.open_note(path, cx),
+                    Ok(_) => {
+                        self.note_self_write(&path);
+                        self.open_note(path, cx)
+                    }
                     Err(e) => {
                         eprintln!("kairn: could not create {}: {e}", path.display());
                         window.push_notification("Could not create the linked note, see stderr.", cx);
@@ -139,11 +198,12 @@ impl Workspace {
         let (Some(path), Some(text)) = (&self.doc_path, &self.doc_text) else {
             return;
         };
+        let path = path.clone();
         let Some(expected) = text.lines().nth(line_idx) else {
             return;
         };
-        match notes::toggle_task_on_disk(path, line_idx, expected) {
-            Ok(true) => {}
+        match notes::toggle_task_on_disk(&path, line_idx, expected) {
+            Ok(true) => self.note_self_write(&path),
             // The line changed on disk since render; the reload below picks
             // up whatever is there now.
             Ok(false) => {}
@@ -158,7 +218,8 @@ impl Workspace {
     pub fn toggle_task_ref(&mut self, task: &notes::TaskRef, cx: &mut Context<Self>) {
         self.commit_line_edit(true, cx);
         match notes::toggle_task_on_disk(&task.path, task.line_idx, &task.line) {
-            Ok(_) => {}
+            Ok(true) => self.note_self_write(&task.path),
+            Ok(false) => {}
             Err(e) => eprintln!("kairn: could not update {}: {e}", task.path.display()),
         }
         self.reload_notes();
@@ -170,6 +231,7 @@ impl Workspace {
     /// our own temp-file + rename write) causes one reload, not several.
     pub(crate) fn watch_notes(
         root: PathBuf,
+        self_writes: SelfWrites,
         cx: &mut Context<Self>,
     ) -> (Option<notify::RecommendedWatcher>, Task<()>) {
         use futures::StreamExt as _;
@@ -184,6 +246,7 @@ impl Workspace {
                         && !p
                             .file_name()
                             .is_some_and(|n| n.to_string_lossy().contains(".kairn-tmp"))
+                        && !is_recent_self_write(&self_writes, p)
                 });
             if relevant {
                 let _ = tx.unbounded_send(());
@@ -239,7 +302,8 @@ impl Workspace {
         if root != self.notes_root {
             self.notes_root = root;
             notes::ensure_layout(&self.notes_root);
-            let (watcher, task) = Self::watch_notes(self.notes_root.clone(), cx);
+            let (watcher, task) =
+                Self::watch_notes(self.notes_root.clone(), self.self_writes.clone(), cx);
             self._notes_watcher = watcher;
             self._notes_watch_task = task;
             self.reload_notes();

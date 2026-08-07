@@ -443,9 +443,10 @@ impl Workspace {
             )
             .child(div().mb(px(8.)).h(px(1.)).bg(t.border));
         let sel = t.sel;
-        for (i, mention) in self.mentions.iter().cloned().enumerate() {
+        for (i, mention) in self.mentions.iter().enumerate() {
             let name = mention.name.clone();
-            let spans = mention.spans.clone();
+            let spans = spans_el(t, &mention.spans, t.dim);
+            let mention = mention.clone();
             section = section.child(
                 div()
                     .id(("mention", i))
@@ -468,7 +469,7 @@ impl Workspace {
                             .text_color(t.faint)
                             .child(name),
                     )
-                    .child(div().flex_1().min_w(px(0.)).child(spans_el(t, &spans, t.dim))),
+                    .child(div().flex_1().min_w(px(0.)).child(spans)),
             );
         }
         section.into_any_element()
@@ -481,20 +482,21 @@ impl Workspace {
         writing: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let tasks: Vec<notes::TaskRef> = self.tasks_for(query).cloned().collect();
-        let subline = format!("{} open", tasks.len());
+        let count = self.task_count(query);
+        let subline = format!("{count} open");
         let mut note = note_frame(t, writing, query.title().to_string(), subline);
 
-        if tasks.is_empty() {
+        if count == 0 {
             note = note.child(div().mt(px(10.)).text_color(t.faint).child("Nothing here."));
         }
 
         let sel = t.sel;
         let dim = t.dim;
-        for (i, task) in tasks.into_iter().enumerate() {
+        for (i, task) in self.tasks_for(query).enumerate() {
             let date = task.date;
             let date_label = format!("{} {}", date.format("%-d"), date.format("%b"));
-            let spans = task.spans.clone();
+            let spans = spans_el(t, &task.spans, t.text);
+            let task = task.clone();
             let checkbox = div()
                 .id(("task-view-box", i))
                 .w(px(13.))
@@ -524,7 +526,7 @@ impl Workspace {
                         this.select_day(date, cx);
                     }))
                     .child(checkbox)
-                    .child(div().flex_1().min_w(px(0.)).child(spans_el(t, &spans, t.text)))
+                    .child(div().flex_1().min_w(px(0.)).child(spans))
                     .child(
                         div()
                             .flex_none()

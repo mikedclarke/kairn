@@ -1,10 +1,12 @@
 //! The one-at-a-time overlays: the session picker, the jump switcher, and
 //! quick capture, plus their shared backdrop.
 
+use std::time::Duration;
+
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AppContext as _, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    Pixels, Point, StatefulInteractiveElement, Styled, Window, div, px,
+    Pixels, Point, StatefulInteractiveElement, Styled, Task, Window, div, px,
 };
 use gpui_component::{
     WindowExt, h_flex,
@@ -31,6 +33,10 @@ pub enum Overlay {
         _sub: gpui::Subscription,
         hits: Vec<notes::SearchHit>,
         selected: usize,
+        /// Bumped per keystroke; a finished search only lands if it is
+        /// still the latest, so slow results never overwrite fresh ones.
+        generation: u64,
+        _search: Option<Task<()>>,
     },
     /// Quick capture into today's note.
     Capture {
@@ -122,7 +128,10 @@ impl Workspace {
         };
         let today = Local::now().date_naive();
         match notes::capture(&self.notes_root, today, &text) {
-            Ok(Some(_)) => self.reload_notes(),
+            Ok(Some(path)) => {
+                self.note_self_write(&path);
+                self.reload_notes()
+            }
             Ok(None) => {}
             Err(e) => {
                 eprintln!("kairn: capture failed: {e}");
@@ -214,14 +223,42 @@ impl Workspace {
                     match ev {
                         InputEvent::Change => {
                             let query = state.read(cx).value().to_string();
-                            let results = notes::search_notes(&this.notes_root, &query, 12);
-                            if let Some(Overlay::Switcher { hits, selected, .. }) =
+                            let root = this.notes_root.clone();
+                            let Some(Overlay::Switcher { generation, _search, .. }) =
                                 &mut this.overlay
-                            {
-                                *hits = results;
-                                *selected = 0;
-                                cx.notify();
-                            }
+                            else {
+                                return;
+                            };
+                            *generation += 1;
+                            let generation = *generation;
+                            // Debounced and off the UI thread: the search
+                            // reads the vault, which must not run per
+                            // keystroke in the input handler.
+                            *_search = Some(cx.spawn(async move |this, cx| {
+                                cx.background_executor()
+                                    .timer(Duration::from_millis(120))
+                                    .await;
+                                let results = cx
+                                    .background_executor()
+                                    .spawn(async move {
+                                        notes::search_notes(&root, &query, 12)
+                                    })
+                                    .await;
+                                let _ = this.update(cx, |ws, cx| {
+                                    if let Some(Overlay::Switcher {
+                                        hits,
+                                        selected,
+                                        generation: current,
+                                        ..
+                                    }) = &mut ws.overlay
+                                        && *current == generation
+                                    {
+                                        *hits = results;
+                                        *selected = 0;
+                                        cx.notify();
+                                    }
+                                });
+                            }));
                         }
                         InputEvent::PressEnter { .. } => {
                             let hit = match &this.overlay {
@@ -244,6 +281,8 @@ impl Workspace {
                 _sub: sub,
                 hits: Vec::new(),
                 selected: 0,
+                generation: 0,
+                _search: None,
             });
             cx.notify();
         }
@@ -274,14 +313,7 @@ impl Workspace {
             .min(viewport.height - est_height - px(8.))
             .max(px(0.));
 
-        let shell_name = std::env::var("SHELL")
-            .ok()
-            .and_then(|s| {
-                std::path::PathBuf::from(s)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-            })
-            .unwrap_or_else(|| "shell".into());
+        let shell_name = shell_name();
 
         let mut menu = div()
             .absolute()
@@ -369,7 +401,7 @@ impl Workspace {
         let Some(Overlay::Switcher { input, hits, selected, .. }) = &self.overlay else {
             return None;
         };
-        let (input, hits, selected) = (input.clone(), hits.clone(), *selected);
+        let selected = *selected;
 
         let today = chrono::Local::now();
         let day_label = format!(
@@ -413,7 +445,7 @@ impl Workspace {
                 .py(px(4.))
                 .border_b_1()
                 .border_color(t.border)
-                .child(Input::new(&input).appearance(false)),
+                .child(Input::new(input).appearance(false)),
         );
 
         // A live query swaps the jump lists for search results.
@@ -428,7 +460,8 @@ impl Workspace {
                         .child("Nothing found"),
                 );
             }
-            for (i, hit) in hits.into_iter().enumerate() {
+            for (i, hit) in hits.iter().enumerate() {
+                let hit = hit.clone();
                 let icon = if hit.date.is_some() { "◷" } else { "≡" };
                 let snippet: Option<String> = hit.snippet.as_ref().map(|s| {
                     let mut short: String = s.chars().take(48).collect();
@@ -562,4 +595,20 @@ fn switcher_backdrop(
                 this.close_overlays(window, cx);
             }),
         )
+}
+
+/// `$SHELL`'s basename, resolved once per process: the picker renders every
+/// frame while open and the environment cannot change under us.
+fn shell_name() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        std::env::var("SHELL")
+            .ok()
+            .and_then(|s| {
+                std::path::PathBuf::from(s)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "shell".into())
+    })
 }

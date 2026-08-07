@@ -154,6 +154,7 @@ impl Workspace {
             };
             match written {
                 Ok(Some(idx)) => {
+                    self.note_self_write(&le.path);
                     le.expected = value;
                     le.appending = false;
                     le.line_idx = idx;
@@ -208,6 +209,7 @@ impl Workspace {
         };
         match written {
             Ok(Some(idx)) => {
+                self.note_self_write(&le.path);
                 self.reload_notes();
                 self.edit_line_at(idx + 1, next_col, window, cx);
             }
@@ -342,6 +344,7 @@ impl Workspace {
         };
         match written {
             Ok(Some(idx)) => {
+                self.note_self_write(&path);
                 self.reload_notes();
                 self.edit_line_at(idx, Some(junction), window, cx);
             }
@@ -395,6 +398,7 @@ impl Workspace {
         let merged = format!("{value}{next_line}");
         match notes::join_lines_on_disk(&path, idx, &expected, &next_line, &merged) {
             Ok(Some(resolved)) => {
+                self.note_self_write(&path);
                 self.reload_notes();
                 self.edit_line_at(resolved, Some(junction), window, cx);
             }
@@ -427,6 +431,7 @@ impl Workspace {
                 self.orphaned = Some((path, text));
                 return;
             }
+            self.note_self_write(&path);
             self.reload_notes();
         }
         cx.notify();

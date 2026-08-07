@@ -2,13 +2,12 @@
 //! line-toggle logic. The app's task views and the CLI's `task list` share
 //! the same predicate.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
 
 use crate::parse::{Line, Span, TaskState, bracket_state, parse_line};
-use crate::vault::{daily_file, days_with_notes};
+use crate::vault::{DayText, VaultScan};
 
 /// One open task found in a daily note, addressable for toggling.
 #[derive(Clone, Debug)]
@@ -24,17 +23,19 @@ pub struct TaskRef {
 
 /// Every open task across the daily notes, newest day first.
 pub fn open_tasks_in_dailies(root: &Path) -> Vec<TaskRef> {
-    let mut days: Vec<NaiveDate> = days_with_notes(root).into_iter().collect();
-    days.sort_unstable_by(|a, b| b.cmp(a));
+    open_tasks_in(&VaultScan::new(root).read_dailies())
+}
+
+/// [`open_tasks_in_dailies`] over dailies already read into memory, so one
+/// read of each file serves both this and the mention scan.
+pub fn open_tasks_in(dailies: &[DayText]) -> Vec<TaskRef> {
     let mut tasks = Vec::new();
-    for date in days {
-        let Some(path) = daily_file(root, date) else { continue };
-        let Ok(text) = fs::read_to_string(&path) else { continue };
-        for (line_idx, raw) in text.lines().enumerate() {
+    for day in dailies {
+        for (line_idx, raw) in day.text.lines().enumerate() {
             if let Line::Task { state: TaskState::Open, spans } = parse_line(raw) {
                 tasks.push(TaskRef {
-                    path: path.clone(),
-                    date,
+                    path: day.path.clone(),
+                    date: day.date,
                     line_idx,
                     line: raw.to_string(),
                     spans,

@@ -25,7 +25,7 @@ impl Workspace {
         for i in 0..3u64 {
             let day = today - Days::new(i);
             let selected = day == self.selected_day;
-            let has_note = self.note_days.contains(&day);
+            let has_note = self.note_days.contains_key(&day);
             let mut row = nav_item(t, ("daily", i as usize))
                 .when(selected, |d| d.bg(t.sel).text_color(t.text))
                 .when(has_note, |d| {
@@ -48,7 +48,7 @@ impl Workspace {
             ("tasks-overdue", "Overdue", TaskQuery::Overdue),
         ];
         for (id, label, query) in queries {
-            let count = self.tasks_for(query).count();
+            let count = self.task_count(query);
             let active = self.view == PaneView::Tasks(query);
             let hot = query == TaskQuery::Overdue && count > 0;
             side = side.child(
@@ -311,7 +311,7 @@ impl Workspace {
                 let in_month = day.month() == shown_first.month();
                 let is_today = day == today;
                 let is_selected = day == self.selected_day;
-                let has_note = self.note_days.contains(&day);
+                let has_note = self.note_days.contains_key(&day);
 
                 let cell = div()
                     .id(("cal-cell", (week * 7 + wd) as usize))
