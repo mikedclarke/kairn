@@ -1,19 +1,24 @@
-//! The sync surface, designed in now so the engine slots into this same
-//! framework later without a second bridge.
+//! The sync surface: the value types [`kairn_sync`] hands out and the live
+//! [`FfiSyncEngine`] object the phone drives, both in one framework.
 //!
-//! These are UniFFI mirrors of the value types [`kairn_sync`] hands out: what a
-//! cycle did, the engine's status, and the events it emits. The phone's
-//! foreground refresh and background-fetch/push handlers are written against
-//! these shapes. The live `SyncEngine` object is deliberately **not** exposed
-//! yet: it takes a concrete `Transport`, and the HTTP/WebSocket transport lands
-//! with GDL-675. Adding it is a new object in this module against the same
-//! `kairn-sync` already compiled in here (see the `From` impls below, which put
-//! it in the iOS build graph today), not a new framework.
+//! The records below are UniFFI mirrors of what a cycle did, the engine's
+//! status, and the events it emits; the phone's foreground refresh and
+//! background-fetch/push handlers are written against these shapes. The `From`
+//! impls are the contract that keeps them from ever drifting from the engine's
+//! own types.
 //!
-//! The `From` impls are the contract that these mirrors never drift from the
-//! engine's own types.
+//! [`FfiSyncEngine`] wraps [`kairn_sync::SyncEngine`] over the concrete
+//! [`HttpTransport`] (spec §10). The Swift side constructs one with its server
+//! URL, device token, and vault paths, implements [`SyncEventListener`] to
+//! receive events, and calls `sync_now()` from its foreground and
+//! background-fetch/push handlers. No sync logic lives here: edits, merge, undo,
+//! the cycle, and conflict rules all stay in `kairn-sync`, so desktop and phone
+//! run the one engine with no drift.
 
-use kairn_sync::{CycleReport, SyncEvent, SyncStatus};
+use std::sync::Arc;
+
+use kairn_sync::engine::EngineConfig;
+use kairn_sync::{CycleReport, HttpTransport, SyncEngine, SyncEvent, SyncStatus};
 
 /// What one sync cycle did. Counts are for observability; `cursor` is the
 /// resumable journal position after the cycle's ack.
@@ -85,6 +90,113 @@ impl From<SyncEvent> for FfiSyncEvent {
             },
             SyncEvent::Error(message) => Self::Error { message },
         }
+    }
+}
+
+/// A sync failure crossing the FFI. The engine's errors are `anyhow`; they
+/// arrive on the Swift side as one message string (opening the state store,
+/// transport/auth failures during a cycle). A rejected conditional write is
+/// never an error here — the engine resolves it internally (spec §8).
+#[derive(Debug, uniffi::Error)]
+pub enum SyncError {
+    Engine { message: String },
+}
+
+impl std::fmt::Display for SyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Engine { message } => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for SyncError {}
+
+impl SyncError {
+    fn engine(e: impl std::fmt::Display) -> Self {
+        Self::Engine {
+            message: e.to_string(),
+        }
+    }
+}
+
+/// The Swift side implements this to receive engine events (spec §14): a
+/// finished cycle, a conflict copy, the about-to-write hook the app feeds into
+/// its self-write suppression, and errors. Called from the engine's threads, so
+/// implementations must not block or call back into the engine.
+#[uniffi::export(callback_interface)]
+pub trait SyncEventListener: Send + Sync {
+    fn on_event(&self, event: FfiSyncEvent);
+}
+
+/// The live sync engine, one per vault, over the HTTP transport (spec §10, §14).
+/// Wraps [`kairn_sync::SyncEngine`] for shared ownership across the FFI; every
+/// method delegates, so the cycle and conflict rules stay in `kairn-sync`.
+#[derive(uniffi::Object)]
+pub struct FfiSyncEngine {
+    inner: SyncEngine,
+}
+
+#[uniffi::export]
+impl FfiSyncEngine {
+    /// Build an engine for one vault. `server_url` is the sync server origin
+    /// (scheme + host + port), `token` the device's enrollment bearer token,
+    /// `vault_root` the notes folder on device, `state_db` the sync-state
+    /// database path (kept outside the vault, spec §6), and `device_label` the
+    /// tag stamped into conflict-copy names (e.g. `IPHONE`, spec §8). Fails only
+    /// if the state store cannot be opened.
+    #[uniffi::constructor]
+    pub fn new(
+        server_url: String,
+        vault_id: String,
+        token: String,
+        vault_root: String,
+        state_db: String,
+        device_label: String,
+        listener: Box<dyn SyncEventListener>,
+    ) -> Result<Arc<Self>, SyncError> {
+        let transport = HttpTransport::new(server_url, vault_id, token);
+        let on_event: Box<dyn Fn(SyncEvent) + Send + Sync> =
+            Box::new(move |e: SyncEvent| listener.on_event(e.into()));
+        let inner = SyncEngine::new(
+            EngineConfig {
+                vault_root: vault_root.into(),
+                state_db: state_db.into(),
+                device_label,
+            },
+            Box::new(transport),
+            on_event,
+        )
+        .map_err(SyncError::engine)?;
+        Ok(Arc::new(Self { inner }))
+    }
+
+    /// Run one full sync cycle now and return what it did. Safe to call from any
+    /// thread; the phone calls this on foreground and from its
+    /// background-fetch/push handlers (spec §7, §12).
+    pub fn sync_now(&self) -> Result<SyncCycleReport, SyncError> {
+        self.inner
+            .sync_now()
+            .map(Into::into)
+            .map_err(SyncError::engine)
+    }
+
+    /// Start the background worker (an immediate cycle, then a safety-timer
+    /// cadence). Idempotent. The phone typically drives cycles explicitly
+    /// instead, but this exists for parity with desktop.
+    pub fn start(&self) {
+        self.inner.start();
+    }
+
+    /// Stop the background worker, waiting for any in-flight cycle. Idempotent.
+    /// The phone calls this when protected data becomes unavailable (locked).
+    pub fn stop(&self) {
+        self.inner.stop();
+    }
+
+    /// A snapshot of engine state for the UI.
+    pub fn status(&self) -> SyncEngineStatus {
+        self.inner.status().into()
     }
 }
 

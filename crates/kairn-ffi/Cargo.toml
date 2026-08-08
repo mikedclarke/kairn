@@ -19,7 +19,9 @@ crate-type = ["lib", "staticlib"]
 
 [dependencies]
 kairn-core = { path = "../kairn-core" }
-kairn-sync = { path = "../kairn-sync" }
+# `http` so the iOS engine builds its concrete transport in-framework; the phone
+# never needs a Rust toolchain or a second bridge.
+kairn-sync = { path = "../kairn-sync", features = ["http"] }
 chrono = "0.4"
 uniffi = { version = "0.28", features = ["cli"] }
 
