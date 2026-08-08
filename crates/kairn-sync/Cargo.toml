@@ -1,0 +1,30 @@
+[package]
+name = "kairn-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The sync engine, deliberately UI-free and runtime-free: it compiles natively
+# into the desktop app and, via UniFFI, into the iOS app, so the same cycle and
+# conflict rules run on every platform with no protocol drift. Keeps gpui and
+# any async runtime out of its dependency graph on purpose.
+[dependencies]
+kairn-core = { path = "../kairn-core" }
+anyhow = "1"
+chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# The embedded filesystem watcher is a desktop-only immediacy optimisation;
+# correctness comes from the periodic scan and explicit sync_now(), so iOS
+# (which has no persistent watcher) simply builds without it.
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+notify = "8"
+
+[features]
+# Exposes the in-memory fake server outside tests so the real server crate
+# (GDL-672) can reuse it as a conformance oracle.
+testkit = []

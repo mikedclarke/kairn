@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/kairn-core",
+    "crates/kairn-sync",
     "crates/kairn-app",
     "crates/kairn-cli",
     "crates/gpui-terminal",
