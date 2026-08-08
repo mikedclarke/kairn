@@ -1,0 +1,24 @@
+[package]
+name = "kairn-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Headless bridge mode (sync spec §3 Phase B, §15.6): runs the sync engine
+# against a notes folder and mirrors it to the server, with no app running. The
+# always-on Mac Mini runs exactly one of these so a vault (Syncthing-managed or
+# a plain folder) lands on the sync server and the phone can join. It shares the
+# same engine, transport, and conflict rules as the desktop and iOS builds, so
+# there is no protocol drift.
+
+[[bin]]
+name = "kairn-bridge"
+path = "src/main.rs"
+
+[dependencies]
+kairn-sync = { path = "../kairn-sync", features = ["http"] }
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+chrono = "0.4"
+ctrlc = "3"

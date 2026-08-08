@@ -4,6 +4,7 @@ members = [
     "crates/kairn-core",
     "crates/kairn-sync",
     "crates/kairn-ffi",
+    "crates/kairn-bridge",
     "crates/kairn-app",
     "crates/kairn-cli",
     "crates/gpui-terminal",
