@@ -6,12 +6,12 @@
 
 Your notes and your terminals in one calm, native window.
 
-Kairn is a daily-notes and tasks app with real terminal sessions beside the page:
+Kairn is a daily-notes and tasks app with real terminal sessions:
 plan the day, run the work, and capture what you learned without switching apps.
 Everything is plain markdown files on disk, and AI agents are first-class users of
 those files, not a chat panel bolted on.
 
-Built in Rust on [GPUI](https://www.gpui.rs) (Zed's UI framework). One codebase for
+Built in Rust on [GPUI](https://www.gpui.rs). One codebase for
 macOS and Linux. Not Electron.
 
 ![Kairn: daily note, tasks, and calendar beside a terminal session](docs/screenshot.png)
@@ -19,18 +19,14 @@ macOS and Linux. Not Electron.
 ## Why
 
 If you work with coding agents, your day is split between terminals where the agents
-run and notes where the plans, context, and decisions live. Keep those in separate
-apps and the knowledge your agents need is never where the agents are.
+run and notes where the plans, context, and decisions live.
 
 Kairn puts them on one surface. Notes are plain markdown on disk, so an agent needs
 no importer, sync bridge, or API key to read them. The `kairn` CLI gives agents
 tasks, capture, search, and backlinks with JSON output and honest exit codes. And
-every write, human or agent, goes through the same atomic never-clobber merge, so an
-agent editing a note you have open cannot destroy your work. What agents do shows up
-in a live activity feed beside your own notes.
+every write, human or agent, goes through the same atomic merge, so an agent editing a note you have open cannot destroy your work.
 
-No cloud, no accounts, no database. A folder of markdown you could still read in
-twenty years.
+No cloud, no accounts, no database. Just a folder of markdown.
 
 ## Features
 
@@ -171,10 +167,6 @@ Mesa Vulkan drivers.
 Keyboard chords use Cmd on macOS and Ctrl+Shift for letters on Linux (so the shell keeps
 Ctrl+J and friends); the full reference lives in Settings → Keybinds.
 
-## Roadmap
-
-- Deeper period notes (weekly/monthly/quarterly reviews)
-
 ## Contributing, changelog, license
 
 - [CONTRIBUTING.md](CONTRIBUTING.md) for issues and pull requests
@@ -183,6 +175,3 @@ Ctrl+J and friends); the full reference lives in Settings → Keybinds.
 - [MIT](LICENSE) licensed. The terminal builds on a vendored fork of
   [gpui-terminal](https://github.com/zortax/gpui-terminal) (MIT/Apache-2.0) over the
   [alacritty_terminal](https://github.com/alacritty/alacritty) engine.
-
-Kairn v1, the previous macOS-only Swift app, is frozen at
-[kairn-v1](https://github.com/mikedclarke/kairn-v1); this is a ground-up rebuild.
