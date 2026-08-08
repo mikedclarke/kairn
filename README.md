@@ -138,8 +138,8 @@ Download the latest build for your platform from the
   Kairn to your application launcher.
 
 To use the `kairn` CLI from any terminal, open Settings → General and click **Install kairn
-command**, which links the bundled CLI onto your PATH. The Linux packages already put
-`kairn` on PATH.
+command**, which links the bundled CLI onto your PATH. The `.deb` already installs the
+`kairn` CLI on PATH for you.
 
 ## Build and run
 
