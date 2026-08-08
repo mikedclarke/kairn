@@ -1,0 +1,27 @@
+[package]
+name = "kairn-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The iOS bridge: one UniFFI facade over kairn-core (and kairn-sync) built into
+# a single XCFramework, so the iPhone app runs on the same document and sync
+# engine as the desktop with no protocol drift. Desktop links kairn-core /
+# kairn-sync natively and never touches this crate; it exists only to cross the
+# Swift boundary.
+#
+# `staticlib` is what the XCFramework links; `lib` carries the UniFFI metadata
+# that library-mode bindgen reads and lets `cargo test` cover the mappings on
+# the host.
+[lib]
+crate-type = ["lib", "staticlib"]
+
+[dependencies]
+kairn-core = { path = "../kairn-core" }
+kairn-sync = { path = "../kairn-sync" }
+chrono = "0.4"
+uniffi = { version = "0.28", features = ["cli"] }
+
+[dev-dependencies]
+uniffi = { version = "0.28", features = ["bindgen-tests"] }
