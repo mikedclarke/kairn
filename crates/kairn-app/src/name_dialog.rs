@@ -110,7 +110,11 @@ pub fn open(
     let on_submit: Submit = Rc::new(on_submit);
     let prompt =
         cx.new(|cx| NamePrompt::new(weak, initial, confirm.into(), on_submit, window, cx));
+    let focus_target = prompt.read(cx).input.clone();
     window.open_dialog(cx, move |dialog, _, _| {
         dialog.w(px(420.)).title(title).child(prompt.clone())
     });
+    // open_dialog focuses the dialog panel, which would undo the focus set in
+    // NamePrompt::new; focus the input again so typing works immediately.
+    focus_target.update(cx, |state, cx| state.focus(window, cx));
 }

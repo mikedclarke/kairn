@@ -14,6 +14,8 @@ those files, not a chat panel bolted on.
 Built in Rust on [GPUI](https://www.gpui.rs) (Zed's UI framework). One codebase for
 macOS and Linux. Not Electron.
 
+![Kairn: daily note, tasks, and calendar beside a terminal session](docs/screenshot.jpg)
+
 ## Why
 
 If you work with coding agents, your day is split between terminals where the agents

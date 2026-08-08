@@ -12,6 +12,9 @@ same fact twice; no em dashes. Rewrite to this standard before releasing.
 
 <!-- New user-visible capabilities. -->
 
+- The notes folder is chosen with the system folder picker instead of typing a path.
+- A KAIRN_ROOT environment variable points the app at a different notes folder for one session.
+
 ## Improved
 
 <!-- Refinements to existing workflows, reliability, performance, or UX. -->
@@ -19,3 +22,6 @@ same fact twice; no em dashes. Rewrite to this standard before releasing.
 ## Fixed
 
 <!-- Bugs that no longer happen. -->
+
+- Dialog text fields (rename note, new note) take keyboard focus when the dialog opens.
+- A squeezed dialog layout can no longer scroll a text field's content out of view, which made the notes folder field look empty or mangled.

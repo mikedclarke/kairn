@@ -29,3 +29,9 @@ opt-level = 2
 # renderer is per-frame hot-path code: keep it optimised in dev builds too.
 [profile.dev.package.gpui-terminal]
 opt-level = 2
+
+# gpui-component vendored at 0.5.1 (crates.io has no newer release) to fix the
+# text-input scroll bug that blanked overflowing dialog inputs; see
+# vendor/gpui-component/KAIRN-CHANGES.md.
+[patch.crates-io]
+gpui-component = { path = "vendor/gpui-component" }

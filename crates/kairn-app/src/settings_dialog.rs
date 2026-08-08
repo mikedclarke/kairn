@@ -1,6 +1,6 @@
 use gpui::{
-    AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, WeakEntity, Window,
-    div, px,
+    AppContext, Context, Entity, IntoElement, ParentElement, PathPromptOptions, Render, Styled,
+    WeakEntity, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     WindowExt,
@@ -47,7 +47,10 @@ const DEFAULT_FONT: &str = "Default";
 pub struct SettingsEditor {
     workspace: WeakEntity<Workspace>,
     tab: Tab,
-    notes_root: Entity<InputState>,
+    /// Pending notes folder, in the form settings.json stores (`~/...` when
+    /// under home). None means the default `~/kairn`. Set via the native
+    /// folder picker; lands with Save.
+    notes_root_choice: Option<String>,
     rows: Vec<HostRow>,
     /// The daily template body as loaded at open, to skip a rewrite (and a
     /// watcher round-trip) when Save changed nothing.
@@ -109,14 +112,7 @@ impl SettingsEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let notes_root_raw = ws.settings.notes_root.clone();
-        let notes_root = cx.new(|cx| {
-            let state = InputState::new(window, cx).placeholder("~/kairn");
-            match notes_root_raw {
-                Some(raw) if !raw.is_empty() => state.default_value(raw),
-                _ => state,
-            }
-        });
+        let notes_root_choice = ws.settings.notes_root.clone().filter(|r| !r.is_empty());
         let mut rows: Vec<HostRow> = ws
             .settings
             .ssh_hosts
@@ -170,7 +166,7 @@ impl SettingsEditor {
         Self {
             workspace,
             tab: Tab::General,
-            notes_root,
+            notes_root_choice,
             rows,
             template_loaded,
             template_body,
@@ -211,7 +207,6 @@ impl SettingsEditor {
     }
 
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let raw = self.notes_root.read(cx).value().trim().to_string();
         let body = self.template_body.read(cx).value().to_string();
         let font_of = |sel: &FontSelect, loaded: &Option<String>| match sel
             .read(cx)
@@ -235,7 +230,7 @@ impl SettingsEditor {
             }
         };
         let patch = crate::vault_state::SettingsPatch {
-            notes_root: (!raw.is_empty()).then_some(raw),
+            notes_root: self.notes_root_choice.clone(),
             hosts: self.collect_hosts(cx),
             daily_template_rule: self.template_rule.clone(),
             template_body: (body != self.template_loaded).then_some(body),
@@ -279,7 +274,7 @@ impl SettingsEditor {
         let resolved = self
             .workspace
             .upgrade()
-            .map(|ws| ws.read(cx).notes_root.display().to_string())
+            .map(|ws| home_relative(&ws.read(cx).notes_root))
             .unwrap_or_default();
 
         let daily_button = |id: &'static str, label: &'static str, forward: bool| {
@@ -317,10 +312,66 @@ impl SettingsEditor {
             .gap_2()
             .w_full()
             .child(Self::section("Notes folder"))
-            .child(Input::new(&self.notes_root))
-            .child(div().text_size(px(11.)).opacity(0.55).child(format!(
-                "Currently {resolved}. A NotePlan-style folder works as-is; Calendar/, \
-                 Notes/ and .kairn/ are created if missing."
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .w_full()
+                    .child(
+                        // min_w_0: a long unbreakable path must not drive the
+                        // column's min-content width past the dialog (that
+                        // collapses sibling layouts to zero width).
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_size(px(12.5))
+                            .child(
+                                self.notes_root_choice
+                                    .clone()
+                                    .unwrap_or_else(|| "~/kairn (default)".to_string()),
+                            ),
+                    )
+                    .child(
+                        Button::new("notes-root-choose")
+                            .outline()
+                            .label("Choose folder…")
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                let rx = cx.prompt_for_paths(PathPromptOptions {
+                                    files: false,
+                                    directories: true,
+                                    multiple: false,
+                                    prompt: Some("Use this folder".into()),
+                                });
+                                cx.spawn(async move |this, cx| {
+                                    if let Ok(Ok(Some(mut paths))) = rx.await
+                                        && let Some(path) = paths.pop()
+                                    {
+                                        let _ = this.update(cx, |this, cx| {
+                                            this.notes_root_choice =
+                                                Some(home_relative(&path));
+                                            cx.notify();
+                                        });
+                                    }
+                                })
+                                .detach();
+                            })),
+                    )
+                    .when(self.notes_root_choice.is_some(), |this| {
+                        this.child(
+                            Button::new("notes-root-default")
+                                .ghost()
+                                .label("Use default")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.notes_root_choice = None;
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
+            .child(div().min_w_0().text_size(px(11.)).opacity(0.55).child(format!(
+                "Currently {resolved}; a change lands on Save. A NotePlan-style folder \
+                 works as-is; Calendar/, Notes/ and .kairn/ are created if missing."
             )))
             .child(Self::section("Sidebar daily list"))
             .child(
@@ -554,6 +605,15 @@ impl Render for SettingsEditor {
                             })),
                     ),
             )
+    }
+}
+
+/// A path for display: home-relative (`~/...`) when it is under $HOME.
+fn home_relative(p: &std::path::Path) -> String {
+    let s = p.display().to_string();
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() && s.starts_with(&h) => format!("~{}", &s[h.len()..]),
+        _ => s,
     }
 }
 
