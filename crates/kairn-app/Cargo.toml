@@ -28,3 +28,51 @@ futures = "0.3"
 anyhow = "1"
 parking_lot = "0.12"
 chrono = "0.4"
+
+# cargo-packager: bundles the app for distribution (.app/.dmg on macOS,
+# .deb/.AppImage on Linux). macOS signing + notarization live in
+# scripts/package-macos.sh, not here, so cargo-packager builds an unsigned
+# bundle and the script signs it with the Developer ID identity. Keys are
+# kebab-case in Cargo.toml metadata.
+[package.metadata.packager]
+product-name = "Kairn"
+identifier = "com.kairnai.kairn"
+category = "Productivity"
+description = "Your notes and your terminals in one calm, native window."
+icons = [
+    "icons/icon.icns",
+    "icons/32x32.png",
+    "icons/128x128.png",
+    "icons/256x256.png",
+    "icons/512x512.png",
+]
+# Builds both the app and the `kairn` CLI so the CLI can be bundled alongside
+# it (the app installs it onto PATH from inside the bundle). On macOS this
+# produces universal (Apple Silicon + Intel) binaries; on Linux, native.
+# Runs from this crate's dir, so reach the workspace-root script by relative
+# path; the script itself resolves the repo root via BASH_SOURCE.
+before-packaging-command = "bash ../../scripts/prep-binaries.sh"
+
+# The GUI (main) plus the agent-facing `kairn` CLI, both dropped into the
+# bundle's binary dir so the in-app "Install CLI" action can symlink it.
+[[package.metadata.packager.binaries]]
+path = "kairn-app"
+main = true
+
+[[package.metadata.packager.binaries]]
+path = "kairn"
+main = false
+
+[package.metadata.packager.macos]
+minimum-system-version = "15.0"
+
+[package.metadata.packager.deb]
+# Runtime libraries GPUI needs (Vulkan renderer, Wayland/X11, fontconfig, ALSA).
+depends = [
+    "libfontconfig1",
+    "libwayland-client0",
+    "libxkbcommon0",
+    "libxkbcommon-x11-0",
+    "libvulkan1",
+    "libasound2",
+]

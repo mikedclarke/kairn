@@ -14,7 +14,7 @@ those files, not a chat panel bolted on.
 Built in Rust on [GPUI](https://www.gpui.rs) (Zed's UI framework). One codebase for
 macOS and Linux. Not Electron.
 
-![Kairn: daily note, tasks, and calendar beside a terminal session](docs/screenshot.jpg)
+![Kairn: daily note, tasks, and calendar beside a terminal session](docs/screenshot.png)
 
 ## Why
 
@@ -125,7 +125,25 @@ kairn backlinks <title>  Lines elsewhere that link to a note
 Global flags: `--root <dir>` (or `$KAIRN_ROOT`), `--json`, `--actor <name>`. Exit codes
 are part of the interface: 0 success, 1 failure, 2 bad usage, 3 no match, 4 ambiguous.
 
+## Install
+
+Download the latest build for your platform from the
+[releases page](https://github.com/mikedclarke/kairn/releases):
+
+- **macOS** — open `Kairn-<version>.dmg` and drag Kairn to Applications. The build is
+  signed and notarized, so it opens without a Gatekeeper prompt. Universal binary (Apple
+  Silicon and Intel), macOS 15 or later.
+- **Linux** — the `.AppImage` runs on any distribution (`chmod +x` it, then run); the
+  `.deb` installs on Debian and Ubuntu (`sudo dpkg -i kairn_<version>_amd64.deb`). Both add
+  Kairn to your application launcher.
+
+To use the `kairn` CLI from any terminal, open Settings → General and click **Install kairn
+command**, which links the bundled CLI onto your PATH. The Linux packages already put
+`kairn` on PATH.
+
 ## Build and run
+
+To build from source instead of installing a release:
 
 Rust stable via [rustup](https://rustup.rs); edition 2024 needs a 2025+ toolchain.
 
@@ -155,8 +173,6 @@ Ctrl+J and friends); the full reference lives in Settings → Keybinds.
 
 ## Roadmap
 
-- Packaged releases: .dmg for macOS, AppImage/deb for Linux
-- A localhost MCP server in the app process, alongside the CLI
 - Deeper period notes (weekly/monthly/quarterly reviews)
 
 ## Contributing, changelog, license

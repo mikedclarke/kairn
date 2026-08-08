@@ -13,6 +13,7 @@ use gpui_component::{
 
 use kairn_core::settings::SshHost;
 use kairn_core::themes::ThemeEntry;
+use crate::cli_install;
 use crate::keymap::keybind_list;
 use crate::theme::KairnThemeExt as _;
 use crate::ui::kbd;
@@ -70,6 +71,8 @@ pub struct SettingsEditor {
     /// Font settings as loaded, kept so a font that isn't installed on this
     /// machine (empty picker selection) survives a Save untouched.
     fonts_loaded: (Option<String>, Option<String>, Option<String>, Option<f32>),
+    /// Result line under the "Install kairn command" button, set on click.
+    cli_status: Option<String>,
 }
 
 struct HostRow {
@@ -177,6 +180,7 @@ impl SettingsEditor {
             editor_font,
             mono_font,
             editor_size,
+            cli_status: None,
             fonts_loaded: (
                 ws.settings.ui_font.clone(),
                 ws.settings.editor_font.clone(),
@@ -398,6 +402,8 @@ impl SettingsEditor {
             .child(div().text_size(px(11.)).opacity(0.55).child(
                 "The pill row of timed lines (09:00 standup) at the top of a daily note.",
             ))
+            .child(Self::section("Command line tool"))
+            .child(self.render_cli(cx))
             .child(Self::section("About"))
             .child(
                 div()
@@ -405,6 +411,54 @@ impl SettingsEditor {
                     .opacity(0.55)
                     .child(concat!("Kairn ", env!("CARGO_PKG_VERSION"))),
             )
+    }
+
+    fn render_cli(&self, cx: &mut Context<Self>) -> gpui::Div {
+        if cli_install::already_installed() {
+            return div().text_size(px(11.)).opacity(0.55).child(
+                "The kairn command is on your PATH. Terminals and agents can run it directly.",
+            );
+        }
+        v_flex()
+            .gap_2()
+            .child(div().text_size(px(11.)).opacity(0.55).child(
+                "Add the kairn command to your PATH so terminals and agents can read notes, \
+                 list tasks, and capture from the command line.",
+            ))
+            .child(
+                Button::new("cli-install")
+                    .outline()
+                    .label("Install kairn command")
+                    // Run off the UI thread: the install may raise a native
+                    // admin-auth prompt, which must not block rendering.
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        let install =
+                            cx.background_executor().spawn(async { cli_install::install() });
+                        cx.spawn(async move |this, cx| {
+                            let msg = match install.await {
+                                cli_install::Outcome::Linked(p) => {
+                                    format!("Installed to {}.", p.display())
+                                }
+                                cli_install::Outcome::Manual { reason, command }
+                                    if command.is_empty() =>
+                                {
+                                    reason
+                                }
+                                cli_install::Outcome::Manual { reason, command } => {
+                                    format!("{reason} Run this in a terminal: {command}")
+                                }
+                            };
+                            let _ = this.update(cx, |this, cx| {
+                                this.cli_status = Some(msg);
+                                cx.notify();
+                            });
+                        })
+                        .detach();
+                    })),
+            )
+            .when_some(self.cli_status.clone(), |this, s| {
+                this.child(div().text_size(px(11.)).opacity(0.7).child(s))
+            })
     }
 
     fn render_theme(&self, cx: &mut Context<Self>) -> gpui::Div {
