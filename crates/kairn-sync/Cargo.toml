@@ -18,6 +18,11 @@ serde_json = "1"
 blake3 = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# The concrete HTTP transport (spec §10), behind the `http` feature. `ureq` is a
+# blocking, runtime-free client so the engine stays async-free and cross-compiles
+# to iOS; TLS is off on purpose (v1 is plain HTTP over the tailnet, spec §3).
+ureq = { version = "2", default-features = false, optional = true }
+
 # The embedded filesystem watcher is a desktop-only immediacy optimisation;
 # correctness comes from the periodic scan and explicit sync_now(), so iOS
 # (which has no persistent watcher) simply builds without it.
@@ -28,3 +33,7 @@ notify = "8"
 # Exposes the in-memory fake server outside tests so the real server crate
 # (GDL-672) can reuse it as a conformance oracle.
 testkit = []
+# The concrete HTTP transport (`HttpTransport`). Off by default so pure-logic
+# users (and the engine's own tests) never pull an HTTP client; the iOS bridge
+# and the desktop app enable it.
+http = ["dep:ureq"]

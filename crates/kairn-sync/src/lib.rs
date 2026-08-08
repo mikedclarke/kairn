@@ -17,6 +17,8 @@
 pub mod cycle;
 pub mod engine;
 pub mod hash;
+#[cfg(feature = "http")]
+pub mod http;
 pub mod ignore;
 pub mod resolve;
 pub mod state;
@@ -31,5 +33,7 @@ pub use engine::{EngineConfig, SyncEngine};
 #[cfg(any(test, feature = "testkit"))]
 pub mod fakeserver;
 
+#[cfg(feature = "http")]
+pub use http::HttpTransport;
 pub use transport::{Transport, TransportError};
 pub use types::*;
