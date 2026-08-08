@@ -67,6 +67,9 @@ main = false
 minimum-system-version = "15.0"
 
 [package.metadata.packager.deb]
+# The Debian package name (defaults to the main binary "kairn-app"; the product
+# is "kairn"). The file is renamed to match in scripts/package-linux.sh.
+package-name = "kairn"
 # Runtime libraries GPUI needs (Vulkan renderer, Wayland/X11, fontconfig, ALSA).
 depends = [
     "libfontconfig1",
