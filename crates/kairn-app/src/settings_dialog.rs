@@ -16,7 +16,7 @@ use kairn_core::themes::ThemeEntry;
 use crate::cli_install;
 use crate::keymap::keybind_list;
 use crate::theme::KairnThemeExt as _;
-use crate::ui::kbd;
+use crate::ui::kbd_key;
 use crate::workspace::Workspace;
 
 /// Settings sections, one tab each; more arrive as the page grows.
@@ -693,9 +693,10 @@ impl SettingsEditor {
                 root = root.child(
                     h_flex()
                         .items_center()
-                        .py(px(2.))
-                        .child(div().flex_1().text_size(px(12.5)).child(what))
-                        .child(kbd(&t, chord)),
+                        .gap_2()
+                        .py(px(3.))
+                        .child(div().flex_1().text_size(px(13.)).child(what))
+                        .child(kbd_key(&t, chord)),
                 );
             }
         }

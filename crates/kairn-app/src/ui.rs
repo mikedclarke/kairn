@@ -53,6 +53,23 @@ pub fn kbd(t: &KairnTheme, label: impl Into<SharedString>) -> gpui::Div {
         .child(label.into())
 }
 
+/// A larger, full-contrast key chip for the settings keybinds list, where the
+/// binding is the content and must be easy to read at a glance. The subtle
+/// [`kbd`] chip is for inline hints in the chrome, not for reading off.
+pub fn kbd_key(t: &KairnTheme, label: impl Into<SharedString>) -> gpui::Div {
+    div()
+        .font_family(t.mono_font.clone())
+        .text_size(px(14.))
+        .text_color(t.text)
+        .border_1()
+        .border_color(t.border)
+        .rounded(px(5.))
+        .px(px(6.))
+        .py(px(1.))
+        .bg(t.bg)
+        .child(label.into())
+}
+
 pub(crate) fn picker_item<T: 'static>(
     t: &KairnTheme,
     id: impl Into<gpui::ElementId>,

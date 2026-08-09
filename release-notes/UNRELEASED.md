@@ -29,6 +29,7 @@ same fact twice; no em dashes. Rewrite to this standard before releasing.
 - The font pickers offer a curated set of installed families instead of every font on the system.
 - The text selection highlight is clearer and no longer dims the selected text.
 - Completing a task no longer writes an @done(date) stamp, since the note's day already dates it.
+- The keybindings list in Settings shows larger, higher-contrast key chips that are easier to read.
 
 ## Fixed
 
