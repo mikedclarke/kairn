@@ -14,7 +14,7 @@ XCFramework, `KairnFFI`, built from this workspace via UniFFI.
 - **kairn-sync** — the sync value types the phone's background handlers consume
   (`SyncCycleReport`, `SyncEngineStatus`, `FfiSyncEvent`). These are designed in
   now so the live engine object slots into this same framework with the concrete
-  transport (GDL-675), not a second bridge. kairn-sync is already compiled into
+  transport, not a second bridge. kairn-sync is already compiled into
   the iOS slices today.
 
 The wrappers hold no logic of their own beyond mapping types across the FFI, so

@@ -15,16 +15,16 @@
 //! sub-second freshness is a later optimisation (spec §12).
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 
+use kairn_sync::HttpTransport;
 use kairn_sync::engine::{EngineConfig, SyncEngine};
 use kairn_sync::types::{CycleReport, SyncEvent};
-use kairn_sync::HttpTransport;
 
 /// Mirror a notes folder to a Kairn sync server (headless bridge mode).
 #[derive(Parser, Debug)]
@@ -34,8 +34,9 @@ struct Args {
     #[arg(long, value_name = "DIR")]
     notes: PathBuf,
 
-    /// The sync server origin (scheme + host + port).
-    #[arg(long, env = "KAIRN_BRIDGE_SERVER", default_value = "http://100.121.119.52:8787")]
+    /// The sync server origin (scheme + host + port). Required: a default here
+    /// would silently point a vault at whichever host that address happens to be.
+    #[arg(long, env = "KAIRN_BRIDGE_SERVER")]
     server: String,
 
     /// The vault id on the server.
@@ -64,10 +65,22 @@ struct Args {
     #[arg(long, default_value_t = 3)]
     interval: u64,
 
+    /// Let one cycle push deletes for more than a handful of files. Off by
+    /// default: a notes folder that suddenly reads as mostly-empty is usually a
+    /// volume that failed to mount, and those tombstones reach every device.
+    /// Pass this only after checking the folder is really as you left it.
+    #[arg(long)]
+    allow_bulk_delete: bool,
+
     /// Run a single cycle and exit (useful for a one-off push or a smoke test).
     #[arg(long)]
     once: bool,
 }
+
+/// The longest the bridge waits between retries after repeated failures. A
+/// revoked token or a server that is down should not mean a request and a log
+/// line every few seconds until someone notices.
+const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -89,6 +102,9 @@ fn main() -> Result<()> {
             vault_root: notes.clone(),
             state_db,
             device_label: args.device_label.clone(),
+            server_url: Some(args.server.clone()),
+            vault_id: Some(args.vault.clone()),
+            allow_bulk_delete: args.allow_bulk_delete,
         },
         Box::new(transport),
         Box::new(on_event),
@@ -115,15 +131,28 @@ fn main() -> Result<()> {
             .context("failed to install signal handler")?;
     }
 
+    let mut failures: u32 = 0;
     while running.load(Ordering::SeqCst) {
         match engine.sync_now() {
-            Ok(report) => report_cycle(report),
+            Ok(report) => {
+                if failures > 0 {
+                    log("recovered; back to the normal interval");
+                }
+                failures = 0;
+                report_cycle(report);
+            }
             // A cycle error (server down, token rejected) is logged, not fatal:
-            // the next cycle retries, so a transient outage self-heals.
-            Err(e) => log(&format!("cycle error: {e:#}")),
+            // the next cycle retries, so a transient outage self-heals. What
+            // does not self-heal — a revoked token, a server that has moved —
+            // backs off instead of hammering the server and the log forever.
+            Err(e) => {
+                failures = failures.saturating_add(1);
+                log(&format!("cycle error (attempt {failures}): {e:#}"));
+            }
         }
         // Sleep in small slices so Ctrl-C / SIGTERM is responsive.
-        for _ in 0..(args.interval * 10) {
+        let wait = backoff(Duration::from_secs(args.interval), failures);
+        for _ in 0..(wait.as_millis() / 100) {
             if !running.load(Ordering::SeqCst) {
                 break;
             }
@@ -133,6 +162,16 @@ fn main() -> Result<()> {
 
     log("bridge stopping");
     Ok(())
+}
+
+/// How long to wait before the next cycle: the poll interval while things work,
+/// doubling per consecutive failure up to [`MAX_BACKOFF`].
+fn backoff(interval: Duration, failures: u32) -> Duration {
+    if failures == 0 {
+        return interval;
+    }
+    let factor = 1u32 << failures.min(16).saturating_sub(1);
+    interval.saturating_mul(factor).min(MAX_BACKOFF)
 }
 
 /// Resolve the token from `--token`, then `--token-file`, then the environment.
@@ -185,7 +224,9 @@ fn report_cycle(r: CycleReport) {
 fn on_event(e: SyncEvent) {
     match e {
         SyncEvent::ConflictCopyCreated { original, copy } => {
-            log(&format!("conflict on {original}: kept your version as {copy}"));
+            log(&format!(
+                "conflict on {original}: kept your version as {copy}"
+            ));
         }
         SyncEvent::Error(msg) => log(&format!("engine error: {msg}")),
         SyncEvent::CycleFinished(_) | SyncEvent::AboutToWrite(_) => {}
@@ -193,5 +234,25 @@ fn on_event(e: SyncEvent) {
 }
 
 fn log(msg: &str) {
-    println!("[{}] {msg}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+    println!(
+        "[{}] {msg}",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_doubles_then_settles_at_the_ceiling() {
+        let base = Duration::from_secs(3);
+        assert_eq!(backoff(base, 0), base);
+        assert_eq!(backoff(base, 1), base);
+        assert_eq!(backoff(base, 2), Duration::from_secs(6));
+        assert_eq!(backoff(base, 4), Duration::from_secs(24));
+        // A revoked token retries every five minutes, not every three seconds.
+        assert_eq!(backoff(base, 20), MAX_BACKOFF);
+        assert_eq!(backoff(base, u32::MAX), MAX_BACKOFF);
+    }
 }

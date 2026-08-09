@@ -194,13 +194,29 @@ fn atomic_write(path: &Path, content: &str) -> io::Result<()> {
         COUNTER.fetch_add(1, Ordering::Relaxed),
     ));
     let write = (|| {
-        fs::write(&tmp, content)?;
+        {
+            use std::io::Write as _;
+            let mut file = fs::File::create(&tmp)?;
+            file.write_all(content.as_bytes())?;
+            // Rename is atomic for the *name*, not for the data behind it: with
+            // no fsync here a power cut can leave the renamed file holding
+            // stale or empty blocks, which is a silently lost edit rather than
+            // a half-written note.
+            file.sync_all()?;
+        }
         // Rename replaces the inode; carry the original's permissions over
         // so a private note (0600) doesn't silently become world-readable.
         if let Ok(meta) = fs::metadata(path) {
             fs::set_permissions(&tmp, meta.permissions())?;
         }
-        fs::rename(&tmp, path)
+        fs::rename(&tmp, path)?;
+        // The new directory entry is durable only once the directory itself is
+        // synced. Not every platform allows opening a directory for that, so a
+        // failure here is not fatal.
+        if let Some(dir) = path.parent() {
+            let _ = fs::File::open(dir).and_then(|d| d.sync_all());
+        }
+        Ok(())
     })();
     if write.is_err() {
         let _ = fs::remove_file(&tmp);

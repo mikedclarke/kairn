@@ -2,7 +2,7 @@
 //! single ordering authority, its append-only journal, and a content-addressed
 //! blob store, with compare-and-swap on every write. It is the conformance
 //! oracle the engine's tests run against (spec §16) and — behind the `testkit`
-//! feature — is reusable by the real server crate (GDL-672) to check its own
+//! feature — is reusable by the real server crate to check its own
 //! behaviour against the same model.
 //!
 //! One [`FakeServer`] is shared by any number of [`FakeClient`]s, each carrying

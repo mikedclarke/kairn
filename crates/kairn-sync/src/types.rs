@@ -1,6 +1,6 @@
 //! The vocabulary of the sync protocol (spec §2, §5). Kept to plain structs
 //! and enums with named fields so the same shapes survive the UniFFI boundary
-//! (GDL-679) without rework: no generics, no lifetimes, no tuple variants in
+//! without rework: no generics, no lifetimes, no tuple variants in
 //! anything the engine hands out.
 
 use serde::{Deserialize, Serialize};
@@ -152,6 +152,18 @@ pub struct CycleReport {
     pub conflicts: u32,
     /// Cursor after this cycle's ack.
     pub cursor: Seq,
+}
+
+/// Cycle policy the host sets. Everything here is a safety valve, not a tuning
+/// knob: the defaults are what a vault should run with.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncConfig {
+    /// Allow a single cycle to push deletes for an unbounded number of paths.
+    /// Off by default: a vault that suddenly reads as mostly-deleted is an
+    /// unmounted volume, a re-pointed root, or a half-populated folder far more
+    /// often than it is a real mass delete, and those tombstones propagate to
+    /// every device (invariant §15.2).
+    pub allow_bulk_delete: bool,
 }
 
 /// A snapshot of engine state for the host UI (spec §14).

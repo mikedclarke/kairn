@@ -7,9 +7,10 @@
 //! calls `sync_now()` from its foreground and background-fetch/push handlers
 //! (there is no persistent watcher there, so the watcher simply isn't built).
 //! The shapes here are UniFFI-friendly (plain config in, plain report out, an
-//! event callback) so GDL-679 can wrap them without reshaping the engine.
+//! event callback) so the iOS bridge can wrap them without reshaping the engine.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -19,7 +20,7 @@ use anyhow::Result;
 use crate::cycle::{SyncContext, run_cycle};
 use crate::state::StateStore;
 use crate::transport::Transport;
-use crate::types::{CycleReport, SyncEvent, SyncStatus};
+use crate::types::{CycleReport, SyncConfig, SyncEvent, SyncStatus};
 use crate::vaultio::VaultIo;
 
 /// The safety-net full cycle interval when nothing wakes the engine sooner
@@ -34,6 +35,14 @@ pub struct EngineConfig {
     pub state_db: PathBuf,
     /// The label stamped into conflict-copy names, e.g. `IPHONE` (spec §8).
     pub device_label: String,
+    /// The server origin this engine talks to, recorded in the state DB so the
+    /// store can refuse to be reused against a different one. `None` skips the
+    /// check (an engine over a fake transport has no URL).
+    pub server_url: Option<String>,
+    /// The vault id on that server, recorded for the same reason.
+    pub vault_id: Option<String>,
+    /// Let a cycle push an unbounded number of deletes (see [`SyncConfig`]).
+    pub allow_bulk_delete: bool,
 }
 
 /// The mutable half, guarded so a cycle never overlaps itself. A cycle is
@@ -42,7 +51,19 @@ struct Inner {
     state: StateStore,
     vault: VaultIo,
     transport: Box<dyn Transport>,
+}
+
+/// Everything a cycle needs that outlives one call, shared with the worker
+/// thread. The event sink lives here rather than inside [`Inner`] so the
+/// terminal event of a cycle can be delivered with the cycle lock already
+/// released: a listener that calls back into the engine then blocks nothing.
+struct Shared {
+    inner: Mutex<Inner>,
+    status: Mutex<SyncStatus>,
     emit: Box<dyn Fn(SyncEvent) + Send + Sync>,
+    config: SyncConfig,
+    /// Set by `stop()`, checked by the cycle between transport calls.
+    cancel: AtomicBool,
 }
 
 struct Worker {
@@ -60,8 +81,7 @@ struct WakeState {
 }
 
 pub struct SyncEngine {
-    inner: Arc<Mutex<Inner>>,
-    status: Arc<Mutex<SyncStatus>>,
+    shared: Arc<Shared>,
     worker: Mutex<Option<Worker>>,
     vault_root: PathBuf,
     /// The worker waits on the condvar; the watcher sets `pending` and notifies
@@ -70,39 +90,54 @@ pub struct SyncEngine {
 }
 
 impl SyncEngine {
-    /// Build an engine over `transport`, delivering events to `on_event`. The
-    /// event callback must not call back into the engine (it runs while the
-    /// cycle lock is held).
+    /// Build an engine over `transport`, delivering events to `on_event`.
+    /// Events raised *during* a cycle arrive while the cycle lock is held, so a
+    /// listener must not call back into the engine from one.
+    ///
+    /// Fails when the state store cannot be opened, when another engine already
+    /// holds it, or when it belongs to a different vault or server (spec §6).
     pub fn new(
         config: EngineConfig,
         transport: Box<dyn Transport>,
         on_event: Box<dyn Fn(SyncEvent) + Send + Sync>,
     ) -> Result<Self> {
         let state = StateStore::open(&config.state_db)?;
+        state.bind_identity(
+            &config.vault_root,
+            config.server_url.as_deref(),
+            config.vault_id.as_deref(),
+        )?;
         let vault = VaultIo::new(&config.vault_root, &config.device_label);
         Ok(Self {
-            inner: Arc::new(Mutex::new(Inner {
-                state,
-                vault,
-                transport,
+            shared: Arc::new(Shared {
+                inner: Mutex::new(Inner {
+                    state,
+                    vault,
+                    transport,
+                }),
+                status: Mutex::new(SyncStatus::default()),
                 emit: on_event,
-            })),
-            status: Arc::new(Mutex::new(SyncStatus::default())),
+                config: SyncConfig {
+                    allow_bulk_delete: config.allow_bulk_delete,
+                },
+                cancel: AtomicBool::new(false),
+            }),
             worker: Mutex::new(None),
             vault_root: config.vault_root,
             wake: Arc::new((Mutex::new(WakeState::default()), Condvar::new())),
         })
     }
 
-    /// Run one cycle now and return what it did. Safe to call from any thread
-    /// and while the background worker is running (cycles are serialised).
+    /// Run one cycle now and return what it did. Blocking (it talks to the
+    /// server), so never call it on a UI thread. Safe from any other thread, and
+    /// while the background worker is running: cycles are serialised.
     pub fn sync_now(&self) -> Result<CycleReport> {
-        run_once(&self.inner, &self.status)
+        run_once(&self.shared)
     }
 
     /// A snapshot of engine state for the host UI (spec §14).
     pub fn status(&self) -> SyncStatus {
-        let mut s = self.status.lock().unwrap().clone();
+        let mut s = self.shared.status.lock().unwrap().clone();
         s.running = self.worker.lock().unwrap().is_some();
         s
     }
@@ -116,28 +151,32 @@ impl SyncEngine {
             return;
         }
         *self.wake.0.lock().unwrap() = WakeState::default();
-        let inner = self.inner.clone();
-        let status = self.status.clone();
+        self.shared.cancel.store(false, Ordering::SeqCst);
+        let shared = self.shared.clone();
         let wake = self.wake.clone();
         let root = self.vault_root.clone();
-        let handle = std::thread::spawn(move || worker_loop(inner, status, wake, root));
+        let handle = std::thread::spawn(move || worker_loop(shared, wake, root));
         *w = Some(Worker { handle });
-        self.status.lock().unwrap().running = true;
+        self.shared.status.lock().unwrap().running = true;
     }
 
-    /// Stop the background worker and wait for it to finish its current cycle.
-    /// Idempotent. iOS calls this on protected-data-unavailable (locked phone).
+    /// Stop the background worker and wait for it to finish. Idempotent. iOS
+    /// calls this on protected-data-unavailable (locked phone), inside a short
+    /// background window, so an in-flight cycle is cancelled at its next step
+    /// boundary rather than run to completion behind a two-minute HTTP timeout.
     pub fn stop(&self) {
         let worker = self.worker.lock().unwrap().take();
         if let Some(w) = worker {
+            self.shared.cancel.store(true, Ordering::SeqCst);
             {
                 let (lock, cvar) = &*self.wake;
                 lock.lock().unwrap().stop = true;
                 cvar.notify_all();
             }
             let _ = w.handle.join();
+            self.shared.cancel.store(false, Ordering::SeqCst);
         }
-        self.status.lock().unwrap().running = false;
+        self.shared.status.lock().unwrap().running = false;
     }
 }
 
@@ -147,40 +186,44 @@ impl Drop for SyncEngine {
     }
 }
 
-/// Run one cycle under the lock and fold the outcome into `status`, emitting the
-/// terminal event. The lock order is always inner → status.
-fn run_once(inner: &Mutex<Inner>, status: &Mutex<SyncStatus>) -> Result<CycleReport> {
-    let guard = inner.lock().unwrap();
-    let ctx = SyncContext {
-        transport: guard.transport.as_ref(),
-        state: &guard.state,
-        vault: &guard.vault,
-        emit: &*guard.emit,
+/// Run one cycle under the cycle lock, fold the outcome into `status`, then
+/// deliver the terminal event with both locks released, so a listener that calls
+/// straight back into the engine cannot deadlock.
+fn run_once(shared: &Shared) -> Result<CycleReport> {
+    let result = {
+        let guard = shared.inner.lock().unwrap();
+        let cancel = || shared.cancel.load(Ordering::SeqCst);
+        let ctx = SyncContext {
+            transport: guard.transport.as_ref(),
+            state: &guard.state,
+            vault: &guard.vault,
+            emit: &*shared.emit,
+            config: &shared.config,
+            cancel: &cancel,
+        };
+        run_cycle(&ctx)
     };
-    let result = run_cycle(&ctx);
-    let mut s = status.lock().unwrap();
-    match &result {
-        Ok(report) => {
-            s.cursor = report.cursor;
-            s.last_cycle = Some(report.clone());
-            s.last_error = None;
-            (guard.emit)(SyncEvent::CycleFinished(report.clone()));
+    let event = {
+        let mut s = shared.status.lock().unwrap();
+        match &result {
+            Ok(report) => {
+                s.cursor = report.cursor;
+                s.last_cycle = Some(report.clone());
+                s.last_error = None;
+                SyncEvent::CycleFinished(report.clone())
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                s.last_error = Some(msg.clone());
+                SyncEvent::Error(msg)
+            }
         }
-        Err(e) => {
-            let msg = e.to_string();
-            s.last_error = Some(msg.clone());
-            (guard.emit)(SyncEvent::Error(msg));
-        }
-    }
+    };
+    (shared.emit)(event);
     result
 }
 
-fn worker_loop(
-    inner: Arc<Mutex<Inner>>,
-    status: Arc<Mutex<SyncStatus>>,
-    wake: Arc<(Mutex<WakeState>, Condvar)>,
-    root: PathBuf,
-) {
+fn worker_loop(shared: Arc<Shared>, wake: Arc<(Mutex<WakeState>, Condvar)>, root: PathBuf) {
     // The watcher lives for the thread's lifetime and is dropped (unwatched)
     // when the loop exits. On iOS it is never built (no persistent watcher).
     #[cfg(not(target_os = "ios"))]
@@ -189,7 +232,7 @@ fn worker_loop(
     let _ = &root;
 
     loop {
-        let _ = run_once(&inner, &status);
+        let _ = run_once(&shared);
         let (lock, cvar) = &*wake;
         let mut g = lock.lock().unwrap();
         if g.stop {
@@ -264,16 +307,27 @@ mod tests {
         }
 
         fn engine(&self, server: &FakeServer, label: &str) -> SyncEngine {
+            self.try_engine(server, label, &self.root).unwrap()
+        }
+
+        fn try_engine(
+            &self,
+            server: &FakeServer,
+            label: &str,
+            root: &std::path::Path,
+        ) -> Result<SyncEngine> {
             SyncEngine::new(
                 EngineConfig {
-                    vault_root: self.root.clone(),
+                    vault_root: root.to_path_buf(),
                     state_db: self.state_db.clone(),
                     device_label: label.to_uppercase(),
+                    server_url: Some("http://mini:8787".into()),
+                    vault_id: Some("default".into()),
+                    allow_bulk_delete: false,
                 },
                 Box::new(server.client(label)),
                 Box::new(|_e| {}),
             )
-            .unwrap()
         }
     }
 
@@ -323,6 +377,37 @@ mod tests {
 
         engine.stop();
         assert!(!engine.status().running);
+    }
+
+    #[test]
+    fn a_state_db_bound_to_another_folder_refuses_to_open() {
+        // Re-pointing an engine at a different folder while keeping its state
+        // would read as a vault-wide delete; it must not get that far.
+        let server = FakeServer::new();
+        let fx = Fixture::new("bound");
+        drop(fx.engine(&server, "mac"));
+        let other = fx.root.parent().unwrap().join("other-vault");
+        std::fs::create_dir_all(&other).unwrap();
+        let err = fx
+            .try_engine(&server, "mac", &other)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("Refusing to run"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_second_engine_over_the_same_state_db_refuses_to_start() {
+        let server = FakeServer::new();
+        let fx = Fixture::new("solo");
+        let _first = fx.engine(&server, "mac");
+        let err = fx
+            .try_engine(&server, "mac", &fx.root)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("already running"), "{err}");
     }
 
     #[test]

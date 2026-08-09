@@ -23,6 +23,11 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # to iOS; TLS is off on purpose (v1 is plain HTTP over the tailnet, spec §3).
 ureq = { version = "2", default-features = false, optional = true }
 
+# `flock` on the state database: the single-instance guard that keeps two
+# engines from interleaving cycles over one vault (spec §3).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # The embedded filesystem watcher is a desktop-only immediacy optimisation;
 # correctness comes from the periodic scan and explicit sync_now(), so iOS
 # (which has no persistent watcher) simply builds without it.
@@ -31,7 +36,7 @@ notify = "8"
 
 [features]
 # Exposes the in-memory fake server outside tests so the real server crate
-# (GDL-672) can reuse it as a conformance oracle.
+# can reuse it as a conformance oracle.
 testkit = []
 # The concrete HTTP transport (`HttpTransport`). Off by default so pure-logic
 # users (and the engine's own tests) never pull an HTTP client; the iOS bridge

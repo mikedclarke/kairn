@@ -12,7 +12,7 @@
 //!
 //! The server is reached through the [`Transport`] trait, so the engine is
 //! fully testable against an in-memory fake (spec §16); the concrete HTTP and
-//! WebSocket transport lands with the server (GDL-672/675).
+//! WebSocket transport lands with the server.
 
 pub mod cycle;
 pub mod engine;

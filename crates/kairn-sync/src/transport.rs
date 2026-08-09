@@ -1,7 +1,7 @@
 //! The seam between the engine and the server (spec §10). A synchronous trait
 //! so the engine stays runtime-free; the in-memory fake (`fakeserver`) drives
 //! every test, and the concrete HTTP/WebSocket client implements the same trait
-//! alongside the real server (GDL-672/675).
+//! alongside the real server.
 
 use crate::types::{ChangesPage, ContentHash, PutOutcome, Rev, Seq, VaultPath};
 

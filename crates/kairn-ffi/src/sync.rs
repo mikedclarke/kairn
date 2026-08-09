@@ -143,8 +143,13 @@ impl FfiSyncEngine {
     /// (scheme + host + port), `token` the device's enrollment bearer token,
     /// `vault_root` the notes folder on device, `state_db` the sync-state
     /// database path (kept outside the vault, spec §6), and `device_label` the
-    /// tag stamped into conflict-copy names (e.g. `IPHONE`, spec §8). Fails only
-    /// if the state store cannot be opened.
+    /// tag stamped into conflict-copy names (e.g. `IPHONE`, spec §8).
+    ///
+    /// Fails if the state store cannot be opened, if another engine already
+    /// holds it, or if it belongs to a different vault or server — the store
+    /// records the identity it was created against and refuses to be reused
+    /// elsewhere, because sync state read against the wrong folder looks exactly
+    /// like every file having been deleted.
     #[uniffi::constructor]
     pub fn new(
         server_url: String,
@@ -155,7 +160,7 @@ impl FfiSyncEngine {
         device_label: String,
         listener: Box<dyn SyncEventListener>,
     ) -> Result<Arc<Self>, SyncError> {
-        let transport = HttpTransport::new(server_url, vault_id, token);
+        let transport = HttpTransport::new(server_url.clone(), vault_id.clone(), token);
         let on_event: Box<dyn Fn(SyncEvent) + Send + Sync> =
             Box::new(move |e: SyncEvent| listener.on_event(e.into()));
         let inner = SyncEngine::new(
@@ -163,6 +168,12 @@ impl FfiSyncEngine {
                 vault_root: vault_root.into(),
                 state_db: state_db.into(),
                 device_label,
+                server_url: Some(server_url),
+                vault_id: Some(vault_id),
+                // The phone never bulk-deletes: a vault that suddenly reads as
+                // empty there is a container that failed to mount, not an
+                // intention (spec §15.2).
+                allow_bulk_delete: false,
             },
             Box::new(transport),
             on_event,
@@ -171,9 +182,13 @@ impl FfiSyncEngine {
         Ok(Arc::new(Self { inner }))
     }
 
-    /// Run one full sync cycle now and return what it did. Safe to call from any
-    /// thread; the phone calls this on foreground and from its
-    /// background-fetch/push handlers (spec §7, §12).
+    /// Run one full sync cycle now and return what it did. The phone calls this
+    /// on foreground and from its background-fetch/push handlers (spec §7, §12).
+    ///
+    /// **Never call this on the main thread.** It blocks for the whole cycle,
+    /// which is network-bound and can run to the transport's two-minute ceiling
+    /// on a bad link; dispatch it to a background queue and hand the report back
+    /// to the main thread.
     pub fn sync_now(&self) -> Result<SyncCycleReport, SyncError> {
         self.inner
             .sync_now()
@@ -183,13 +198,18 @@ impl FfiSyncEngine {
 
     /// Start the background worker (an immediate cycle, then a safety-timer
     /// cadence). Idempotent. The phone typically drives cycles explicitly
-    /// instead, but this exists for parity with desktop.
+    /// instead, but this exists for parity with desktop. Returns immediately;
+    /// the cycles run on the engine's own thread.
     pub fn start(&self) {
         self.inner.start();
     }
 
-    /// Stop the background worker, waiting for any in-flight cycle. Idempotent.
-    /// The phone calls this when protected data becomes unavailable (locked).
+    /// Stop the background worker, waiting for the in-flight cycle to reach its
+    /// next step boundary (it is cancelled there rather than run to completion,
+    /// so this returns promptly even mid-request). Idempotent. The phone calls
+    /// this when protected data becomes unavailable (locked).
+    ///
+    /// **Never call this on the main thread**: it joins the worker thread.
     pub fn stop(&self) {
         self.inner.stop();
     }

@@ -13,9 +13,9 @@
 //! - [`tasks`]   task toggling and rescheduling
 //! - [`vault`]   the vault's daily-note naming convention
 //! - [`text`]    UTF-16 <-> byte offset helpers for TextKit
-//! - [`sync`]    the sync value types the phone's background handlers consume;
-//!               the live engine object lands with the concrete transport
-//!               (GDL-675), reusing this same framework.
+//! - [`sync`]  the sync value types the phone's background handlers consume;
+//!   the live engine object lands with the concrete transport, reusing this
+//!   same framework.
 //!
 //! ## Offsets
 //! Every offset crossing this boundary is a **UTF-8 byte offset**, matching

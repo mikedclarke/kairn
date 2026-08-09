@@ -31,13 +31,36 @@ server's version as the file and preserves the local one as a
    ```
    echo '<token>' > ~/.kairn-bridge/token
    chmod 600 ~/.kairn-bridge/token
-   kairn-bridge --notes ~/Notes --token-file ~/.kairn-bridge/token
+   kairn-bridge --notes ~/Notes --server http://<server-host>:8787 \
+       --token-file ~/.kairn-bridge/token
    ```
 
-   Defaults: server `http://100.121.119.52:8787`, vault `default`, state DB
+   `--server` is required (or `KAIRN_BRIDGE_SERVER`): there is no default, so a
+   vault can never end up pointed at whichever machine an old address now
+   belongs to. Other defaults: vault `default`, state DB
    `~/.kairn-bridge/<vault>.db` (kept outside the notes folder so it never
    syncs), interval 3s, device label `MINI`. `--once` runs a single cycle and
    exits (handy for a first push or a smoke test).
+
+   Persistent errors (a revoked token, a server that has moved) back off
+   exponentially to one retry every five minutes, so a broken bridge doesn't
+   fill the log or hammer the server.
+
+## Safety valves
+
+- **The state DB is bound to its vault.** On first run it records the notes
+  folder, server, and vault id; on later runs a mismatch is a hard failure
+  rather than a silent re-sync. Sync state read against the wrong folder looks
+  exactly like every note having been deleted.
+- **One bridge per folder, enforced.** The engine takes an exclusive lock beside
+  the state DB (`<vault>.db.lock`) and refuses to start if another process holds
+  it — which is what happens when launchd respawns the bridge while the old one
+  is still stuck in a request.
+- **Mass deletes are refused.** If a cycle would push deletes for more than
+  `max(10, 20%)` of the tracked files, it pushes none of them, logs loudly, and
+  leaves the vault alone. Pulls and content pushes keep working. Once you have
+  checked the folder really is as you left it, re-run with
+  `--allow-bulk-delete` to let those deletions through.
 
 ## Phased rollout (the safe path)
 
@@ -47,6 +70,19 @@ server's version as the file and preserves the local one as a
 - **Phase B — go live.** Point `--notes` at the real notes folder (Syncthing may
   keep managing it; the bridge is the single bridge device). Install the launchd
   agent below so it runs always.
+
+### Sharing the folder with Syncthing
+
+Add the engine's atomic-write temp files to the folder's `.stignore` so
+Syncthing never picks one up mid-rename and shuttles a half-written note to
+another machine:
+
+```
+.*.kairn-tmp.*
+```
+
+(The engine already ignores those names, and `.stignore`, `.stfolder` and
+`.stversions`, in the other direction.)
 
 ## launchd agent (macOS, Phase B)
 

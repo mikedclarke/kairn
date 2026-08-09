@@ -3512,6 +3512,7 @@ dependencies = [
  "blake3",
  "chrono",
  "kairn-core",
+ "libc",
  "notify 8.2.0",
  "rusqlite",
  "serde",
