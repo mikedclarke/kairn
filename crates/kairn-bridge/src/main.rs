@@ -77,6 +77,10 @@ struct Args {
     once: bool,
 }
 
+/// How long the first cycle may take before the bridge says something is wrong.
+/// Generous: a cold start hashes the whole vault.
+const FIRST_CYCLE_WARN: Duration = Duration::from_secs(90);
+
 /// The longest the bridge waits between retries after repeated failures. A
 /// revoked token or a server that is down should not mean a request and a log
 /// line every few seconds until someone notices.
@@ -124,6 +128,31 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // A cycle that never returns is the one failure this loop cannot report:
+    // on macOS, opening a folder the process has no privacy grant for blocks
+    // inside opendir with no error and no timeout, so the bridge sits there
+    // looking healthy while nothing syncs. Say so out loud if the first cycle
+    // has not finished promptly.
+    let first_cycle_done = Arc::new(AtomicBool::new(false));
+    {
+        let done = first_cycle_done.clone();
+        let root = notes.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(FIRST_CYCLE_WARN);
+            if !done.load(Ordering::SeqCst) {
+                log(&format!(
+                    "still in the first cycle after {}s, with no error. The usual cause is \
+                     macOS denying this binary access to {}: a background agent cannot show \
+                     the approval prompt, so the read blocks forever. Grant the bridge Full \
+                     Disk Access in System Settings, then restart it. Note the grant follows \
+                     the binary's code signature, so an unsigned rebuild loses it.",
+                    FIRST_CYCLE_WARN.as_secs(),
+                    root.display(),
+                ));
+            }
+        });
+    }
+
     let running = Arc::new(AtomicBool::new(true));
     {
         let r = running.clone();
@@ -150,6 +179,7 @@ fn main() -> Result<()> {
                 log(&format!("cycle error (attempt {failures}): {e:#}"));
             }
         }
+        first_cycle_done.store(true, Ordering::SeqCst);
         // Sleep in small slices so Ctrl-C / SIGTERM is responsive.
         let wait = backoff(Duration::from_secs(args.interval), failures);
         for _ in 0..(wait.as_millis() / 100) {

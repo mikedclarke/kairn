@@ -86,6 +86,27 @@ another machine:
 
 ## launchd agent (macOS, Phase B)
 
+> **macOS privacy permission: read this before you redeploy.** If the notes
+> folder lives somewhere macOS protects (`~/Documents`, `~/Desktop`, iCloud
+> Drive), the bridge needs **Full Disk Access**. A background agent cannot show
+> the approval prompt, so without the grant `opendir` on the vault **blocks
+> forever**: the process stays alive, logs no error, and silently syncs nothing.
+>
+> The grant follows the binary's code signature, so an ad-hoc (unsigned) build
+> loses it on every rebuild. Sign the deployed binary with a stable identity
+> once, and the grant survives future rebuilds:
+>
+> ```sh
+> codesign --force -s "Developer ID Application: <your identity>" \
+>   --identifier com.example.kairn-bridge --options runtime --timestamp \
+>   ~/kairn-bridge/kairn-bridge
+> ```
+>
+> Then add that binary under System Settings → Privacy & Security → Full Disk
+> Access and restart the agent. The bridge warns in its log if a first cycle has
+> not finished within 90 seconds, which is what this looks like.
+
+
 Template — fill in the absolute paths (`launchd` does not expand `~`), drop it at
 `~/Library/LaunchAgents/com.kairn.bridge.plist`, then
 `launchctl load` it:
