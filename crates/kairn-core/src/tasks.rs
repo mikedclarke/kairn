@@ -153,25 +153,26 @@ impl TaskQuery {
 }
 
 /// Toggle one task line between open and done, writing in the line's own
-/// style: indentation and list marker are preserved, only the bracket and the
-/// `@done(...)` stamp change. `* task` becomes `* [x] task @done(now)`; a done
-/// task reopens as `[ ]` with the stamp stripped (the `-` marker needs the
-/// bracket to stay a task at all, and `[ ]` reads identically everywhere).
-/// Returns `None` for anything that isn't an open or done task.
-pub fn toggle_task_line(line: &str, now: &str) -> Option<String> {
+/// style: indentation and list marker are preserved, only the bracket changes.
+/// `* task` becomes `* [x] task`; a done task reopens as `[ ]`. Completion
+/// carries no `@done(...)` stamp — the day a task lives on already dates it —
+/// but reopening still strips a trailing stamp so imported or legacy notes get
+/// tidied on the first toggle (the `-` marker needs the bracket to stay a task
+/// at all, and `[ ]` reads identically everywhere). Returns `None` for
+/// anything that isn't an open or done task.
+pub fn toggle_task_line(line: &str) -> Option<String> {
     let indent_len = line.len() - line.trim_start().len();
     let (indent, rest) = line.split_at(indent_len);
     let marker = ["* ", "+ ", "- "].iter().find(|m| rest.starts_with(**m))?;
     let body = &rest[2..];
     let gap_len = body.len() - body.trim_start().len();
     let (gap, body) = body.split_at(gap_len);
-    // Trailing whitespace is content (markdown hard breaks); the stamp goes
-    // after it and reopening removes only the stamp and its separator space,
+    // Trailing whitespace is content (markdown hard breaks) and is preserved,
     // so a toggle round-trips the line byte-for-byte.
     match bracket_state(body) {
         Some(TaskState::Open) => {
             let content = &body[3..];
-            Some(format!("{indent}{marker}{gap}[x]{content} @done({now})"))
+            Some(format!("{indent}{marker}{gap}[x]{content}"))
         }
         Some(TaskState::Done) => {
             let content = strip_trailing_done_stamp(&body[3..]);
@@ -179,7 +180,7 @@ pub fn toggle_task_line(line: &str, now: &str) -> Option<String> {
         }
         Some(_) => None,
         None if *marker == "- " || body.is_empty() || looks_bracketed(body) => None,
-        None => Some(format!("{indent}{marker}{gap}[x] {body} @done({now})")),
+        None => Some(format!("{indent}{marker}{gap}[x] {body}")),
     }
 }
 
@@ -225,9 +226,11 @@ fn looks_bracketed(body: &str) -> bool {
     chars.next() == Some('[') && chars.next().is_some() && chars.next() == Some(']')
 }
 
-/// Remove the single trailing ` @done(...)` stamp, the one toggling appends.
-/// Stamps anywhere else in the line are content the user (or NotePlan) wrote
-/// and stay untouched, as does anything merely containing the substring.
+/// Remove the single trailing ` @done(...)` stamp, so reopening a task that
+/// still carries one (imported from NotePlan, or written by an older Kairn)
+/// tidies it. Stamps anywhere else in the line are content the user (or
+/// NotePlan) wrote and stay untouched, as does anything merely containing the
+/// substring.
 fn strip_trailing_done_stamp(s: &str) -> &str {
     let trimmed = s.trim_end();
     let Some(pos) = trimmed.rfind("@done(") else {
@@ -369,67 +372,56 @@ mod tests {
 
     #[test]
     fn toggle_line_styles() {
-        let now = "2026-08-06 21:30";
-        // Bare NotePlan task and checklist gain a bracket and a stamp.
-        assert_eq!(
-            toggle_task_line("* buy milk", now).as_deref(),
-            Some("* [x] buy milk @done(2026-08-06 21:30)")
-        );
-        assert_eq!(
-            toggle_task_line("+ pack bag", now).as_deref(),
-            Some("+ [x] pack bag @done(2026-08-06 21:30)")
-        );
+        // Bare NotePlan task and checklist gain a bracket; no stamp is added.
+        assert_eq!(toggle_task_line("* buy milk").as_deref(), Some("* [x] buy milk"));
+        assert_eq!(toggle_task_line("+ pack bag").as_deref(), Some("+ [x] pack bag"));
         // Bracketed style keeps its marker, indentation survives.
         assert_eq!(
-            toggle_task_line("  - [ ] call bank", now).as_deref(),
-            Some("  - [x] call bank @done(2026-08-06 21:30)")
+            toggle_task_line("  - [ ] call bank").as_deref(),
+            Some("  - [x] call bank")
         );
-        // Reopening strips the stamp and keeps a bracket.
+        // Reopening strips a legacy/imported stamp and keeps a bracket.
         assert_eq!(
-            toggle_task_line("* [x] shipped @done(2026-08-06 18:00)", now).as_deref(),
+            toggle_task_line("* [x] shipped @done(2026-08-06 18:00)").as_deref(),
             Some("* [ ] shipped")
         );
-        // Only the trailing stamp is Kairn's; earlier ones are user content.
+        // Only the trailing stamp is stripped; earlier ones are user content.
         assert_eq!(
-            toggle_task_line("- [x] paid @done(2026-08-05) again @done(2026-08-06)", now)
-                .as_deref(),
+            toggle_task_line("- [x] paid @done(2026-08-05) again @done(2026-08-06)").as_deref(),
             Some("- [ ] paid @done(2026-08-05) again")
         );
         // Not toggleable: bullets, scheduled, cancelled, plain text.
-        assert_eq!(toggle_task_line("- just a bullet", now), None);
-        assert_eq!(toggle_task_line("* [>] moved", now), None);
-        assert_eq!(toggle_task_line("+ [-] cancelled", now), None);
-        assert_eq!(toggle_task_line("plain text", now), None);
+        assert_eq!(toggle_task_line("- just a bullet"), None);
+        assert_eq!(toggle_task_line("* [>] moved"), None);
+        assert_eq!(toggle_task_line("+ [-] cancelled"), None);
+        assert_eq!(toggle_task_line("plain text"), None);
     }
 
     #[test]
     fn reopen_leaves_user_stamps_and_links_alone() {
-        let now = "2026-08-07 12:00";
         // A wiki link containing the stamp substring must survive verbatim.
         assert_eq!(
-            toggle_task_line("* [x] see [[log @done(old)]] @done(2026-08-06 18:00)", now)
-                .as_deref(),
+            toggle_task_line("* [x] see [[log @done(old)]] @done(2026-08-06 18:00)").as_deref(),
             Some("* [ ] see [[log @done(old)]]")
         );
         // A done task with no stamp at all reopens cleanly.
-        assert_eq!(toggle_task_line("* [x] no stamp", now).as_deref(), Some("* [ ] no stamp"));
+        assert_eq!(toggle_task_line("* [x] no stamp").as_deref(), Some("* [ ] no stamp"));
         // A stamp mid-line (not trailing) is content and stays.
         assert_eq!(
-            toggle_task_line("* [x] logged @done(2026-08-05) then more", now).as_deref(),
+            toggle_task_line("* [x] logged @done(2026-08-05) then more").as_deref(),
             Some("* [ ] logged @done(2026-08-05) then more")
         );
     }
 
     #[test]
     fn toggle_round_trips_exactly() {
-        let now = "2026-08-07 12:00";
         // Trailing spaces are markdown hard breaks: kept through a full
         // toggle cycle.
-        let done = toggle_task_line("* task  ", now).expect("toggles");
-        assert_eq!(done, "* [x] task   @done(2026-08-07 12:00)");
-        assert_eq!(toggle_task_line(&done, now).as_deref(), Some("* [ ] task  "));
+        let done = toggle_task_line("* task  ").expect("toggles");
+        assert_eq!(done, "* [x] task  ");
+        assert_eq!(toggle_task_line(&done).as_deref(), Some("* [ ] task  "));
         // Unknown bracket styles ([!], [?]) neither toggle nor corrupt.
-        assert_eq!(toggle_task_line("* [!] important", now), None);
-        assert_eq!(toggle_task_line("+ [?] maybe", now), None);
+        assert_eq!(toggle_task_line("* [!] important"), None);
+        assert_eq!(toggle_task_line("+ [?] maybe"), None);
     }
 }

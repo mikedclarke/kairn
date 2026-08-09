@@ -1,11 +1,44 @@
 //! Small shared UI pieces used across the chrome, overlays, and panes.
 
 use gpui::{
-    Context, InteractiveElement, IntoElement, ParentElement, SharedString,
+    Context, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString,
     Styled, div, px,
 };
+use kairn_core::tasks::DayTaskStats;
 
 use crate::theme::KairnTheme;
+
+/// The NotePlan-style day indicator shared by the calendar grid and the week
+/// strip so the two can't drift: a hollow ring while any of the day's tasks
+/// are open (red once the day is past), a tick when they're all done, nothing
+/// on a task-free day. `base` is the ring colour for this cell's context and
+/// `emphasized` marks the day that sits on the amber pill (today in the
+/// calendar, the selected day in the strip), which flips the colours to read
+/// against amber. Returns `None` when there's nothing to show; wrap the result
+/// in the caller's fixed-height slot so the layout never shifts.
+pub(crate) fn day_task_indicator(
+    t: &KairnTheme,
+    stats: DayTaskStats,
+    base: Hsla,
+    overdue_open: bool,
+    emphasized: bool,
+) -> Option<gpui::Div> {
+    if stats.open > 0 {
+        let ring = if overdue_open && !emphasized { t.red } else { base };
+        Some(div().w(px(5.)).h(px(5.)).rounded_full().border_1().border_color(ring))
+    } else if stats.done > 0 {
+        let check = if emphasized { t.on_amber } else { t.accent };
+        Some(
+            div()
+                .text_size(px(7.5))
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(check)
+                .child("✓"),
+        )
+    } else {
+        None
+    }
+}
 
 pub fn kbd(t: &KairnTheme, label: impl Into<SharedString>) -> gpui::Div {
     div()

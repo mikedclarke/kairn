@@ -53,6 +53,8 @@ pub struct KairnTheme {
     pub highlight: Hsla,
     /// Heading and note-title text.
     pub heading: Hsla,
+    /// `**bold**` text: a distinct colour, not just a heavier weight.
+    pub bold: Hsla,
     /// UI chrome family; `None` keeps the system font.
     pub ui_font: Option<SharedString>,
     /// Notes editor family; `None` follows the UI font.
@@ -61,6 +63,9 @@ pub struct KairnTheme {
     pub mono_font: SharedString,
     /// Editor body size in px; headings scale with it.
     pub editor_size: f32,
+    /// Interface text size in px; the whole app chrome scales from it via
+    /// [`KairnTheme::ui_px`].
+    pub ui_size: f32,
     pub term_colors: ColorPalette,
 }
 
@@ -68,10 +73,24 @@ pub struct KairnTheme {
 /// against; `editor_size / EDITOR_BASE_SIZE` scales them.
 pub const EDITOR_BASE_SIZE: f32 = 13.0;
 
+/// The default interface size the hard-coded chrome sizes are authored
+/// against; `ui_size / UI_BASE_SIZE` scales them (see [`KairnTheme::ui_px`]).
+pub const UI_BASE_SIZE: f32 = 13.0;
+
+impl KairnTheme {
+    /// Scale a chrome text size (authored against [`UI_BASE_SIZE`]) by the
+    /// active interface size, so every `text_size(t.ui_px(n))` in the UI
+    /// tracks the one setting. The editor uses `editor_size` instead.
+    pub fn ui_px(&self, base: f32) -> gpui::Pixels {
+        gpui::px(base * self.ui_size / UI_BASE_SIZE)
+    }
+}
+
 impl KairnTheme {
     pub fn dark() -> Self {
         let amber = c(0xd9a75c);
         let text = c(0xdadcd1);
+        let accent = c(0xa8b48d);
         Self {
             mode: Mode::Dark,
             bg: c(0x1a1b15),
@@ -82,18 +101,20 @@ impl KairnTheme {
             text,
             dim: c(0x90957f),
             faint: c(0x5f6355),
-            accent: c(0xa8b48d),
+            accent,
             amber,
             on_amber: c(0x1a1a14),
             red: c(0xc97b6d),
             term_bg: c(0x14150f),
-            sel: ca(0xa8b48d26),
+            sel: ca(0xa8b48d40),
             highlight: amber.opacity(0.28),
-            heading: text,
+            heading: accent,
+            bold: amber,
             ui_font: None,
             editor_font: None,
             mono_font: auto_mono().into(),
             editor_size: EDITOR_BASE_SIZE,
+            ui_size: UI_BASE_SIZE,
             term_colors: terminal_palette(&ThemeTerminal::default(), (0x14, 0x15, 0x0f)),
         }
     }
@@ -101,6 +122,7 @@ impl KairnTheme {
     pub fn light() -> Self {
         let amber = c(0xae7c2c);
         let text = c(0x2c2e26);
+        let accent = c(0x5f7247);
         Self {
             mode: Mode::Light,
             bg: c(0xf4f4ea),
@@ -111,20 +133,22 @@ impl KairnTheme {
             text,
             dim: c(0x6e7263),
             faint: c(0x9ba18b),
-            accent: c(0x5f7247),
+            accent,
             amber,
             on_amber: c(0x1a1a14),
             red: c(0xa8574a),
             // The terminal stays dark in both modes per the design spec;
             // only its background shade follows.
             term_bg: c(0x22231c),
-            sel: ca(0x5f724721),
+            sel: ca(0x5f724733),
             highlight: amber.opacity(0.28),
-            heading: text,
+            heading: accent,
+            bold: amber,
             ui_font: None,
             editor_font: None,
             mono_font: auto_mono().into(),
             editor_size: EDITOR_BASE_SIZE,
+            ui_size: UI_BASE_SIZE,
             term_colors: terminal_palette(&ThemeTerminal::default(), (0x22, 0x23, 0x1c)),
         }
     }
@@ -160,11 +184,13 @@ impl KairnTheme {
         set(&mut t.term_bg, &colors.term_bg);
         set(&mut t.sel, &colors.sel);
         // The derived defaults follow their sources when the file moves
-        // amber or text but doesn't pin highlight/heading explicitly.
+        // amber/accent but doesn't pin highlight/heading/bold explicitly.
         t.highlight = t.amber.opacity(0.28);
-        t.heading = t.text;
+        t.heading = t.accent;
+        t.bold = t.amber;
         set(&mut t.highlight, &colors.highlight);
         set(&mut t.heading, &colors.heading);
+        set(&mut t.bold, &colors.bold);
         if let Some(f) = &spec.fonts.ui {
             t.ui_font = Some(f.clone().into());
         }
@@ -191,6 +217,35 @@ impl KairnTheme {
     }
 }
 
+/// Built-in themes offered in the picker beyond the two base modes. Each is
+/// the dark base with a different accent family, so the proven neutral
+/// backgrounds stay and only the colour that carries headings, links, ticks,
+/// and bold shifts. Ids are stable (settings store them); names are shown.
+pub const BUILTIN_PRESETS: &[(&str, &str)] = &[
+    ("ocean", "Ocean"),
+    ("rose", "Rose"),
+    ("forest", "Forest"),
+];
+
+/// Resolve a built-in preset id to its theme, or `None` for anything that
+/// isn't one (a base mode or a `.kairn/themes` file id).
+fn preset(id: &str) -> Option<KairnTheme> {
+    let (accent, amber) = match id {
+        "ocean" => (c(0x7fa8c9), c(0xd9a75c)),
+        "rose" => (c(0xc98fa8), c(0xd9a75c)),
+        "forest" => (c(0x8fbf8f), c(0xcbb26a)),
+        _ => return None,
+    };
+    let mut t = KairnTheme::dark();
+    t.accent = accent;
+    t.amber = amber;
+    t.heading = accent;
+    t.bold = amber;
+    t.sel = accent.opacity(0.25);
+    t.highlight = amber.opacity(0.28);
+    Some(t)
+}
+
 pub struct ActiveKairnTheme(pub KairnTheme);
 
 impl Global for ActiveKairnTheme {}
@@ -213,9 +268,14 @@ pub fn apply(settings: &Settings, notes_root: &Path, window: Option<&mut Window>
     let mut t = match settings.theme.as_str() {
         "light" => KairnTheme::light(),
         "dark" => KairnTheme::dark(),
-        id => match kairn_core::themes::load_theme(notes_root, id) {
-            Some(spec) => KairnTheme::from_spec(&spec),
-            None => KairnTheme::dark(),
+        // Presets first: they have no file, so trying to load them as one
+        // would just spew a "could not load theme" line every apply.
+        id => match preset(id) {
+            Some(t) => t,
+            None => match kairn_core::themes::load_theme(notes_root, id) {
+                Some(spec) => KairnTheme::from_spec(&spec),
+                None => KairnTheme::dark(),
+            },
         },
     };
     if let Some(f) = &settings.ui_font {
@@ -229,6 +289,9 @@ pub fn apply(settings: &Settings, notes_root: &Path, window: Option<&mut Window>
     }
     if let Some(s) = settings.editor_font_size {
         t.editor_size = s.clamp(9., 32.);
+    }
+    if let Some(s) = settings.ui_font_size {
+        t.ui_size = s.clamp(9., 32.);
     }
 
     Theme::change(

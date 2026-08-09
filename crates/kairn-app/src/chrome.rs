@@ -23,7 +23,7 @@ impl Workspace {
             .border_1()
             .border_color(t.border)
             .bg(t.bg)
-            .text_size(px(12.))
+            .text_size(t.ui_px(12.))
             .text_color(t.faint)
             .cursor_pointer()
             .hover(|s| s.border_color(t.faint))
@@ -59,7 +59,7 @@ impl Workspace {
                         h_flex()
                             .gap(px(7.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_size(px(13.))
+                            .text_size(t.ui_px(13.))
                             .child(cairn_mark(t))
                             .child("Kairn"),
                     ),
@@ -101,7 +101,7 @@ impl Workspace {
                 .bg(t.panel)
                 .border_t_1()
                 .border_color(t.border)
-                .text_size(px(11.5))
+                .text_size(t.ui_px(11.5))
                 .text_color(t.amber)
                 .children(warnings),
         )
@@ -132,7 +132,7 @@ pub(crate) fn titlebar_button<T: 'static>(
         .px(px(8.))
         .py(px(3.))
         .rounded(px(6.))
-        .text_size(px(12.))
+        .text_size(t.ui_px(12.))
         .text_color(t.dim)
         .cursor_pointer()
         .hover(move |s| s.bg(hover_bg))

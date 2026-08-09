@@ -2,14 +2,14 @@
 //! string transforms. The line-level rules (NotePlan markers, `@done` stamps,
 //! `>date` tokens) live in [`kairn_core::tasks`].
 
-/// Toggle a task line between open and done. `now` is the `@done(...)` stamp to
-/// write when completing (the caller supplies the formatted timestamp, so this
-/// stays clock-free and testable). Returns the rewritten line, or `None` if the
-/// line is not a toggleable task (a plain `-` bullet, an unknown bracket state,
-/// or not a task at all).
+/// Toggle a task line between open and done. Completion adds no `@done(...)`
+/// stamp — the note's day already dates it — while reopening strips a trailing
+/// stamp left by an import or an older version. Returns the rewritten line, or
+/// `None` if the line is not a toggleable task (a plain `-` bullet, an unknown
+/// bracket state, or not a task at all).
 #[uniffi::export]
-pub fn toggle_task_line(line: String, now: String) -> Option<String> {
-    kairn_core::toggle_task_line(&line, &now)
+pub fn toggle_task_line(line: String) -> Option<String> {
+    kairn_core::toggle_task_line(&line)
 }
 
 /// Set an open task line's due date to `year-month-day`: rewrites the first
@@ -27,15 +27,15 @@ mod tests {
 
     #[test]
     fn toggle_completes_and_reopens() {
-        let done = toggle_task_line("* [ ] buy milk".into(), "2026-08-08".into()).unwrap();
-        assert_eq!(done, "* [x] buy milk @done(2026-08-08)");
-        let reopened = toggle_task_line(done, "2026-08-08".into()).unwrap();
+        let done = toggle_task_line("* [ ] buy milk".into()).unwrap();
+        assert_eq!(done, "* [x] buy milk");
+        let reopened = toggle_task_line(done).unwrap();
         assert_eq!(reopened, "* [ ] buy milk");
     }
 
     #[test]
     fn plain_bullet_does_not_toggle() {
-        assert!(toggle_task_line("- just a bullet".into(), "2026-08-08".into()).is_none());
+        assert!(toggle_task_line("- just a bullet".into()).is_none());
     }
 
     #[test]

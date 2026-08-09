@@ -47,7 +47,7 @@ pub struct Settings {
     #[serde(default = "default_week_strip")]
     pub week_strip: String,
     /// The timeline pill row of time-blocked lines on the daily note.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_day_timeline")]
     pub day_timeline: bool,
     /// When the daily template seeds new days: "always", "weekdays", or
     /// "off". Unknown values read as "always".
@@ -65,6 +65,11 @@ pub struct Settings {
     /// Editor body size in px; headings scale with it. Unset means 13.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor_font_size: Option<f32>,
+    /// Interface text size in px: the whole app chrome (sidebar, calendar,
+    /// panes, dialogs) scales from it, leaving the notes editor to its own
+    /// `editor_font_size`. Unset means 13.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_font_size: Option<f32>,
     /// Set when the settings file existed but couldn't be parsed. While
     /// degraded, [`Settings::save`] refuses to run: auto-saving defaults
     /// over a corrupt file is how SSH hosts and the notes root get wiped.
@@ -74,15 +79,19 @@ pub struct Settings {
 }
 
 fn default_theme() -> String {
-    "dark".to_string()
+    "ocean".to_string()
 }
 
 fn default_true() -> bool {
     true
 }
 
+fn default_day_timeline() -> bool {
+    false
+}
+
 fn default_week_strip() -> String {
-    "always".to_string()
+    "off".to_string()
 }
 
 fn default_template_rule() -> String {
@@ -98,12 +107,17 @@ impl Default for Settings {
             daily_forward: true,
             sidebar_collapsed: Vec::new(),
             week_strip: default_week_strip(),
-            day_timeline: true,
+            day_timeline: default_day_timeline(),
             daily_template_rule: default_template_rule(),
-            ui_font: None,
-            editor_font: None,
+            // Fresh-install look: Ocean theme, Noto Sans for chrome and notes
+            // (terminal keeps the auto-resolved mono), everything at 14px.
+            // Existing configs keep their own values; these only seed a new
+            // install (no settings.json yet).
+            ui_font: Some("Noto Sans".to_string()),
+            editor_font: Some("Noto Sans".to_string()),
             mono_font: None,
-            editor_font_size: None,
+            editor_font_size: Some(14.0),
+            ui_font_size: Some(14.0),
             degraded: false,
         }
     }

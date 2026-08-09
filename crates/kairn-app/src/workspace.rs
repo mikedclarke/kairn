@@ -105,8 +105,9 @@ pub struct Workspace {
     pub notes_tree: Vec<notes::NoteEntry>,
     /// Folders currently expanded in the Notes browser.
     pub(crate) notes_expanded: HashSet<PathBuf>,
-    /// Open-task counts for Monday..Sunday of the selected day's week.
-    pub week_open_counts: [usize; 7],
+    /// Open/done task tallies for Monday..Sunday of the selected day's week,
+    /// so the week strip can show the same indicators as the calendar.
+    pub week_stats: [notes::DayTaskStats; 7],
     /// Time-blocked lines of the selected day's note, for the timeline pill
     /// row; empty for other views. Recomputed on reload, not per frame.
     pub day_timeline: Vec<notes::TimeBlock>,
@@ -219,7 +220,7 @@ impl Workspace {
             open_tasks: Vec::new(),
             notes_tree: Vec::new(),
             notes_expanded: HashSet::new(),
-            week_open_counts: [0; 7],
+            week_stats: [notes::DayTaskStats::default(); 7],
             day_timeline: Vec::new(),
             task_counts: [0; 3],
             agent_activity: Vec::new(),
@@ -516,7 +517,7 @@ impl Render for Workspace {
             .size_full()
             .bg(t.bg)
             .text_color(t.text)
-            .text_size(px(13.))
+            .text_size(t.ui_px(13.))
             .when_some(t.ui_font.clone(), |d, f| d.font_family(f))
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_toggle_terminal_full))
@@ -584,7 +585,7 @@ impl Workspace {
                 .border_1()
                 .border_color(t.border)
                 .shadow_md()
-                .text_size(px(12.))
+                .text_size(t.ui_px(12.))
                 .text_color(t.dim)
                 .child(
                     div()

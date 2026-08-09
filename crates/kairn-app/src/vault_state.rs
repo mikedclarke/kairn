@@ -128,6 +128,7 @@ impl Workspace {
             |this, _editor, event: &NoteEditorEvent, cx| match event {
                 NoteEditorEvent::Saved(path) => {
                     this.note_self_write(path);
+                    this.rename_note_to_title(path.clone(), cx);
                     this.reload_notes(cx);
                     cx.notify();
                 }
@@ -223,9 +224,9 @@ impl Workspace {
         });
         let monday = self.selected_day
             - Days::new(self.selected_day.weekday().num_days_from_monday() as u64);
-        for (i, count) in self.week_open_counts.iter_mut().enumerate() {
+        for (i, stats) in self.week_stats.iter_mut().enumerate() {
             let day = monday + Days::new(i as u64);
-            *count = self.open_tasks.iter().filter(|t| t.due == day).count();
+            *stats = self.day_stats.get(&day).copied().unwrap_or_default();
         }
         let path = match &self.view {
             PaneView::Day => scan.days.get(&self.selected_day).cloned(),
@@ -243,19 +244,26 @@ impl Workspace {
             },
         };
         self.doc_error = doc_error;
-        // A day from today onward with no file yet starts from the daily
+        // A day from today onward with no content yet starts from the daily
         // template (Notes/@Templates/Daily.md): rendered immediately, written
-        // to disk only when the first edit lands. Past days stay blank — a
-        // template there would dress up history that never happened. The
-        // settings rule can narrow this to weekdays or turn it off.
-        let text = if text.is_none()
+        // to disk only when the first edit lands. An empty file already on
+        // disk (NotePlan pre-creates these, and a stray visit can too) counts
+        // as no content, so the template still seeds rather than the day
+        // reading blank forever. Past days stay blank — a template there would
+        // dress up history that never happened. The settings rule can narrow
+        // this to weekdays or turn it off.
+        let day_is_blank = text.as_deref().is_none_or(|s| s.trim().is_empty());
+        let text = if day_is_blank
             && matches!(self.view, PaneView::Day)
             && self.doc_error.is_none()
             && !self.root_missing
             && self.selected_day >= today
             && notes::template_applies(&self.settings.daily_template_rule, self.selected_day)
         {
+            // Drop any leading `# title` from the template: the day's masthead
+            // already titles it, so a heading here would just duplicate it.
             notes::daily_template(&self.notes_root)
+                .map(|body| notes::strip_daily_title(&body).to_string())
         } else {
             text
         };
@@ -381,25 +389,55 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Create a note in a folder of the Notes tree and open it. An existing
-    /// note of that name is opened untouched (same posture as wiki links).
-    pub fn create_note_in(
-        &mut self,
-        dir: &Path,
-        name: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match notes::new_note_in(dir, name) {
+    /// Create a fresh untitled note in a folder of the Notes tree and open it,
+    /// the caret sitting after the seeded `# ` so the user just types the
+    /// title — which then renames the file (see [`Self::rename_note_to_title`]).
+    /// No name prompt: NotePlan-style.
+    pub fn create_new_note(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        match notes::new_untitled_note_in(&dir) {
             Ok(path) => {
                 self.note_self_write(&path);
                 // Expand the folder so the new note is visible in the tree.
                 if dir != self.notes_root.join("Notes") {
-                    self.notes_expanded.insert(dir.to_path_buf());
+                    self.notes_expanded.insert(dir);
                 }
                 self.open_note(path, cx);
+                if let Some(editor) = self.note_editor.clone() {
+                    editor.update(cx, |ed, cx| ed.focus_title(window, cx));
+                }
             }
             Err(e) => window.push_notification(format!("Could not create note: {e}"), cx),
+        }
+    }
+
+    /// After a regular note saves, keep its filename in step with its title:
+    /// derive a stem from the first heading and rename the file to match.
+    /// Daily notes are date-named and never touched; a name collision or an
+    /// unusable title just leaves the file where it is (the title simply
+    /// doesn't match the filename until it's unique and valid).
+    fn rename_note_to_title(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        // Only the note actually on screen, and only regular notes — dailies
+        // are PaneView::Day and keep their date name.
+        if self.view != PaneView::Note(path.clone()) {
+            return;
+        }
+        let editor = match &self.note_editor {
+            Some(e) if e.read(cx).path == path => e.clone(),
+            _ => return,
+        };
+        let Some(stem) = editor.read(cx).title_stem() else {
+            return;
+        };
+        let current = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+        if stem == current {
+            return;
+        }
+        if let Ok(new_path) = notes::rename_note(&path, &stem)
+            && new_path != path
+        {
+            self.note_self_write(&new_path);
+            editor.update(cx, |ed, _| ed.set_path(new_path.clone()));
+            self.view = PaneView::Note(new_path);
         }
     }
 
@@ -421,17 +459,11 @@ impl Workspace {
         );
     }
 
-    /// New-note prompt for a folder row (or the Notes section header, which
-    /// creates at the top level).
+    /// New-note action for a folder row (or the Notes section header, which
+    /// creates at the top level): kept as a thin alias so call sites read as
+    /// intent, not mechanism.
     pub fn prompt_new_note(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        crate::name_dialog::open(
-            "New note",
-            "Create",
-            None,
-            window,
-            cx,
-            move |ws, name, window, cx| ws.create_note_in(&dir, name, window, cx),
-        );
+        self.create_new_note(dir, window, cx);
     }
 
     /// Flush pending editor changes now instead of waiting for the autosave.
@@ -543,6 +575,7 @@ impl Workspace {
         self.settings.editor_font = patch.editor_font;
         self.settings.mono_font = patch.mono_font;
         self.settings.editor_font_size = patch.editor_font_size;
+        self.settings.ui_font_size = patch.ui_font_size;
         // Applying settings is the explicit user action that ends the
         // degraded no-save state after a corrupt settings.json.
         self.settings.degraded = false;
@@ -600,4 +633,5 @@ pub struct SettingsPatch {
     pub editor_font: Option<String>,
     pub mono_font: Option<String>,
     pub editor_font_size: Option<f32>,
+    pub ui_font_size: Option<f32>,
 }

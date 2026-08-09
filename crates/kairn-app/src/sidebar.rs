@@ -126,10 +126,10 @@ impl Workspace {
                     row = row
                         .child(
                             div()
-                                .w(px(9.))
+                                .w(px(11.))
                                 .flex_none()
-                                .text_size(px(8.))
-                                .text_color(t.faint)
+                                .text_size(t.ui_px(11.))
+                                .text_color(t.dim)
                                 .child(if open { "▾" } else { "▸" }),
                         )
                         .child(folder_icon(t))
@@ -155,7 +155,7 @@ impl Workspace {
                     let selected = self.view == PaneView::Note(entry.path.clone());
                     row = row
                         .when(selected, |d| d.bg(t.sel).text_color(t.text))
-                        .child(div().w(px(9.)).flex_none())
+                        .child(div().w(px(11.)).flex_none())
                         .child(note_icon(t))
                         .child(
                             div()
@@ -230,7 +230,7 @@ impl Workspace {
                 if matches!(session.kind, SessionKind::Ssh(_)) {
                     row = row.child(
                         div()
-                            .text_size(px(9.5))
+                            .text_size(t.ui_px(9.5))
                             .border_1()
                             .border_color(t.border)
                             .rounded(px(3.))
@@ -243,7 +243,7 @@ impl Workspace {
                     row = row.child(
                         div()
                             .font_family(t.mono_font.clone())
-                            .text_size(px(10.5))
+                            .text_size(t.ui_px(10.5))
                             .text_color(t.faint)
                             .child(chord(&(i + 1).to_string())),
                     );
@@ -288,7 +288,7 @@ impl Workspace {
                     div()
                         .px(px(14.))
                         .pb(px(16.))
-                        .text_size(px(11.5))
+                        .text_size(t.ui_px(11.5))
                         .text_color(t.faint)
                         .child("No agent activity yet"),
                 );
@@ -307,12 +307,12 @@ impl Workspace {
                         .gap(px(8.))
                         .px(px(14.))
                         .py(px(3.))
-                        .text_size(px(11.5))
+                        .text_size(t.ui_px(11.5))
                         .child(
                             div()
                                 .flex_none()
                                 .font_family(t.mono_font.clone())
-                                .text_size(px(10.5))
+                                .text_size(t.ui_px(10.5))
                                 .text_color(t.faint)
                                 .child(activity_time(&entry.ts, today)),
                         )
@@ -363,7 +363,7 @@ impl Workspace {
             .text_color(t.dim)
             .cursor_pointer()
             .hover(move |s| s.bg(hover_bg).text_color(hover_text))
-            .child(div().text_size(px(13.)).child("⚙"))
+            .child(div().text_size(t.ui_px(13.)).child("⚙"))
             .child(div().flex_1().child("Settings"))
             .child(kbd(t, chord(",")))
             .on_click(cx.listener(|this, _, window, cx| {
@@ -379,7 +379,7 @@ impl Workspace {
             .bg(t.panel)
             .border_r_1()
             .border_color(t.border)
-            .text_size(px(12.5))
+            .text_size(t.ui_px(12.5))
             .child(side)
             .child(settings_row)
     }
@@ -398,6 +398,7 @@ impl Workspace {
         };
 
         let title = format!("{} {}", shown_first.format("%B"), shown_first.year());
+        let today_hover = t.text;
         let grid_start =
             shown_first - Days::new(shown_first.weekday().num_days_from_monday() as u64);
 
@@ -411,14 +412,27 @@ impl Workspace {
                     .justify_between()
                     .items_center()
                     .mb(px(8.))
-                    .text_size(px(12.))
+                    .text_size(t.ui_px(12.))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(title)
+                    .child(
+                        // Clicking the month/year is the "take me to today"
+                        // shortcut: jump the calendar to the current month and
+                        // open today's daily note.
+                        div()
+                            .id("cal-today")
+                            .cursor_pointer()
+                            .hover(move |s| s.text_color(today_hover))
+                            .child(title)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.cal_offset = 0;
+                                this.select_day(today, cx);
+                            })),
+                    )
                     .child(
                         div()
                             .flex()
                             .gap(px(2.))
-                            .text_color(t.faint)
+                            .text_color(t.dim)
                             .child(
                                 cal_nav(t, "cal-prev", "‹").on_click(cx.listener(|this, _, _, cx| {
                                     this.cal_offset -= 1;
@@ -436,7 +450,7 @@ impl Workspace {
             .child(
                 div()
                     .flex()
-                    .text_size(px(10.5))
+                    .text_size(t.ui_px(10.5))
                     .text_color(t.faint)
                     .children(["M", "T", "W", "T", "F", "S", "S"].map(|d| {
                         div().flex_1().py(px(2.)).text_center().child(d)
@@ -444,7 +458,7 @@ impl Workspace {
             );
 
         for week in 0..6u64 {
-            let mut row = div().flex().text_size(px(10.5));
+            let mut row = div().flex().text_size(t.ui_px(11.5));
             for wd in 0..7u64 {
                 let day: NaiveDate = grid_start + Days::new(week * 7 + wd);
                 let in_month = day.month() == shown_first.month();
@@ -495,22 +509,18 @@ impl Workspace {
                 } else {
                     t.faint
                 };
-                let mut slot = div().h(px(9.)).flex().items_center().justify_center();
-                if stats.open > 0 {
-                    let ring = if overdue_open && !is_today { t.red } else { base };
-                    slot = slot.child(
-                        div().w(px(5.)).h(px(5.)).rounded_full().border_1().border_color(ring),
-                    );
-                } else if stats.done > 0 {
-                    let check = if is_today { t.on_amber } else { t.accent };
-                    slot = slot.child(
-                        div()
-                            .text_size(px(7.5))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(check)
-                            .child("✓"),
-                    );
-                }
+                let slot = div()
+                    .h(px(9.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .children(crate::ui::day_task_indicator(
+                        t,
+                        stats,
+                        base,
+                        overdue_open,
+                        is_today,
+                    ));
                 let cell = cell.child(slot);
 
                 let hover_bg = t.hover;
@@ -555,13 +565,13 @@ fn sechead(
         .px(px(14.))
         .pt(px(16.))
         .pb(px(6.))
-        .text_size(px(10.5))
+        .text_size(t.ui_px(10.5))
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .text_color(t.faint)
         .cursor_pointer()
         .hover(move |s| s.text_color(hover_text))
         .child(label.to_uppercase())
-        .child(div().text_size(px(8.)).child(if collapsed { "▸" } else { "▾" }))
+        .child(div().text_size(t.ui_px(11.)).child(if collapsed { "▸" } else { "▾" }))
         .child(div().flex_1());
     if let Some(count) = count {
         head = head.child(div().child(count));
@@ -603,7 +613,7 @@ fn note_icon(t: &KairnTheme) -> impl IntoElement {
 
 fn count_label(t: &KairnTheme, label: &str, hot: bool) -> impl IntoElement {
     div()
-        .text_size(px(11.))
+        .text_size(t.ui_px(11.))
         .text_color(if hot { t.amber } else { t.faint })
         .child(label.to_string())
 }
@@ -640,6 +650,7 @@ fn cal_nav(t: &KairnTheme, id: &'static str, glyph: &'static str) -> gpui::State
     div()
         .id(id)
         .px(px(4.))
+        .text_size(t.ui_px(16.))
         .cursor_pointer()
         .hover(move |s| s.text_color(hover_text))
         .child(glyph)

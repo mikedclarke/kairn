@@ -52,7 +52,7 @@ impl Workspace {
                 .child("No session")
                 .child(
                     div()
-                        .text_size(px(11.5))
+                        .text_size(t.ui_px(11.5))
                         .child(format!("{} starts a new shell", chord("N"))),
                 ),
         }
@@ -79,19 +79,19 @@ impl Workspace {
                 .bg(t.bg)
                 .child(
                     div()
-                        .text_size(px(15.))
+                        .text_size(t.ui_px(15.))
                         .text_color(t.text)
                         .child("Notes folder unavailable"),
                 )
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(t.ui_px(12.))
                         .text_color(t.faint)
                         .child(self.notes_root.display().to_string()),
                 )
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(t.ui_px(12.))
                         .text_color(t.dim)
                         .child("Check the drive, or choose a folder in Settings."),
                 );
@@ -177,22 +177,24 @@ impl Workspace {
             let day = monday + Days::new(i);
             let is_today = day == today;
             let is_selected = day == selected;
-            let dots = self.week_open_counts[i as usize].min(4);
-            // Open tasks on a past day are overdue: those dots run hot.
-            let dot_color = if is_selected {
-                t.on_amber.opacity(0.6)
-            } else if day < today {
-                t.amber
-            } else {
-                t.faint
-            };
-
-            let mut dots_row = div().h(px(5.)).mt(px(1.)).flex().gap(px(2.)).justify_center();
-            for _ in 0..dots {
-                dots_row = dots_row.child(
-                    div().w(px(3.5)).h(px(3.5)).rounded_full().bg(dot_color),
-                );
-            }
+            let stats = self.week_stats[i as usize];
+            let overdue_open = stats.open > 0 && day < today;
+            // Same ring/tick indicator as the calendar; on the selected day it
+            // sits on the amber pill, so its colours flip to read against amber.
+            let base = if is_selected { t.on_amber } else { t.faint };
+            let indicator = div()
+                .h(px(9.))
+                .mt(px(1.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .children(crate::ui::day_task_indicator(
+                    t,
+                    stats,
+                    base,
+                    overdue_open,
+                    is_selected,
+                ));
 
             let hover_bg = t.hover;
             let is_drop = drop_day == Some(day);
@@ -226,7 +228,7 @@ impl Workspace {
                     )
                     .child(
                         div()
-                            .text_size(px(9.))
+                            .text_size(t.ui_px(9.))
                             .text_color(if is_drop {
                                 t.accent
                             } else if is_selected {
@@ -238,12 +240,12 @@ impl Workspace {
                     )
                     .child(
                         div()
-                            .text_size(px(13.5))
+                            .text_size(t.ui_px(13.5))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .when(is_today && !is_selected, |d| d.text_color(t.amber))
                             .child(day.format("%-d").to_string()),
                     )
-                    .child(dots_row)
+                    .child(indicator)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select_day(day, cx);
                     })),
@@ -380,7 +382,7 @@ impl Workspace {
                 .border_color(if current { t.accent } else { t.border })
                 .bg(t.panel)
                 .font_family(t.mono_font.clone())
-                .text_size(px(10.5))
+                .text_size(t.ui_px(10.5))
                 .text_color(if current { t.text } else { t.dim })
                 .child(
                     div()
@@ -424,7 +426,7 @@ impl Workspace {
                 .border_1()
                 .border_color(t.amber.opacity(0.5))
                 .bg(t.amber.opacity(0.08))
-                .text_size(px(12.))
+                .text_size(t.ui_px(12.))
                 .child(
                     div()
                         .text_color(t.dim)
@@ -435,7 +437,7 @@ impl Workspace {
                     div()
                         .flex()
                         .gap(px(14.))
-                        .text_size(px(11.5))
+                        .text_size(t.ui_px(11.5))
                         .child(action("Put it back at the end of its note", "orphan-append").on_click(
                             cx.listener(|this, _, _, cx| {
                                 cx.stop_propagation();
@@ -479,7 +481,7 @@ impl Workspace {
                     .border_1()
                     .border_color(t.amber.opacity(0.5))
                     .bg(t.amber.opacity(0.08))
-                    .text_size(px(12.))
+                    .text_size(t.ui_px(12.))
                     .child(div().text_color(t.dim).child(
                         "A sync conflict copy of this note exists; it may hold changes this version is missing.",
                     ))
@@ -487,7 +489,7 @@ impl Workspace {
                         h_flex()
                             .mt(px(4.))
                             .gap(px(14.))
-                            .text_size(px(11.5))
+                            .text_size(t.ui_px(11.5))
                             .child(
                                 div()
                                     .id(("conflict-open", i))
@@ -518,7 +520,7 @@ impl Workspace {
             .child(
                 div()
                     .mb(px(8.))
-                    .text_size(px(11.))
+                    .text_size(t.ui_px(11.))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(t.faint)
                     .child(format!("LINKED MENTIONS · {}", self.mentions.len())),
@@ -547,7 +549,7 @@ impl Workspace {
                         div()
                             .flex_none()
                             .mt(px(1.))
-                            .text_size(px(11.))
+                            .text_size(t.ui_px(11.))
                             .text_color(t.faint)
                             .child(name),
                     )
@@ -633,7 +635,7 @@ impl Workspace {
                         d.child(
                             div()
                                 .flex_none()
-                                .text_size(px(11.))
+                                .text_size(t.ui_px(11.))
                                 .text_color(t.faint)
                                 .child(stem),
                         )
@@ -641,7 +643,7 @@ impl Workspace {
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(11.))
+                            .text_size(t.ui_px(11.))
                             .text_color(t.faint)
                             .child(date_label),
                     ),
@@ -667,7 +669,7 @@ fn note_frame(
         .mb(px(2.))
         .child(
             div()
-                .text_size(px(21.))
+                .text_size(t.ui_px(21.))
                 .font_weight(gpui::FontWeight::BOLD)
                 .text_color(t.heading)
                 .child(masthead),
@@ -679,7 +681,7 @@ fn note_frame(
                 .py(px(1.))
                 .rounded(px(5.))
                 .bg(t.amber.opacity(0.16))
-                .text_size(px(10.5))
+                .text_size(t.ui_px(10.5))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(t.amber)
                 .child(badge.to_uppercase()),
@@ -694,7 +696,7 @@ fn note_frame(
         .child(head)
         .child(
             div()
-                .text_size(px(12.))
+                .text_size(t.ui_px(12.))
                 .text_color(t.faint)
                 .mb(px(4.))
                 .child(subline),
@@ -707,8 +709,8 @@ fn week_nav(t: &KairnTheme, id: &'static str, glyph: &'static str) -> gpui::Stat
     div()
         .id(id)
         .px(px(3.))
-        .text_size(px(13.))
-        .text_color(t.faint)
+        .text_size(t.ui_px(16.))
+        .text_color(t.dim)
         .cursor_pointer()
         .hover(move |s| s.text_color(hover_text))
         .child(glyph)

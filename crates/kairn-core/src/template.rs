@@ -51,16 +51,32 @@ pub fn save_daily_template(root: &Path, body: &str) -> std::io::Result<()> {
     fs::write(&path, format!("{frontmatter}{body}"))
 }
 
-/// The daily-note template body: `Notes/@Templates/Daily.md` (or `.txt`)
-/// with any frontmatter stripped. `None` when no template exists or it is
-/// effectively empty.
+/// The daily-note template body to seed a new day with: the same read and
+/// frontmatter stripping the settings editor shows via [`daily_template_body`],
+/// so what the user edits is exactly what seeds. `None` when no template exists
+/// or it is effectively empty (only frontmatter or blank lines).
 pub fn daily_template(root: &Path) -> Option<String> {
-    let dir = root.join("Notes").join("@Templates");
-    ["Daily.md", "Daily.txt"]
-        .iter()
-        .find_map(|name| fs::read_to_string(dir.join(name)).ok())
-        .map(|text| strip_frontmatter(&text).to_string())
-        .filter(|body| !body.trim().is_empty())
+    Some(daily_template_body(root)).filter(|body| !body.trim().is_empty())
+}
+
+/// Drop a leading level-1 heading (and the blank lines under it) when seeding
+/// a daily note: the daily masthead already shows the date as the title, so a
+/// `# ...` first line would just duplicate it. Only H1 goes — `## Tasks` and
+/// deeper structure stay, and a body that doesn't start with a heading passes
+/// through unchanged.
+pub fn strip_daily_title(body: &str) -> &str {
+    let mut lines = body.split_inclusive('\n');
+    let Some(first) = lines.next() else {
+        return body;
+    };
+    let trimmed = first.trim_start();
+    let hashes = trimmed.bytes().take_while(|b| *b == b'#').count();
+    let rest = &trimmed[hashes..];
+    let is_h1 = hashes == 1 && (rest.trim_end().is_empty() || rest.starts_with(char::is_whitespace));
+    if !is_h1 {
+        return body;
+    }
+    body[first.len()..].trim_start_matches(['\r', '\n'])
 }
 
 /// Everything after a leading `---` frontmatter block, with the blank lines
@@ -151,6 +167,20 @@ mod tests {
             std::fs::read_to_string(root.0.join("Notes/@Templates/Daily.txt")).expect("read"),
             "new\n"
         );
+    }
+
+    #[test]
+    fn strips_a_redundant_daily_title() {
+        // A leading H1 (the date title) and the blank line under it go.
+        assert_eq!(
+            strip_daily_title("# Monday\n\n## Tasks\n* \n"),
+            "## Tasks\n* \n"
+        );
+        // Deeper headings and title-less bodies are untouched.
+        assert_eq!(strip_daily_title("## Tasks\n* \n"), "## Tasks\n* \n");
+        assert_eq!(strip_daily_title("notes for today\n"), "notes for today\n");
+        // A title-only template seeds nothing.
+        assert_eq!(strip_daily_title("# Monday\n"), "");
     }
 
     #[test]

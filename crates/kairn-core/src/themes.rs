@@ -45,8 +45,11 @@ pub struct ThemeColors {
     pub sel: Option<String>,
     /// The `==highlight==` background; alpha respected.
     pub highlight: Option<String>,
-    /// Heading and note-title text; defaults to the body text color.
+    /// Heading and note-title text; defaults to the sage accent.
     pub heading: Option<String>,
+    /// `**bold**` text; defaults to the amber accent so bold reads as a
+    /// distinct colour, not just a heavier weight.
+    pub bold: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

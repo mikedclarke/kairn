@@ -228,6 +228,29 @@ impl NoteEditor {
         cx.notify();
     }
 
+    /// The filename stem this note's title (its first heading) implies, or
+    /// `None` when there's no usable title yet. Drives title-follows-filename
+    /// renaming for regular notes.
+    pub fn title_stem(&self) -> Option<String> {
+        notes::note_title_stem(self.text())
+    }
+
+    /// Re-point the editor at a moved file (after a title rename) without
+    /// swapping the entity, so the cursor, undo history, and focus survive.
+    pub fn set_path(&mut self, path: PathBuf) {
+        self.path = path;
+    }
+
+    /// Put the caret at the end of the title line and take focus, so a
+    /// freshly created note is ready to type into right after the `# `.
+    pub fn focus_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cursor = self.text().find('\n').unwrap_or(self.text().len());
+        self.selection_anchor = None;
+        self.follow_cursor.set(true);
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
     /// An external change shifted the text under us: any selection or
     /// in-flight glyph drag holds stale byte offsets, so let go of them.
     fn drop_stale_offsets(&mut self) {
@@ -971,8 +994,7 @@ impl NoteEditor {
 
     fn toggle_task_in(&mut self, raw_range: Range<usize>, cx: &mut Context<Self>) {
         let line = self.text()[raw_range.clone()].to_string();
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
-        let Some(toggled) = notes::toggle_task_line(&line, &now) else { return };
+        let Some(toggled) = notes::toggle_task_line(&line) else { return };
         self.buffer.edit(raw_range, &toggled, self.cursor, now_ms());
         self.after_edit(cx);
     }
@@ -1478,7 +1500,7 @@ fn span_style(kind: SpanKind, base: Hsla, t: &KairnTheme) -> (Hsla, Option<Hsla>
         SpanKind::Tag | SpanKind::DateRef => (t.amber, None, FontWeight::NORMAL, FontStyle::Normal),
         SpanKind::Mention => (t.faint, None, FontWeight::NORMAL, FontStyle::Normal),
         SpanKind::Highlight => (t.text, Some(t.highlight), FontWeight::NORMAL, FontStyle::Normal),
-        SpanKind::Bold => (base, None, FontWeight::BOLD, FontStyle::Normal),
+        SpanKind::Bold => (t.bold, None, FontWeight::BOLD, FontStyle::Normal),
         SpanKind::Italic => (base, None, FontWeight::NORMAL, FontStyle::Italic),
         SpanKind::Hidden => (t.faint, None, FontWeight::NORMAL, FontStyle::Normal),
     }
@@ -1855,7 +1877,7 @@ impl Element for NoteEditorElement {
                     let s_raw = sel.start.max(slot.raw_start) - slot.raw_start;
                     let e_raw = sel.end.min(line_end) - slot.raw_start;
                     let includes_newline = sel.end > line_end;
-                    let color = t.accent.opacity(0.22);
+                    let color = t.sel;
                     match &slot.entry.wrapped {
                         Some(wrapped) => {
                             let (s_ix, e_ix) = if slot.entry.active {

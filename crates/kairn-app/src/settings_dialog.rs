@@ -45,6 +45,44 @@ type FontSelect = Entity<SelectState<SearchableVec<String>>>;
 /// built-in choice applies.
 const DEFAULT_FONT: &str = "Default";
 
+/// Curated proportional/serif families for the interface and notes pickers,
+/// spanning macOS and Linux. Only the ones actually installed are offered, so
+/// the list stays short and every option renders — rather than dumping every
+/// font on the machine. A family already configured but not in this set is
+/// still added so it never silently drops.
+const TEXT_FONTS: &[&str] = &[
+    "Inter",
+    "SF Pro Text",
+    "Helvetica Neue",
+    "Avenir Next",
+    "Optima",
+    "Charter",
+    "Iowan Old Style",
+    "New York",
+    "Georgia",
+    "Cantarell",
+    "Noto Sans",
+    "Adwaita Sans",
+    "DejaVu Sans",
+    "Ubuntu",
+];
+
+/// Curated monospace families for the terminal & mono picker, same rule.
+const MONO_FONTS: &[&str] = &[
+    "SF Mono",
+    "Menlo",
+    "JetBrains Mono",
+    "Fira Code",
+    "Hack",
+    "IBM Plex Mono",
+    "Cascadia Code",
+    "Source Code Pro",
+    "Adwaita Mono",
+    "DejaVu Sans Mono",
+    "Noto Sans Mono",
+    "Ubuntu Mono",
+];
+
 pub struct SettingsEditor {
     workspace: WeakEntity<Workspace>,
     tab: Tab,
@@ -68,9 +106,12 @@ pub struct SettingsEditor {
     editor_font: FontSelect,
     mono_font: FontSelect,
     editor_size: Entity<InputState>,
+    ui_size: Entity<InputState>,
     /// Font settings as loaded, kept so a font that isn't installed on this
-    /// machine (empty picker selection) survives a Save untouched.
+    /// machine (empty picker selection) survives a Save untouched, plus the
+    /// loaded sizes so nonsense input falls back rather than resetting.
     fonts_loaded: (Option<String>, Option<String>, Option<String>, Option<f32>),
+    ui_size_loaded: Option<f32>,
     /// Result line under the "Install kairn command" button, set on click.
     cli_status: Option<String>,
 }
@@ -137,30 +178,55 @@ impl SettingsEditor {
         });
 
         let themes = kairn_core::themes::list_themes(&ws.notes_root);
-        // Installed families for the pickers; macOS dot-prefixed system
-        // internals stay out.
-        let mut families: Vec<String> = cx.text_system().all_font_names();
-        families.retain(|f| !f.starts_with('.'));
-        families.sort();
-        families.dedup();
-        let mut font_select = |current: &Option<String>, cx: &mut Context<Self>| -> FontSelect {
-            let mut items = Vec::with_capacity(families.len() + 1);
-            items.push(DEFAULT_FONT.to_string());
-            items.extend(families.iter().cloned());
-            let selected = current.clone().unwrap_or_else(|| DEFAULT_FONT.to_string());
-            cx.new(|cx| {
-                let mut state =
-                    SelectState::new(SearchableVec::new(items), None, window, cx).searchable(true);
-                state.set_selected_value(&selected, window, cx);
-                state
-            })
+        // Installed families, macOS dot-prefixed system internals excluded, as
+        // a set to filter the curated candidate lists against.
+        let installed: std::collections::HashSet<String> = cx
+            .text_system()
+            .all_font_names()
+            .into_iter()
+            .filter(|f| !f.starts_with('.'))
+            .collect();
+        let curate = |candidates: &[&str]| -> Vec<String> {
+            candidates
+                .iter()
+                .filter(|c| installed.contains(**c))
+                .map(|c| c.to_string())
+                .collect()
         };
-        let ui_font = font_select(&ws.settings.ui_font, cx);
-        let editor_font = font_select(&ws.settings.editor_font, cx);
-        let mono_font = font_select(&ws.settings.mono_font, cx);
+        let text_fonts = curate(TEXT_FONTS);
+        let mono_fonts = curate(MONO_FONTS);
+        let mut font_select =
+            |candidates: &[String], current: &Option<String>, cx: &mut Context<Self>| -> FontSelect {
+                let mut items = Vec::with_capacity(candidates.len() + 2);
+                items.push(DEFAULT_FONT.to_string());
+                // A configured family outside the curated set stays selectable.
+                if let Some(cur) = current
+                    && !candidates.iter().any(|c| c == cur)
+                {
+                    items.push(cur.clone());
+                }
+                items.extend(candidates.iter().cloned());
+                let selected = current.clone().unwrap_or_else(|| DEFAULT_FONT.to_string());
+                cx.new(|cx| {
+                    let mut state = SelectState::new(SearchableVec::new(items), None, window, cx)
+                        .searchable(true);
+                    state.set_selected_value(&selected, window, cx);
+                    state
+                })
+            };
+        let ui_font = font_select(&text_fonts, &ws.settings.ui_font, cx);
+        let editor_font = font_select(&text_fonts, &ws.settings.editor_font, cx);
+        let mono_font = font_select(&mono_fonts, &ws.settings.mono_font, cx);
         let editor_size = cx.new(|cx| {
             let state = InputState::new(window, cx).placeholder("13");
             match ws.settings.editor_font_size {
+                Some(s) => state.default_value(fmt_size(s)),
+                None => state,
+            }
+        });
+        let ui_size = cx.new(|cx| {
+            let state = InputState::new(window, cx).placeholder("13");
+            match ws.settings.ui_font_size {
                 Some(s) => state.default_value(fmt_size(s)),
                 None => state,
             }
@@ -180,6 +246,7 @@ impl SettingsEditor {
             editor_font,
             mono_font,
             editor_size,
+            ui_size,
             cli_status: None,
             fonts_loaded: (
                 ws.settings.ui_font.clone(),
@@ -187,6 +254,7 @@ impl SettingsEditor {
                 ws.settings.mono_font.clone(),
                 ws.settings.editor_font_size,
             ),
+            ui_size_loaded: ws.settings.ui_font_size,
         }
     }
 
@@ -222,17 +290,20 @@ impl SettingsEditor {
             // keep it rather than silently dropping the other machine's font.
             None => loaded.clone(),
         };
-        let size_raw = self.editor_size.read(cx).value().trim().to_string();
-        let editor_font_size = if size_raw.is_empty() {
-            None
-        } else {
-            match size_raw.parse::<f32>() {
+        // Parse a size box: empty clears the override, a valid 9–32 sets it,
+        // and nonsense falls back to what was loaded rather than resetting.
+        let parse_size = |state: &Entity<InputState>, loaded: Option<f32>| {
+            let raw = state.read(cx).value().trim().to_string();
+            if raw.is_empty() {
+                return None;
+            }
+            match raw.parse::<f32>() {
                 Ok(s) if (9.0..=32.0).contains(&s) => Some(s),
-                // Nonsense input falls back to what was loaded, not to a
-                // surprise reset.
-                _ => self.fonts_loaded.3,
+                _ => loaded,
             }
         };
+        let editor_font_size = parse_size(&self.editor_size, self.fonts_loaded.3);
+        let ui_font_size = parse_size(&self.ui_size, self.ui_size_loaded);
         let patch = crate::vault_state::SettingsPatch {
             notes_root: self.notes_root_choice.clone(),
             hosts: self.collect_hosts(cx),
@@ -243,6 +314,7 @@ impl SettingsEditor {
             editor_font: font_of(&self.editor_font, &self.fonts_loaded.1),
             mono_font: font_of(&self.mono_font, &self.fonts_loaded.2),
             editor_font_size,
+            ui_font_size,
         };
         let _ = self.workspace.update(cx, |ws, cx| {
             ws.apply_settings(patch, window, cx);
@@ -466,6 +538,11 @@ impl SettingsEditor {
             ("dark".to_string(), "Dark".to_string()),
             ("light".to_string(), "Light".to_string()),
         ];
+        choices.extend(
+            crate::theme::BUILTIN_PRESETS
+                .iter()
+                .map(|(id, name)| (id.to_string(), name.to_string())),
+        );
         choices.extend(self.themes.iter().map(|t| (t.id.clone(), t.name.clone())));
         let mut theme_row = h_flex().gap_2().flex_wrap();
         for (i, (id, name)) in choices.into_iter().enumerate() {
@@ -494,19 +571,32 @@ impl SettingsEditor {
             .child(Self::section("Theme"))
             .child(theme_row)
             .child(div().text_size(px(11.)).opacity(0.55).child(
-                "Dark and Light are built in. Custom themes are JSON files in \
-                 .kairn/themes/ inside your notes folder; any colours, fonts, and \
-                 terminal shades they leave out fall back to the built-ins.",
+                "Dark, Light, and the coloured presets are built in. For full \
+                 control, custom themes are JSON files in .kairn/themes/ inside \
+                 your notes folder; any colours, fonts, and terminal shades they \
+                 leave out fall back to the built-ins.",
             ))
             .child(Self::section("Fonts"))
             .child(font_row("Interface", &self.ui_font))
             .child(font_row("Notes editor", &self.editor_font))
             .child(font_row("Terminal & mono", &self.mono_font))
             .child(div().text_size(px(11.)).opacity(0.55).child(
-                "Default keeps the built-in choice: the system font for the \
-                 interface, the interface font for notes, and an auto-detected \
-                 mono for the terminal.",
+                "A curated set of the families installed on this machine. Default \
+                 keeps the built-in choice: the system font for the interface, the \
+                 interface font for notes, and an auto-detected mono for the \
+                 terminal. Any other installed font can be set in a theme file.",
             ))
+            .child(Self::section("Interface text size"))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().w(px(70.)).flex_none().child(Input::new(&self.ui_size)))
+                    .child(div().text_size(px(11.)).opacity(0.55).child(
+                        "In pixels; the whole app chrome (sidebar, calendar, panes) \
+                         scales from it. Default 13.",
+                    )),
+            )
             .child(Self::section("Editor text size"))
             .child(
                 h_flex()

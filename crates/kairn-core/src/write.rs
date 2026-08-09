@@ -23,7 +23,8 @@ pub fn append_to_day(root: &Path, date: NaiveDate, text: &str) -> io::Result<Pat
         && date >= Local::now().date_naive()
         && let Some(seed) = crate::template::daily_template(root)
     {
-        create_note_if_absent(&path, &seed)?;
+        // The day's masthead titles it, so drop a redundant leading `# title`.
+        create_note_if_absent(&path, crate::template::strip_daily_title(&seed))?;
     }
     append_line(&path, &format!("* {}", text.trim()))?;
     Ok(path)
@@ -179,6 +180,58 @@ pub fn new_note_in(dir: &Path, name: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Create a fresh, untitled note in `dir`, seeded with an empty `# ` heading
+/// so the caret can land after it and the user just types the title — which
+/// then renames the file (see [`note_title_stem`]), NotePlan-style. Picks the
+/// first free "Untitled" name. Returns the note's path.
+pub fn new_untitled_note_in(dir: &Path) -> io::Result<PathBuf> {
+    let mut path = dir.join("Untitled.md");
+    let mut n = 2;
+    while path.exists() {
+        path = dir.join(format!("Untitled {n}.md"));
+        n += 1;
+    }
+    create_note_if_absent(&path, "# \n")?;
+    Ok(path)
+}
+
+/// The filename stem a note's title implies: the text of its first heading
+/// (the `# Title` line new notes are seeded with), sanitised into something
+/// safe to name a file. `None` when the first non-empty line isn't a heading,
+/// or nothing usable is left after cleaning — the caller then leaves the name
+/// alone. This is how a regular note's file follows its title.
+pub fn note_title_stem(text: &str) -> Option<String> {
+    let line = text.lines().find(|l| !l.trim().is_empty())?;
+    let trimmed = line.trim_start();
+    let hashes = trimmed.bytes().take_while(|b| *b == b'#').count();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    let rest = &trimmed[hashes..];
+    // ATX headings need whitespace after the hashes; "#project" is a tag-like
+    // first line, not a title.
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    sanitize_title_stem(rest.trim())
+}
+
+/// Turn heading text into a safe file stem: path separators and colons become
+/// dashes, and the leading/trailing characters that would make a bad or hidden
+/// filename are trimmed. `None` when nothing usable is left.
+fn sanitize_title_stem(title: &str) -> Option<String> {
+    let cleaned: String = title
+        .chars()
+        .map(|c| if matches!(c, '/' | '\\' | ':') { '-' } else { c })
+        .collect();
+    let cleaned = cleaned
+        .trim()
+        .trim_start_matches(['.', '@'])
+        .trim_end_matches('.')
+        .trim();
+    (!cleaned.is_empty()).then(|| cleaned.to_string())
+}
+
 fn atomic_write(path: &Path, content: &str) -> io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -282,13 +335,8 @@ fn edit_line_in_text(
 
 /// Toggle the task at `line_idx` between open and done. See
 /// [`edit_line_in_text`] for the relocation contract.
-pub fn toggle_task_in_text(
-    text: &str,
-    line_idx: usize,
-    expected: &str,
-    now: &str,
-) -> Option<String> {
-    edit_line_in_text(text, line_idx, expected, |line| toggle_task_line(line, now))
+pub fn toggle_task_in_text(text: &str, line_idx: usize, expected: &str) -> Option<String> {
+    edit_line_in_text(text, line_idx, expected, toggle_task_line)
         .map(|(new_text, _)| new_text)
 }
 
@@ -451,8 +499,7 @@ pub fn reschedule_task_on_disk(
 /// change was applied.
 pub fn toggle_task_on_disk(path: &Path, line_idx: usize, expected: &str) -> io::Result<bool> {
     let text = fs::read_to_string(path)?;
-    let now = Local::now().format("%Y-%m-%d %H:%M").to_string();
-    let Some(new_text) = toggle_task_in_text(&text, line_idx, expected, &now) else {
+    let Some(new_text) = toggle_task_in_text(&text, line_idx, expected) else {
         return Ok(false);
     };
     atomic_write(path, &new_text)?;
@@ -466,25 +513,24 @@ mod tests {
 
     #[test]
     fn toggle_in_text_tracks_moved_lines() {
-        let now = "2026-08-06 21:30";
         let text = "# Day\n* one\n* two\n";
         // Straightforward: index matches.
         assert_eq!(
-            toggle_task_in_text(text, 2, "* two", now).as_deref(),
-            Some("# Day\n* one\n* [x] two @done(2026-08-06 21:30)\n")
+            toggle_task_in_text(text, 2, "* two").as_deref(),
+            Some("# Day\n* one\n* [x] two\n")
         );
         // A line was inserted above since render: found again by content.
         let shifted = "# Day\nnew line\n* one\n* two\n";
         assert_eq!(
-            toggle_task_in_text(shifted, 2, "* two", now).as_deref(),
-            Some("# Day\nnew line\n* one\n* [x] two @done(2026-08-06 21:30)\n")
+            toggle_task_in_text(shifted, 2, "* two").as_deref(),
+            Some("# Day\nnew line\n* one\n* [x] two\n")
         );
         // The line is gone: nothing is written.
-        assert_eq!(toggle_task_in_text("# Day\n* other\n", 1, "* two", now), None);
+        assert_eq!(toggle_task_in_text("# Day\n* other\n", 1, "* two"), None);
         // No trailing newline is preserved as-is.
         assert_eq!(
-            toggle_task_in_text("* one", 0, "* one", now).as_deref(),
-            Some("* [x] one @done(2026-08-06 21:30)")
+            toggle_task_in_text("* one", 0, "* one").as_deref(),
+            Some("* [x] one")
         );
     }
 
@@ -543,6 +589,33 @@ mod tests {
         let again = new_note_in(&dir, "Meeting Notes").expect("existing");
         assert_eq!(again, path);
         assert_eq!(fs::read_to_string(&path).expect("read"), "real content\n");
+    }
+
+    #[test]
+    fn untitled_note_picks_a_free_name() {
+        let root = ScratchRoot::new("untitled");
+        let dir = root.0.join("Notes");
+        let first = new_untitled_note_in(&dir).expect("create");
+        assert_eq!(first, dir.join("Untitled.md"));
+        assert_eq!(fs::read_to_string(&first).expect("read"), "# \n");
+        // A second one steps to a numbered name rather than colliding.
+        let second = new_untitled_note_in(&dir).expect("create");
+        assert_eq!(second, dir.join("Untitled 2.md"));
+    }
+
+    #[test]
+    fn title_stem_follows_first_heading() {
+        assert_eq!(note_title_stem("# Groceries\nmilk\n").as_deref(), Some("Groceries"));
+        assert_eq!(note_title_stem("\n\n##  Weekly Plan \n").as_deref(), Some("Weekly Plan"));
+        // Path separators and colons are made filename-safe.
+        assert_eq!(note_title_stem("# Meeting: A/B\n").as_deref(), Some("Meeting- A-B"));
+        // A leading '@' (NotePlan's special prefix) is trimmed off.
+        assert_eq!(note_title_stem("# @Home\n").as_deref(), Some("Home"));
+        // No usable title: empty heading, a non-heading first line, or a
+        // tag-like "#word" with no space after the hashes.
+        assert_eq!(note_title_stem("# \nbody\n"), None);
+        assert_eq!(note_title_stem("just text\n"), None);
+        assert_eq!(note_title_stem("#project first\n"), None);
     }
 
     #[test]
