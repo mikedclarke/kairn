@@ -1,15 +1,15 @@
 //! Window chrome: the custom titlebar and the statusbar.
 
 use gpui::{
-    App, Context, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, div, px,
+    App, Context, Hsla, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{TitleBar, h_flex};
 
 use crate::keymap::{ToggleSidebar, ToggleSwitcher, chord};
 use crate::theme::KairnTheme;
 use crate::ui::kbd;
-use crate::workspace::Workspace;
+use crate::workspace::{LayoutMode, Workspace};
 
 impl Workspace {
     pub(crate) fn render_titlebar(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -33,44 +33,100 @@ impl Workspace {
             .child(div().flex_1().child("Jump to session, day, or note"))
             .child(kbd(t, chord("J")));
 
-        // Open/close the terminal pane, so it isn't always stuck on screen.
-        let terminal_open = self.layout.shows_terminal();
-        let terminal_btn = titlebar_button(t, "terminal-btn", cx)
-            .font_family(t.mono_font.clone())
-            .text_color(if terminal_open { t.accent } else { t.dim })
-            .child(">_")
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.toggle_terminal_pane(window, cx);
-            }));
-
-        let sidebar_btn = titlebar_button(t, "sidebar-btn", cx)
+        let hover_bg = t.hover;
+        let sidebar_btn = div()
+            .id("sidebar-btn")
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(30.))
+            .h(px(26.))
+            .rounded(px(6.))
+            .text_size(t.ui_px(16.))
             .text_color(t.dim)
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover_bg))
             .child("◧")
             .on_click(cx.listener(|this, _, window, cx| {
                 this.on_toggle_sidebar(&ToggleSidebar, window, cx);
             }));
 
+        // The layout switch: Notes | Split | Term. One click sets the layout,
+        // the active state stays lit. Notes-first, so Split is the resting
+        // state; Term hands the whole main area to the terminal.
+        let layout_seg = h_flex()
+            .gap(px(3.))
+            .p(px(2.))
+            .rounded(px(7.))
+            .bg(t.bg)
+            .border_1()
+            .border_color(t.border)
+            .child(self.layout_seg_button(
+                t,
+                "seg-notes",
+                self.layout == LayoutMode::NotesFull,
+                LayoutMode::NotesFull,
+                cx,
+            ))
+            .child(self.layout_seg_button(
+                t,
+                "seg-split",
+                self.layout == LayoutMode::Split,
+                LayoutMode::Split,
+                cx,
+            ))
+            .child(self.layout_seg_button(
+                t,
+                "seg-term",
+                self.layout == LayoutMode::TerminalFull,
+                LayoutMode::TerminalFull,
+                cx,
+            ));
+
         TitleBar::new()
-            .child(
-                h_flex()
-                    .gap(px(8.))
-                    .child(sidebar_btn)
-                    .child(
-                        h_flex()
-                            .gap(px(7.))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_size(t.ui_px(13.))
-                            .child(cairn_mark(t))
-                            .child("Kairn"),
-                    ),
-            )
+            .child(h_flex().h_full().items_center().child(sidebar_btn))
             .child(
                 h_flex()
                     .gap(px(8.))
                     .pr(px(8.))
                     .child(jump_hint)
-                    .child(terminal_btn),
+                    .child(layout_seg),
             )
+    }
+
+    /// One cell of the layout segment: its glyph (drawn, so it renders the
+    /// same on every platform), lit when its layout is active.
+    fn layout_seg_button(
+        &self,
+        t: &KairnTheme,
+        id: &'static str,
+        active: bool,
+        mode: LayoutMode,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let hover_bg = t.hover;
+        let sel = t.sel;
+        let color = if active { t.accent } else { t.dim };
+        let glyph = match mode {
+            LayoutMode::NotesFull => seg_icon_notes(color).into_any_element(),
+            LayoutMode::TerminalFull => seg_icon_term(t, color).into_any_element(),
+            _ => seg_icon_split(color).into_any_element(),
+        };
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(30.))
+            .py(px(4.))
+            .rounded(px(5.))
+            .cursor_pointer()
+            .when(active, |d| d.bg(sel))
+            .when(!active, |d| d.hover(move |s| s.bg(hover_bg)))
+            .child(glyph)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.set_layout(mode, window, cx);
+            }))
     }
 
     /// Warnings only: each of these is a rare state the user must know
@@ -108,32 +164,41 @@ impl Workspace {
     }
 }
 
-pub(crate) fn cairn_mark(t: &KairnTheme) -> impl IntoElement {
-    // The stacked-stones mark, drawn as bars so no asset pipeline is needed.
+/// Notes-full glyph: a page with a couple of text lines.
+fn seg_icon_notes(color: Hsla) -> impl IntoElement {
     div()
+        .w(px(13.))
+        .h(px(11.))
+        .rounded(px(2.))
+        .border_1()
+        .border_color(color)
         .flex()
         .flex_col()
-        .items_center()
-        .gap(px(1.))
-        .child(div().w(px(4.)).h(px(2.)).rounded_full().bg(t.text.opacity(0.35)))
-        .child(div().w(px(7.)).h(px(2.5)).rounded_full().bg(t.text.opacity(0.5)))
-        .child(div().w(px(10.)).h(px(3.)).rounded_full().bg(t.text.opacity(0.7)))
-        .child(div().w(px(13.)).h(px(3.5)).rounded_full().bg(t.text.opacity(0.9)))
+        .justify_center()
+        .gap(px(1.5))
+        .px(px(2.5))
+        .child(div().h(px(1.)).w_full().bg(color))
+        .child(div().h(px(1.)).w(px(5.)).bg(color))
 }
 
-pub(crate) fn titlebar_button<T: 'static>(
-    t: &KairnTheme,
-    id: &'static str,
-    _cx: &mut Context<T>,
-) -> gpui::Stateful<gpui::Div> {
-    let hover_bg = t.hover;
+/// Split glyph: a frame divided into two panes.
+fn seg_icon_split(color: Hsla) -> impl IntoElement {
     div()
-        .id(id)
-        .px(px(8.))
-        .py(px(3.))
-        .rounded(px(6.))
-        .text_size(t.ui_px(12.))
-        .text_color(t.dim)
-        .cursor_pointer()
-        .hover(move |s| s.bg(hover_bg))
+        .w(px(13.))
+        .h(px(11.))
+        .rounded(px(2.))
+        .border_1()
+        .border_color(color)
+        .flex()
+        .justify_center()
+        .child(div().w(px(1.)).h_full().bg(color))
+}
+
+/// Terminal-full glyph: the `>_` prompt, the app's established terminal mark.
+fn seg_icon_term(t: &KairnTheme, color: Hsla) -> impl IntoElement {
+    div()
+        .font_family(t.mono_font.clone())
+        .text_size(t.ui_px(11.))
+        .text_color(color)
+        .child(">_")
 }

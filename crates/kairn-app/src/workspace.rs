@@ -334,13 +334,15 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The titlebar toggle: close the terminal (full-width notes) or bring
-    /// it back to the split.
-    pub(crate) fn toggle_terminal_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.layout.shows_terminal() {
-            self.layout = LayoutMode::NotesFull;
-        } else {
-            self.layout = LayoutMode::Split;
+    /// The titlebar segment: set one of the three layouts directly. Split and
+    /// TerminalFull hand focus to the terminal; NotesFull leaves it with the
+    /// note editor. Also the escape from Writing back into a normal layout.
+    pub(crate) fn set_layout(&mut self, mode: LayoutMode, window: &mut Window, cx: &mut Context<Self>) {
+        if self.layout == mode {
+            return;
+        }
+        self.layout = mode;
+        if mode.shows_terminal() {
             self.focus_active_terminal(window, cx);
         }
         cx.notify();

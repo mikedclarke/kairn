@@ -30,6 +30,8 @@ same fact twice; no em dashes. Rewrite to this standard before releasing.
 - The text selection highlight is clearer and no longer dims the selected text.
 - Completing a task no longer writes an @done(date) stamp, since the note's day already dates it.
 - The keybindings list in Settings shows larger, higher-contrast key chips that are easier to read.
+- The titlebar has a Notes, Split, and Terminal layout switch in place of the single terminal toggle, so full-screen terminal is one click.
+- The Kairn name and mark are removed from the titlebar, leaving the sidebar button on the left.
 
 ## Fixed
 
