@@ -17,6 +17,13 @@ use crate::types::{ChangesPage, ContentHash, PutOutcome, Rev, Seq, VaultPath};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// A hard ceiling on the whole call (connect + send + receive). The per-phase
+/// timeouts above don't cover every stall — a connection pooled from a since-
+/// restarted server, or a peer that accepts then goes silent mid-body, can hang
+/// a blocking client indefinitely. This caps it so a wedged call errors and the
+/// next cycle retries on a fresh connection, which matters most for the always-
+/// on bridge. Generous enough for a 25 MB blob (spec §4) on a slow link.
+const OVERALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// An HTTP client bound to one server, one vault, and one device token. Cheap to
 /// construct; the underlying `ureq::Agent` pools connections across cycles.
@@ -39,6 +46,7 @@ impl HttpTransport {
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(CONNECT_TIMEOUT)
             .timeout_read(READ_TIMEOUT)
+            .timeout(OVERALL_TIMEOUT)
             .build();
         let mut base = server_url.into();
         while base.ends_with('/') {
