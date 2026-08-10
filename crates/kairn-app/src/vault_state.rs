@@ -70,7 +70,15 @@ impl Workspace {
     }
 
     pub fn open_note(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let was_open = self.view == PaneView::Note(path.clone());
         self.flush_note_editor(cx);
+        // The flush may have just renamed this very note to its typed title
+        // (a click on its not-yet-refreshed tree row): follow the rename
+        // rather than reopening the stale path as a fresh empty note.
+        let path = match (&self.view, was_open) {
+            (PaneView::Note(renamed), true) => renamed.clone(),
+            _ => path,
+        };
         self.view = PaneView::Note(path);
         self.show_note_pane();
         self.reload_notes(cx);
@@ -85,9 +93,20 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Write the single-buffer editor's pending edits now (navigation, save
-    /// shortcut, window close). A no-op when the editor is clean or absent.
+    /// The flush point (navigation, save shortcut, quit, window close):
+    /// write the single-buffer editor's pending edits now, then let a
+    /// freshly created untitled note's filename catch up with its typed
+    /// title. A no-op when the editor is clean or absent.
     pub(crate) fn flush_note_editor(&mut self, cx: &mut Context<Self>) {
+        self.save_note_editor(cx);
+        if let Some(path) = self.note_editor.as_ref().map(|e| e.read(cx).path.clone()) {
+            self.rename_note_to_title(path, cx);
+        }
+    }
+
+    /// The save half of a flush, without the title rename: for callers about
+    /// to trash or rename the file at a path they are holding on to.
+    pub(crate) fn save_note_editor(&mut self, cx: &mut Context<Self>) {
         if let Some(editor) = &self.note_editor {
             editor.update(cx, |ed, cx| ed.save_now(cx));
         }
@@ -96,7 +115,15 @@ impl Workspace {
     /// Keep the single-buffer editor entity in step with the pane's document
     /// after a reload: same file merges the fresh disk state into any
     /// in-flight edits; a different file (or view) swaps the editor out.
-    fn sync_note_editor(&mut self, cx: &mut Context<Self>) {
+    /// `disk_text` is what the file actually holds (the editor's merge
+    /// baseline); `seed` is the daily template rendered over a blank day,
+    /// which must never masquerade as disk state.
+    fn sync_note_editor(
+        &mut self,
+        disk_text: Option<&str>,
+        seed: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
         use crate::note_editor::{NoteEditor, NoteEditorEvent};
 
         if self.doc_error.is_some() || self.root_missing {
@@ -115,20 +142,19 @@ impl Workspace {
             self._note_editor_sub = None;
             return;
         };
-        let text = self.doc_text.clone().unwrap_or_default();
+        let text = disk_text.unwrap_or_default();
         if let Some(editor) = &self.note_editor
             && editor.read(cx).path == path
         {
-            editor.update(cx, |ed, cx| ed.reconcile_from_disk(&text, cx));
+            editor.update(cx, |ed, cx| ed.reconcile_from_disk(text, cx));
             return;
         }
-        let editor = cx.new(|cx| NoteEditor::new(path, &text, cx));
+        let editor = cx.new(|cx| NoteEditor::new(path, text, seed, cx));
         self._note_editor_sub = Some(cx.subscribe(
             &editor,
             |this, _editor, event: &NoteEditorEvent, cx| match event {
                 NoteEditorEvent::Saved(path) => {
                     this.note_self_write(path);
-                    this.rename_note_to_title(path.clone(), cx);
                     this.reload_notes(cx);
                     cx.notify();
                 }
@@ -233,7 +259,7 @@ impl Workspace {
             PaneView::Note(p) => Some(p.clone()),
             PaneView::Tasks(_) => None,
         };
-        let (text, doc_error) = match path.as_deref() {
+        let (disk_text, doc_error) = match path.as_deref() {
             None => (None, None),
             Some(p) => match std::fs::read_to_string(p) {
                 Ok(t) => (Some(t), None),
@@ -244,16 +270,18 @@ impl Workspace {
             },
         };
         self.doc_error = doc_error;
-        // A day from today onward with no content yet starts from the daily
-        // template (Notes/@Templates/Daily.md): rendered immediately, written
-        // to disk only when the first edit lands. An empty file already on
-        // disk (NotePlan pre-creates these, and a stray visit can too) counts
-        // as no content, so the template still seeds rather than the day
-        // reading blank forever. Past days stay blank — a template there would
-        // dress up history that never happened. The settings rule can narrow
-        // this to weekdays or turn it off.
-        let day_is_blank = text.as_deref().is_none_or(|s| s.trim().is_empty());
-        let text = if day_is_blank
+        // A day from today onward with no content yet renders seeded from the
+        // daily template (Notes/@Templates/Daily.md). The seed is display
+        // plus intent, never disk state: the editor keeps its baseline at
+        // what the file actually holds — an empty file already on disk counts
+        // (NotePlan pre-creates these, and a stray visit can too) — and
+        // writes nothing until a real edit lands, so the first save merges
+        // cleanly instead of reading the template as externally deleted.
+        // Past days stay blank — a template there would dress up history that
+        // never happened. The settings rule can narrow this to weekdays or
+        // turn it off.
+        let day_is_blank = disk_text.as_deref().is_none_or(|s| s.trim().is_empty());
+        let seed = if day_is_blank
             && matches!(self.view, PaneView::Day)
             && self.doc_error.is_none()
             && !self.root_missing
@@ -265,9 +293,12 @@ impl Workspace {
             notes::daily_template(&self.notes_root)
                 .map(|body| notes::strip_daily_title(&body).to_string())
         } else {
-            text
+            None
         };
-        self.doc_text = text;
+        self.doc_text = match &seed {
+            Some(s) => Some(s.clone()),
+            None => disk_text.clone(),
+        };
         self.day_timeline = match (&self.view, &self.doc_text) {
             (PaneView::Day, Some(text)) if self.settings.day_timeline => {
                 notes::time_blocks(text)
@@ -301,7 +332,7 @@ impl Workspace {
             .unwrap_or_default();
         self.doc_path = path;
         self.note_days = scan.days;
-        self.sync_note_editor(cx);
+        self.sync_note_editor(disk_text.as_deref(), seed.as_deref(), cx);
     }
 
     /// Open whatever a wiki link points at: a day, an existing note, or a
@@ -354,7 +385,8 @@ impl Workspace {
     /// with the file. If the trashed note is on screen, the pane drops back
     /// to the day view.
     pub fn trash_note_at(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        self.flush_note_editor(cx);
+        // Save without the title rename: `path` must still name the file.
+        self.save_note_editor(cx);
         match notes::trash_note(&self.notes_root, path) {
             Ok(_) => {
                 if self.view == PaneView::Note(path.to_path_buf()) {
@@ -376,7 +408,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.flush_note_editor(cx);
+        // Save without the title rename: `path` must still name the file.
+        self.save_note_editor(cx);
         match notes::rename_note(path, new_stem) {
             Ok(new_path) => {
                 if self.view == PaneView::Note(path.to_path_buf()) {
@@ -391,8 +424,8 @@ impl Workspace {
 
     /// Create a fresh untitled note in a folder of the Notes tree and open it,
     /// the caret sitting after the seeded `# ` so the user just types the
-    /// title — which then renames the file (see [`Self::rename_note_to_title`]).
-    /// No name prompt: NotePlan-style.
+    /// title — the file takes that name at the next flush (see
+    /// [`Self::rename_note_to_title`]). No name prompt: NotePlan-style.
     pub fn create_new_note(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         match notes::new_untitled_note_in(&dir) {
             Ok(path) => {
@@ -410,15 +443,21 @@ impl Workspace {
         }
     }
 
-    /// After a regular note saves, keep its filename in step with its title:
-    /// derive a stem from the first heading and rename the file to match.
-    /// Daily notes are date-named and never touched; a name collision or an
-    /// unusable title just leaves the file where it is (the title simply
-    /// doesn't match the filename until it's unique and valid).
+    /// At a flush point, let a freshly created note's filename catch up with
+    /// its typed title: derive a stem from the first heading and rename the
+    /// file to match. Only notes still carrying an "Untitled" name are ever
+    /// renamed — retitling an existing note must not silently move its file
+    /// (wiki links to it would dangle, and clicking one would grow a fresh
+    /// empty note at the old name). Daily notes are date-named and never
+    /// touched. A name collision leaves the file where it is and says so.
     fn rename_note_to_title(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         // Only the note actually on screen, and only regular notes — dailies
         // are PaneView::Day and keep their date name.
         if self.view != PaneView::Note(path.clone()) {
+            return;
+        }
+        let current = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+        if !notes::is_untitled_stem(current) {
             return;
         }
         let editor = match &self.note_editor {
@@ -428,16 +467,32 @@ impl Workspace {
         let Some(stem) = editor.read(cx).title_stem() else {
             return;
         };
-        let current = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
         if stem == current {
             return;
         }
-        if let Ok(new_path) = notes::rename_note(&path, &stem)
-            && new_path != path
-        {
-            self.note_self_write(&new_path);
-            editor.update(cx, |ed, _| ed.set_path(new_path.clone()));
-            self.view = PaneView::Note(new_path);
+        match notes::rename_note(&path, &stem) {
+            Ok(new_path) if new_path != path => {
+                self.note_self_write(&new_path);
+                editor.update(cx, |ed, _| ed.set_path(new_path.clone()));
+                self.view = PaneView::Note(new_path);
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Flush points don't carry a Window; reach the active one for
+                // the notice, after the current update settles.
+                let msg = format!(
+                    "Note kept as \"{current}\": a note named \"{stem}\" already exists here."
+                );
+                match cx.active_window() {
+                    Some(win) => cx.defer(move |cx| {
+                        let _ = win.update(cx, |_, window, cx| {
+                            window.push_notification(msg, cx);
+                        });
+                    }),
+                    None => eprintln!("kairn: {msg}"),
+                }
+            }
+            Err(e) => eprintln!("kairn: could not rename {}: {e}", path.display()),
         }
     }
 

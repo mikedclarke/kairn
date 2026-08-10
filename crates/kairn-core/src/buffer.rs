@@ -52,6 +52,11 @@ pub struct NoteBuffer {
     /// The file content our edits are relative to: what was last loaded,
     /// saved, or absorbed from disk.
     baseline: String,
+    /// The text is a pre-rendered seed (the daily template) over a blank
+    /// file, untouched by the user: nothing saves until a real edit lands,
+    /// and content arriving on disk replaces the seed instead of merging
+    /// with it.
+    seeded: bool,
     undo: Vec<UndoGroup>,
     redo: Vec<UndoGroup>,
 }
@@ -59,7 +64,22 @@ pub struct NoteBuffer {
 impl NoteBuffer {
     pub fn new(text: impl Into<String>) -> Self {
         let text = text.into();
-        Self { baseline: text.clone(), text, undo: Vec::new(), redo: Vec::new() }
+        Self { baseline: text.clone(), text, seeded: false, undo: Vec::new(), redo: Vec::new() }
+    }
+
+    /// A buffer opened over a blank (or absent) file with `seed` rendered in
+    /// place of the emptiness: the daily-template case. The baseline stays
+    /// the real disk content — treating the seed as disk state would make the
+    /// next reconcile read every seed line as externally deleted and wipe the
+    /// note (the pre-created empty daily file bug).
+    pub fn with_seed(disk: impl Into<String>, seed: impl Into<String>) -> Self {
+        Self {
+            baseline: disk.into(),
+            text: seed.into(),
+            seeded: true,
+            undo: Vec::new(),
+            redo: Vec::new(),
+        }
     }
 
     pub fn text(&self) -> &str {
@@ -71,9 +91,10 @@ impl NoteBuffer {
     }
 
     /// Whether the buffer holds edits the baseline (last known disk state)
-    /// does not.
+    /// does not. An untouched seed is not an edit: a day the user only
+    /// looked at never writes a file.
     pub fn is_dirty(&self) -> bool {
-        self.text != self.baseline
+        !self.seeded && self.text != self.baseline
     }
 
     /// Record that `text()` was just written to disk successfully.
@@ -108,6 +129,8 @@ impl NoteBuffer {
         if removed.is_empty() && insert.is_empty() {
             return floor_boundary(&self.text, cursor_before);
         }
+        // The first real edit makes the seed the user's own content.
+        self.seeded = false;
         self.text.replace_range(start..end, insert);
         let cursor_after = start + insert.len();
         self.redo.clear();
@@ -289,6 +312,20 @@ impl NoteBuffer {
     /// caller must surface.
     pub fn reconcile(&mut self, disk: &str, cursor: usize) -> (usize, Vec<String>) {
         if disk == self.baseline {
+            return (floor_boundary(&self.text, cursor), Vec::new());
+        }
+        if self.seeded {
+            // The file changed under an untouched seed. Still blank: keep
+            // showing the seed over the new baseline. Real content: the day
+            // is no longer blank, the seed bows out, and the disk side is
+            // adopted wholesale — nothing typed exists to conflict with.
+            self.baseline = disk.to_string();
+            if !disk.trim().is_empty() {
+                self.text = disk.to_string();
+                self.seeded = false;
+                self.undo.clear();
+                self.redo.clear();
+            }
             return (floor_boundary(&self.text, cursor), Vec::new());
         }
         let merged = merge3(&self.baseline, disk, &self.text);
@@ -545,6 +582,46 @@ mod tests {
         let (_, conflicts) = b.reconcile("a\nagent\n", 7);
         assert_eq!(b.text(), "a\nagent\n");
         assert_eq!(conflicts, vec!["typed".to_string()]);
+    }
+
+    #[test]
+    fn seeded_buffer_only_saves_after_a_real_edit() {
+        let mut b = NoteBuffer::with_seed("", "## Tasks\n\n## Notes\n");
+        assert!(!b.is_dirty());
+        b.edit(9..9, "* call the bank\n", 9, 1000);
+        assert!(b.is_dirty());
+    }
+
+    #[test]
+    fn typing_into_a_seeded_day_survives_reconcile_with_the_empty_file() {
+        // A pre-created empty daily file: the template renders as a seed
+        // while disk holds "". Saving must not read the seed lines as
+        // externally deleted and move the typed text into conflicts.
+        let mut b = NoteBuffer::with_seed("", "## Tasks\n\n## Notes\n");
+        b.edit(9..9, "* call the bank\n", 9, 1000);
+        let (_, conflicts) = b.reconcile("", 25);
+        assert!(conflicts.is_empty());
+        assert_eq!(b.text(), "## Tasks\n* call the bank\n\n## Notes\n");
+        assert!(b.is_dirty());
+    }
+
+    #[test]
+    fn seeded_buffer_adopts_external_content_without_conflicts() {
+        let mut b = NoteBuffer::with_seed("", "## Tasks\n\n## Notes\n");
+        let (_, conflicts) = b.reconcile("* captured\n", 0);
+        assert!(conflicts.is_empty());
+        assert_eq!(b.text(), "* captured\n");
+        assert!(!b.is_dirty());
+    }
+
+    #[test]
+    fn seeded_buffer_keeps_the_seed_over_a_still_blank_rewrite() {
+        let mut b = NoteBuffer::with_seed("", "## Tasks\n");
+        let (_, conflicts) = b.reconcile("\n", 0);
+        assert!(conflicts.is_empty());
+        assert_eq!(b.text(), "## Tasks\n");
+        assert_eq!(b.baseline(), "\n");
+        assert!(!b.is_dirty());
     }
 
     #[test]

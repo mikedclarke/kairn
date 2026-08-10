@@ -195,6 +195,20 @@ pub fn new_untitled_note_in(dir: &Path) -> io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Whether `stem` is a name [`new_untitled_note_in`] hands out ("Untitled",
+/// "Untitled 2", ...). Title-driven renaming applies only to these: a note
+/// that already carries a real name must never be moved on disk just because
+/// its first heading was edited (wiki links to it would silently dangle).
+pub fn is_untitled_stem(stem: &str) -> bool {
+    match stem.strip_prefix("Untitled") {
+        Some("") => true,
+        Some(rest) => rest
+            .strip_prefix(' ')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
+        None => false,
+    }
+}
+
 /// The filename stem a note's title implies: the text of its first heading
 /// (the `# Title` line new notes are seeded with), sanitised into something
 /// safe to name a file. `None` when the first non-empty line isn't a heading,
@@ -601,6 +615,16 @@ mod tests {
         // A second one steps to a numbered name rather than colliding.
         let second = new_untitled_note_in(&dir).expect("create");
         assert_eq!(second, dir.join("Untitled 2.md"));
+    }
+
+    #[test]
+    fn untitled_stems_are_recognised() {
+        for good in ["Untitled", "Untitled 2", "Untitled 10"] {
+            assert!(is_untitled_stem(good), "{good:?} should count as untitled");
+        }
+        for bad in ["Groceries", "Untitled2", "Untitled x", "untitled", "Untitled ", "Untitled 2b"] {
+            assert!(!is_untitled_stem(bad), "{bad:?} should not count as untitled");
+        }
     }
 
     #[test]

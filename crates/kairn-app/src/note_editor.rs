@@ -181,15 +181,20 @@ fn now_ms() -> u64 {
 }
 
 impl NoteEditor {
-    /// `text` is the document as read from disk (or the rendered template
-    /// for a day with no file yet); `path` is where saves go, which may not
-    /// exist until the first save creates it.
-    pub fn new(path: PathBuf, text: &str, cx: &mut Context<Self>) -> Self {
+    /// `text` is the document as read from disk; `seed` is content rendered
+    /// over a blank day (the daily template), kept out of the disk baseline
+    /// and written only once a real edit lands; `path` is where saves go,
+    /// which may not exist until the first save creates it.
+    pub fn new(path: PathBuf, text: &str, seed: Option<&str>, cx: &mut Context<Self>) -> Self {
         let crlf = text.contains("\r\n");
         let text = if crlf { text.replace("\r\n", "\n") } else { text.to_string() };
+        let buffer = match seed {
+            Some(seed) => NoteBuffer::with_seed(text, seed),
+            None => NoteBuffer::new(text),
+        };
         Self {
             path,
-            buffer: NoteBuffer::new(text),
+            buffer,
             crlf,
             cursor: 0,
             selection_anchor: None,
