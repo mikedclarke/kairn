@@ -14,13 +14,20 @@ use crate::vault::{daily_file, daily_path};
 
 /// Append a captured line to a day's note as an open task, creating the file
 /// if the day has none yet. A day from today onward that is created here
-/// starts from the daily template, matching what the app shows for an empty
-/// day, so a capture never flattens the template layout the user was
-/// looking at. Returns the file written.
-pub fn append_to_day(root: &Path, date: NaiveDate, text: &str) -> io::Result<PathBuf> {
+/// starts from the daily template when `template_rule` (the configured
+/// daily-template rule) applies to that day, matching what the app shows
+/// for an empty day, so a capture never flattens the template layout the
+/// user was looking at. Returns the file written.
+pub fn append_to_day(
+    root: &Path,
+    date: NaiveDate,
+    text: &str,
+    template_rule: &str,
+) -> io::Result<PathBuf> {
     let path = daily_file(root, date).unwrap_or_else(|| daily_path(root, date));
     if !path.exists()
         && date >= Local::now().date_naive()
+        && crate::template::template_applies(template_rule, date)
         && let Some(seed) = crate::template::daily_template(root)
     {
         // The day's masthead titles it, so drop a redundant leading `# title`.
@@ -33,12 +40,17 @@ pub fn append_to_day(root: &Path, date: NaiveDate, text: &str) -> io::Result<Pat
 /// Capture a line of input into a day's note: the quick-capture flow the app
 /// and the CLI share. Blank input is a no-op; anything else lands as an open
 /// task. Returns the file written, `None` when there was nothing to write.
-pub fn capture(root: &Path, date: NaiveDate, text: &str) -> io::Result<Option<PathBuf>> {
+pub fn capture(
+    root: &Path,
+    date: NaiveDate,
+    text: &str,
+    template_rule: &str,
+) -> io::Result<Option<PathBuf>> {
     let text = text.trim();
     if text.is_empty() {
         return Ok(None);
     }
-    append_to_day(root, date, text).map(Some)
+    append_to_day(root, date, text, template_rule).map(Some)
 }
 
 /// Append `line` (which may contain newlines) to a note, re-reading the file
@@ -801,10 +813,10 @@ mod tests {
         let root = ScratchRoot::new("capture");
         let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 7).expect("valid");
         // Blank input writes nothing at all.
-        assert_eq!(capture(&root.0, date, "   ").expect("io"), None);
+        assert_eq!(capture(&root.0, date, "   ", "always").expect("io"), None);
         assert!(!root.0.join("Calendar/20260807.md").exists());
         // Real input lands as an open task.
-        let path = capture(&root.0, date, "call the bank").expect("io").expect("written");
+        let path = capture(&root.0, date, "call the bank", "always").expect("io").expect("written");
         assert_eq!(fs::read_to_string(&path).expect("read"), "* call the bank\n");
     }
 
@@ -814,15 +826,41 @@ mod tests {
         root.write("Notes/@Templates/Daily.md", "### Tasks\n\n### Notes\n");
         // A capture into a brand-new future day lands under the template.
         let future = Local::now().date_naive() + chrono::Days::new(1);
-        let path = capture(&root.0, future, "pack bags").expect("io").expect("written");
+        let path = capture(&root.0, future, "pack bags", "always").expect("io").expect("written");
         assert_eq!(
             fs::read_to_string(&path).expect("read"),
             "### Tasks\n\n### Notes\n* pack bags\n"
         );
         // A past day is never dressed up with today's template.
         let past = chrono::NaiveDate::from_ymd_opt(2020, 1, 2).expect("valid");
-        let past_path = capture(&root.0, past, "old note").expect("io").expect("written");
+        let past_path = capture(&root.0, past, "old note", "always").expect("io").expect("written");
         assert_eq!(fs::read_to_string(&past_path).expect("read"), "* old note\n");
+    }
+
+    #[test]
+    fn capture_respects_the_template_rule() {
+        use chrono::Datelike as _;
+        let root = ScratchRoot::new("capture-rule");
+        root.write("Notes/@Templates/Daily.md", "### Tasks\n");
+        let today = Local::now().date_naive();
+        // Under "off" no day is seeded, template file or not.
+        let path = capture(&root.0, today, "plain day", "off").expect("io").expect("written");
+        assert_eq!(fs::read_to_string(&path).expect("read"), "* plain day\n");
+        // Under "weekdays" the next Saturday goes unseeded but the next
+        // Monday is dressed — the same days the app's day view would seed.
+        let mut day = today + chrono::Days::new(1);
+        let (saturday, monday) = loop {
+            if day.weekday() == chrono::Weekday::Sat {
+                break (day, day + chrono::Days::new(2));
+            }
+            day = day + chrono::Days::new(1);
+        };
+        let sat_path =
+            capture(&root.0, saturday, "mow the lawn", "weekdays").expect("io").expect("written");
+        assert_eq!(fs::read_to_string(&sat_path).expect("read"), "* mow the lawn\n");
+        let mon_path =
+            capture(&root.0, monday, "stand-up", "weekdays").expect("io").expect("written");
+        assert_eq!(fs::read_to_string(&mon_path).expect("read"), "### Tasks\n* stand-up\n");
     }
 
     #[cfg(unix)]

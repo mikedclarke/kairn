@@ -410,7 +410,10 @@ fn cmd_append(
     if text.is_empty() {
         return Err(Failure::new(2, "nothing to add: the text is empty"));
     }
-    let path = write::append_to_day(root, date, text).map_err(|e| {
+    // The app's configured daily-template rule decides whether a brand-new
+    // day gets seeded, so a CLI capture matches what the app would show.
+    let rule = Settings::load().daily_template_rule;
+    let path = write::append_to_day(root, date, text, &rule).map_err(|e| {
         Failure::new(EXIT_FAILED, format!("could not write the daily note: {e}"))
     })?;
     log_write(root, actor, action, &path, text);

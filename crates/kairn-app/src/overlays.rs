@@ -131,7 +131,12 @@ impl Workspace {
             return;
         }
         let today = Local::now().date_naive();
-        match notes::capture(&self.notes_root, today, &text) {
+        match notes::capture(
+            &self.notes_root,
+            today,
+            &text,
+            &self.settings.daily_template_rule,
+        ) {
             Ok(Some(path)) => {
                 self.note_self_write(&path);
                 self.reload_notes(cx)
