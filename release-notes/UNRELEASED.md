@@ -25,3 +25,4 @@ same fact twice; no em dashes. Rewrite to this standard before releasing.
 - Typing into a day whose file already existed empty no longer wipes the note into a conflict banner.
 - Editing an existing note no longer renames its file to match its first heading; only new untitled notes take their name from the typed title, when you save or leave the note.
 - A new note whose title clashes with an existing note now shows a notice instead of silently keeping the Untitled name.
+- The CLI's done command help no longer claims completed tasks get an @done timestamp.

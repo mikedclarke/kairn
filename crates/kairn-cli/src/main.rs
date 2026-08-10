@@ -127,7 +127,7 @@ picks another day.")]
     /// Mark an open task as done
     #[command(long_about = "\
 Find the one open task whose text contains MATCH (case-insensitive) and
-mark it done with a NotePlan `@done(...)` timestamp. If several tasks
+mark it done (`[x]`); the day it lives on dates it. If several tasks
 match, nothing is changed: the matches are listed and the exit code is 4;
 rerun with more of the task's words. Exit 3 when nothing matches.")]
     Done {
