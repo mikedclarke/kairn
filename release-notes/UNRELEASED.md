@@ -19,3 +19,5 @@ same fact twice; no em dashes. Rewrite to this standard before releasing.
 ## Fixed
 
 <!-- Bugs that no longer happen. -->
+
+- On macOS the window close button now minimises Kairn to the Dock instead of leaving a stuck app that could only be force quit.

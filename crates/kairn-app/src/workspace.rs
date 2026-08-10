@@ -184,11 +184,35 @@ impl Workspace {
 
         // Closing the window must not drop a pending edit.
         let flush = cx.weak_entity();
-        window.on_window_should_close(cx, move |_, cx| {
+        window.on_window_should_close(cx, move |window, cx| {
             flush
                 .update(cx, |ws, cx| ws.flush_note_editor(cx))
                 .ok();
-            true
+            if cfg!(target_os = "macos") {
+                // Minimize instead of destroying the window: the workspace
+                // (and its live terminal sessions) survives, and a Dock
+                // click brings it back. Destroying it leaves a windowless
+                // process the Dock can't reopen. Quit remains the way to
+                // exit. The minimize must run after this handler returns:
+                // AppKit's close-button sequence reverses a miniaturize
+                // issued from inside windowShouldClose.
+                let handle = window.window_handle();
+                cx.spawn(async move |cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                    handle
+                        .update(cx, |_, window, _| window.minimize_window())
+                        .ok();
+                })
+                .detach();
+                false
+            } else {
+                // Linux: a closed window with no Dock to reopen from would
+                // strand a headless process, so close means quit.
+                cx.quit();
+                true
+            }
         });
 
         let mut this = Self {
