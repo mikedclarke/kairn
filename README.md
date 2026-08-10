@@ -14,7 +14,7 @@ those files, not a chat panel bolted on.
 Built in Rust on [GPUI](https://www.gpui.rs). One codebase for
 macOS and Linux. Not Electron.
 
-![Kairn: daily note, tasks, and calendar beside a terminal session](docs/screenshot.png)
+![Kairn: a daily note, tasks, and calendar beside herdr running a Claude Code session](docs/screenshot.png)
 
 ## Why
 
@@ -80,12 +80,16 @@ No cloud, no accounts, no database. Just a folder of markdown.
 - Same core, same write safety: agents go through the identical never-clobber paths as
   the editor
 
+![The terminal at full width running herdr, with two coding-agent sessions and the notes sidebar alongside](docs/screenshot-terminal.png)
+
 ### Capture and navigation
 
 - Quick capture chord: one overlay, one field, appends to today's note
 - A jump switcher for sessions, days, and notes: fuzzy titles, full-text search with
   snippets, and date-shaped queries (`aug 12`, `tomorrow`, `2026-W32`)
 - Writing mode: the note at a comfortable measure, nothing else
+
+![Writing mode: a daily note centred at a comfortable measure with the week strip on top and no sidebar](docs/screenshot-writing.png)
 
 ### Theming and settings
 
