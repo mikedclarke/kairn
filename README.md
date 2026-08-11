@@ -57,7 +57,9 @@ No cloud, no accounts, no database. Just a folder of markdown.
 - Today / Open / Overdue views with live counts and click-through to the source note
 - Click a checkbox anywhere to complete it (writes `[x]` back to disk in the line's own
   style)
-- Drag a task onto a week-strip day to reschedule it
+- Drag any line by its handle: reorder within the note (sub-lines travel along), or
+  drop it on a week-strip day, calendar day, or Daily row to move it into that day's
+  note; hold over a day to file it under one of that note's headings
 - Calendar and week-strip indicators for open, done, and overdue days
 
 ### Terminal
