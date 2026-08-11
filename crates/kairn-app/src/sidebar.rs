@@ -21,14 +21,38 @@ impl Workspace {
         let session_count = self.sessions.len();
         let today = Local::now().date_naive();
 
+        // While a line drag is in flight, the day row or cell under the
+        // pointer rings as the drop target (hit-tested against last-painted
+        // bounds, like the week strip).
+        let drop_day = self
+            .note_editor
+            .as_ref()
+            .and_then(|e| e.read(cx).line_drag())
+            .and_then(|(_, _, position)| self.resolve_day_drop(position));
+        self.sidebar_bounds.borrow_mut().take();
+
+        let sidebar_store = self.sidebar_bounds.clone();
         let mut side = div()
             .id("sidebar-scroll")
             .flex_1()
             .min_h(px(0.))
             .overflow_y_scroll()
-            .child(self.render_calendar(t, cx));
+            .child(
+                gpui::canvas(
+                    move |bounds, _, _| {
+                        sidebar_store.borrow_mut().replace(bounds);
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(self.render_calendar(t, drop_day, cx));
 
         // Daily: today plus the next (or previous, per settings) two days.
+        // The bounds store clears before the visibility checks so a hidden
+        // or collapsed section always clears its drop targets.
+        self.daily_drop_bounds.borrow_mut().clear();
         if self.settings.show_daily {
             let collapsed = self.section_collapsed("Daily");
             side = side.child(
@@ -42,14 +66,28 @@ impl Workspace {
                     let day = if forward { today + Days::new(i) } else { today - Days::new(i) };
                     let selected = day == self.selected_day;
                     let has_note = self.note_days.contains_key(&day);
+                    let is_drop = drop_day == Some(day);
+                    let bounds_store = self.daily_drop_bounds.clone();
                     let mut row = nav_item(t, ("daily", i as usize))
+                        .relative()
                         .when(selected, |d| d.bg(t.sel).text_color(t.text))
+                        .child(
+                            gpui::canvas(
+                                move |bounds, _, _| bounds_store.borrow_mut().push((day, bounds)),
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .size_full(),
+                        )
                         .when(has_note, |d| {
                             d.child(div().w(px(7.)).h(px(7.)).flex_none().rounded_full().bg(t.amber))
                         })
                         .child(div().flex_1().child(day_label(day)));
                     if day == today {
                         row = row.child(count_label(t, "today", false));
+                    }
+                    if is_drop {
+                        row = row.bg(t.sel).text_color(t.accent).border_1().border_color(t.accent);
                     }
                     side = side.child(row.on_click(cx.listener(move |this, _, _, cx| {
                         this.select_day(day, cx);
@@ -378,7 +416,13 @@ impl Workspace {
             .child(side)
     }
 
-    fn render_calendar(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_calendar(
+        &self,
+        t: &KairnTheme,
+        drop_day: Option<NaiveDate>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        self.calendar_drop_bounds.borrow_mut().clear();
         let today = Local::now().date_naive();
         let current_first = today.with_day(1).expect("valid first of month");
         let shown_first = if self.cal_offset >= 0 {
@@ -463,8 +507,11 @@ impl Workspace {
                 let stats = self.day_stats.get(&day).copied().unwrap_or_default();
                 let overdue_open = stats.open > 0 && day < today;
 
+                let is_drop = drop_day == Some(day);
+                let bounds_store = self.calendar_drop_bounds.clone();
                 let cell = div()
                     .id(("cal-cell", (week * 7 + wd) as usize))
+                    .relative()
                     .flex_1()
                     .pt(px(2.))
                     .pb(px(3.))
@@ -473,6 +520,14 @@ impl Workspace {
                     .flex_col()
                     .items_center()
                     .cursor_pointer()
+                    .child(
+                        gpui::canvas(
+                            move |bounds, _, _| bounds_store.borrow_mut().push((day, bounds)),
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
                     // A tight line height keeps the indicator slot snug under
                     // the digits instead of drifting to the cell's bottom edge.
                     .child(
@@ -523,13 +578,22 @@ impl Workspace {
                         is_today,
                     ));
                 let cell = cell.child(slot);
+                // The drop ring is applied last so it wins over the today and
+                // selected treatments while a drag hovers the cell.
+                let cell = if is_drop {
+                    cell.bg(t.sel).text_color(t.accent).border_1().border_color(t.accent)
+                } else {
+                    cell
+                };
 
                 let hover_bg = t.hover;
                 row = row.child(
-                    cell.when(!is_today && !is_selected, |c| c.hover(move |s| s.bg(hover_bg)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.select_day(day, cx);
-                        })),
+                    cell.when(!is_today && !is_selected && !is_drop, |c| {
+                        c.hover(move |s| s.bg(hover_bg))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_day(day, cx);
+                    })),
                 );
             }
             cal = cal.child(row);

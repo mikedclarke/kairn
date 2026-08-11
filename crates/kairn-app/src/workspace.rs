@@ -124,8 +124,16 @@ pub struct Workspace {
     pub(crate) note_cache: notes::TextCache,
     /// Week-strip day cells' window bounds from the last paint, captured so
     /// a task drag can hit-test its drop day without a second layout pass.
-    pub(crate) week_strip_bounds:
-        std::rc::Rc<std::cell::RefCell<Vec<(NaiveDate, gpui::Bounds<gpui::Pixels>)>>>,
+    pub(crate) week_strip_bounds: crate::vault_state::DayBounds,
+    /// Mini-calendar day cells' window bounds, same contract as the strip.
+    pub(crate) calendar_drop_bounds: crate::vault_state::DayBounds,
+    /// Sidebar Daily rows' window bounds, same contract as the strip.
+    pub(crate) daily_drop_bounds: crate::vault_state::DayBounds,
+    /// The sidebar scroll container's window bounds this frame. Cells
+    /// scrolled out of its clip still prepaint their capture canvases, so a
+    /// sidebar drop must also fall inside this to count.
+    pub(crate) sidebar_bounds:
+        std::rc::Rc<std::cell::RefCell<Option<gpui::Bounds<gpui::Pixels>>>>,
     _activity_timer: Task<()>,
     /// Watches the notes root so outside edits (agents, Syncthing, NotePlan
     /// elsewhere) appear without a restart. Dropped with the workspace.
@@ -251,6 +259,9 @@ impl Workspace {
             daily_cache: notes::TextCache::default(),
             note_cache: notes::TextCache::default(),
             week_strip_bounds: Default::default(),
+            calendar_drop_bounds: Default::default(),
+            daily_drop_bounds: Default::default(),
+            sidebar_bounds: Default::default(),
             _activity_timer: activity_timer,
             _notes_watcher: notes_watcher,
             _notes_watch_task: notes_watch_task,
@@ -567,6 +578,12 @@ impl Render for Workspace {
         // no sidebar.
         if self.sidebar_open && self.layout != LayoutMode::Writing {
             body = body.child(self.render_sidebar(&t, cx));
+        } else {
+            // No sidebar this frame: its drop targets must not linger as
+            // invisible hit zones for an in-flight drag.
+            self.sidebar_bounds.borrow_mut().take();
+            self.calendar_drop_bounds.borrow_mut().clear();
+            self.daily_drop_bounds.borrow_mut().clear();
         }
         body = body.child(self.render_main(&t, window, cx));
 

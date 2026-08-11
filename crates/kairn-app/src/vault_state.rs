@@ -21,6 +21,12 @@ use crate::workspace::{LayoutMode, PaneView, Workspace};
 /// own atomic-write renames, without going blind to real external edits.
 pub(crate) type SelfWrites = Arc<parking_lot::Mutex<HashMap<PathBuf, (Instant, u64)>>>;
 
+/// Day drop targets' window bounds, captured at paint time by the surface
+/// that rendered them (week strip, mini calendar, Daily rows) and cleared by
+/// that surface when it doesn't render.
+pub(crate) type DayBounds =
+    std::rc::Rc<std::cell::RefCell<Vec<(NaiveDate, gpui::Bounds<gpui::Pixels>)>>>;
+
 fn file_hash(path: &Path) -> Option<u64> {
     let bytes = std::fs::read(path).ok()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -191,16 +197,30 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The day whose drop target contains `position`, if any.
+    /// The day whose drop target contains `position`, if any: the week strip
+    /// first, then the sidebar surfaces (mini calendar, Daily rows), whose
+    /// hits only count inside the sidebar's own bounds — cells scrolled out
+    /// of its clip still capture bounds but must never catch a drop.
     pub(crate) fn resolve_day_drop(
         &self,
         position: gpui::Point<gpui::Pixels>,
     ) -> Option<NaiveDate> {
-        self.week_strip_bounds
-            .borrow()
-            .iter()
-            .find(|(_, bounds)| bounds.contains(&position))
-            .map(|(day, _)| *day)
+        let hit = |store: &DayBounds| {
+            store
+                .borrow()
+                .iter()
+                .find(|(_, bounds)| bounds.contains(&position))
+                .map(|(day, _)| *day)
+        };
+        if let Some(day) = hit(&self.week_strip_bounds) {
+            return Some(day);
+        }
+        let inside_sidebar =
+            self.sidebar_bounds.borrow().is_some_and(|b| b.contains(&position));
+        if !inside_sidebar {
+            return None;
+        }
+        hit(&self.calendar_drop_bounds).or_else(|| hit(&self.daily_drop_bounds))
     }
 
     /// Move a block out of the open note into `day`'s note, landing at the
