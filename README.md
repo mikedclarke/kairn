@@ -112,18 +112,28 @@ No cloud, no accounts, no database. Just a folder of markdown.
 ## The `kairn` CLI
 
 ```text
-kairn today              Print today's daily note
-kairn note <title>       Print a note by title, date, or period (2026-W32)
-kairn tasks              List open tasks by due date (--today, --overdue)
-kairn add <text>         Add a task to a daily note (--date today|tomorrow|aug 12)
-kairn done <match>       Complete the matching open task
-kairn capture <text>     Append a line to today's note
-kairn search <query>     Fuzzy title + full-text search
-kairn backlinks <title>  Lines elsewhere that link to a note
+kairn today                 Print today's daily note
+kairn note <title>          Print a note by title, date, or period (2026-W32)
+kairn tasks                 List open tasks by due date (--today, --overdue; --done for completed)
+kairn add <text>            Add a task to a daily note (--date, --section)
+kairn done <match>          Complete the matching open task
+kairn capture <text>        Append a line to today's note
+kairn append <note> <text>  Append text to any note (--section targets or creates a section)
+kairn edit <note> --find X  Replace, extend, or delete the one matching line
+kairn carry                 Move overdue tasks from past days into today (--dry-run, --from)
+kairn search <query>        Fuzzy title + full-text search
+kairn recent                List notes by modification time, newest first (--days)
+kairn backlinks <title>     Lines elsewhere that link to a note
 ```
 
-Global flags: `--root <dir>` (or `$KAIRN_ROOT`), `--json`, `--actor <name>`. Exit codes
-are part of the interface: 0 success, 1 failure, 2 bad usage, 3 no match, 4 ambiguous.
+Note arguments resolve like wiki links: a title, an ISO date, a period, or the words
+today, tomorrow, and yesterday. Global flags: `--root <dir>` (or `$KAIRN_ROOT`),
+`--json`, `--actor <name>`. Exit codes are part of the interface: 0 success, 1 failure,
+2 bad usage, 3 no match, 4 ambiguous (nothing was changed).
+
+Writes never clobber: every edit re-verifies the target line against the file on disk
+and refuses rather than guesses, appends are atomic, and `carry` previews with
+`--dry-run` and only looks back 14 days unless told otherwise.
 
 ## Install
 
