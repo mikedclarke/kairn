@@ -20,6 +20,12 @@ same fact twice; no em dashes. Rewrite to this standard before releasing.
 - Word, line, and note start/end cursor movement on the platform's standard keys, with shift selecting.
 - Option+Backspace deletes the previous word and Cmd+Backspace deletes to the start of the line.
 - Backspace at the start of a task, bullet, or quote removes the whole marker in one press.
+- kairn append adds a line to any note, optionally inside a named section, creating the section when it is missing.
+- kairn edit changes, extends, or deletes a single matched line of a note, refusing ambiguous matches.
+- kairn carry moves overdue open tasks from past daily notes into today, group headers travelling with their tasks.
+- kairn recent lists notes by file modification time, so backfilled edits surface.
+- kairn tasks can list completed tasks with --done and filter by due date with --since.
+- kairn add can place a task inside a named section, and note arguments accept today, tomorrow, and yesterday.
 
 ## Improved
 
