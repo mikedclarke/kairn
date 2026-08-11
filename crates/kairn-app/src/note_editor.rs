@@ -45,6 +45,10 @@ const CURSOR_WIDTH: Pixels = px(2.);
 const BLINK_MS: u64 = 550;
 /// Pointer travel before a glyph press becomes a line drag, not a click.
 const DRAG_THRESHOLD: Pixels = px(3.);
+/// The handle gutter left of every line, at the base editor size: the grab
+/// zone for dragging any line. Scales with the editor size like the glyph
+/// indents.
+const HANDLE_GUTTER: f32 = 18.;
 
 pub enum NoteEditorEvent {
     /// The editor wrote its file; the workspace should note the self-write
@@ -56,9 +60,9 @@ pub enum NoteEditorEvent {
     OpenWikiLink(String),
     OpenDate(chrono::NaiveDate),
     OpenUrl(String),
-    /// An open task's glyph drag was released outside the editor; the
-    /// workspace reschedules if the pointer sat on a week-strip day.
-    TaskDropped { line_start: usize, position: Point<Pixels> },
+    /// A line drag was released outside the editor; the workspace moves the
+    /// block if the pointer sat on a day drop target.
+    BlockDropped { range: Range<usize>, position: Point<Pixels> },
 }
 
 pub struct NoteEditor {
@@ -72,10 +76,13 @@ pub struct NoteEditor {
     selection_anchor: Option<usize>,
     /// A mouse drag-select is in progress (mouse down through mouse up).
     selecting: bool,
-    /// An in-flight drag that started on a line's glyph: released in place
-    /// it toggles open/done tasks; moved past the threshold it reorders the
-    /// line.
-    glyph_drag: Option<GlyphDrag>,
+    /// An in-flight drag that started on a line's handle or glyph: released
+    /// in place a glyph grab toggles open/done tasks; moved past the
+    /// threshold it drags the line's block.
+    line_drag: Option<LineDrag>,
+    /// Line-start offset of the line under the pointer, for the hover-
+    /// revealed drag handle in the gutter.
+    hovered_line: Option<usize>,
     ime_marked: Option<Range<usize>>,
     /// The clickable span under the pointer, underlined so links read as
     /// links: the line's start offset and the span's display-char range.
@@ -103,6 +110,9 @@ pub struct NoteEditor {
 
 pub(crate) struct EditorLayout {
     pub bounds: Bounds<Pixels>,
+    /// Width of the handle gutter at the current editor size; every entry's
+    /// `indent` already includes it.
+    pub gutter: Pixels,
     pub slots: Vec<LineSlot>,
 }
 
@@ -123,19 +133,21 @@ impl LineSlot {
     }
 }
 
-struct GlyphDrag {
-    /// Line-start offset of the dragged line at mouse down.
-    line_start: usize,
+struct LineDrag {
+    /// Byte range of the dragged block at mouse down: the grabbed line plus
+    /// its deeper-indented run (`block_range`), final newline excluded.
+    range: Range<usize>,
     origin: Point<Pixels>,
     /// Where the pointer is now, window coordinates: the workspace reads it
-    /// to place the drag ghost and light up week-strip drop targets.
+    /// to place the drag ghost and light up day drop targets.
     position: Point<Pixels>,
     moved: bool,
-    /// Whether releasing without moving toggles the task.
+    /// Whether releasing without moving toggles the task (glyph grabs on
+    /// open/done tasks).
     toggles: bool,
-    /// The dragged line is an open task: leaving the editor turns the drag
-    /// into a reschedule instead of a reorder.
-    open_task: bool,
+    /// The grab started on the handle gutter, where releasing in place is a
+    /// no-op, rather than on a task/bullet glyph.
+    from_handle: bool,
     /// Drop position for a reorder: a line-start offset (or the text length
     /// for the end); `None` while the pointer is outside the editor.
     target: Option<usize>,
@@ -260,7 +272,8 @@ impl NoteEditor {
             cursor: 0,
             selection_anchor: None,
             selecting: false,
-            glyph_drag: None,
+            line_drag: None,
+            hovered_line: None,
             ime_marked: None,
             hovered_link: None,
             menu_link: None,
@@ -318,11 +331,12 @@ impl NoteEditor {
     }
 
     /// An external change shifted the text under us: any selection or
-    /// in-flight glyph drag holds stale byte offsets, so let go of them.
+    /// in-flight line drag holds stale byte offsets, so let go of them.
     fn drop_stale_offsets(&mut self) {
         self.selection_anchor = None;
         self.selecting = false;
-        self.glyph_drag = None;
+        self.line_drag = None;
+        self.hovered_line = None;
         self.hovered_link = None;
     }
 
@@ -983,7 +997,8 @@ impl NoteEditor {
         cx: &mut Context<Self>,
     ) {
         enum Click {
-            Glyph { line_start: usize, toggles: bool, open_task: bool },
+            Handle { line_start: usize },
+            Glyph { line_start: usize, toggles: bool },
             Nav(notes::LinkTarget),
             Cursor(usize),
         }
@@ -998,9 +1013,16 @@ impl NoteEditor {
                     continue;
                 }
                 let raw_line = &self.text()[slot.raw_start..slot.raw_start + slot.raw_len];
+                // The handle gutter: any non-blank line picks up for a drag.
+                if pos.x < layout.bounds.origin.x + layout.gutter {
+                    if !raw_line.trim().is_empty() {
+                        click = Click::Handle { line_start: slot.raw_start };
+                        break;
+                    }
+                }
                 // The glyph column of a task or bullet line: a press-and-
-                // release toggles (open/done tasks); a drag reorders the line.
-                if matches!(slot.entry.glyph, Glyph::Task(_) | Glyph::Bullet)
+                // release toggles (open/done tasks); a drag moves the block.
+                else if matches!(slot.entry.glyph, Glyph::Task(_) | Glyph::Bullet)
                     && pos.x < layout.bounds.origin.x + slot.entry.indent
                 {
                     click = Click::Glyph {
@@ -1009,7 +1031,6 @@ impl NoteEditor {
                             slot.entry.glyph,
                             Glyph::Task(TaskState::Open | TaskState::Done)
                         ),
-                        open_task: matches!(slot.entry.glyph, Glyph::Task(TaskState::Open)),
                     };
                     break;
                 }
@@ -1044,14 +1065,25 @@ impl NoteEditor {
             click
         };
         match click {
-            Click::Glyph { line_start, toggles, open_task } => {
-                self.glyph_drag = Some(GlyphDrag {
-                    line_start,
+            Click::Handle { line_start } => {
+                self.line_drag = Some(LineDrag {
+                    range: notes::block_range(self.text(), line_start),
+                    origin: event.position,
+                    position: event.position,
+                    moved: false,
+                    toggles: false,
+                    from_handle: true,
+                    target: None,
+                });
+            }
+            Click::Glyph { line_start, toggles } => {
+                self.line_drag = Some(LineDrag {
+                    range: notes::block_range(self.text(), line_start),
                     origin: event.position,
                     position: event.position,
                     moved: false,
                     toggles,
-                    open_task,
+                    from_handle: false,
                     target: None,
                 });
             }
@@ -1091,12 +1123,12 @@ impl NoteEditor {
     }
 
     /// Window-level mouse move while the primary button is down: extends a
-    /// drag-select or tracks a glyph drag, wherever the pointer goes.
+    /// drag-select or tracks a line drag, wherever the pointer goes.
     fn on_drag_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        if self.glyph_drag.is_none() && !self.selecting {
+        if self.line_drag.is_none() && !self.selecting {
             return;
         }
-        if let Some(mut drag) = self.glyph_drag.take() {
+        if let Some(mut drag) = self.line_drag.take() {
             let delta = event.position - drag.origin;
             if !drag.moved
                 && (delta.x.abs() > DRAG_THRESHOLD || delta.y.abs() > DRAG_THRESHOLD)
@@ -1116,7 +1148,7 @@ impl NoteEditor {
                 drag.target = inside.then(|| self.drop_target_for_y(event.position.y));
                 cx.notify();
             }
-            self.glyph_drag = Some(drag);
+            self.line_drag = Some(drag);
             return;
         }
         if self.selecting
@@ -1131,30 +1163,33 @@ impl NoteEditor {
     }
 
     fn on_mouse_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(drag) = self.glyph_drag.take() {
+        if let Some(drag) = self.line_drag.take() {
             if !drag.moved {
-                if drag.toggles {
-                    let line = self.line_range_at(drag.line_start);
+                if drag.from_handle {
+                    // A handle press-and-release does nothing: the handle is
+                    // purely a grab point.
+                } else if drag.toggles {
+                    let line = self.line_range_at(drag.range.start);
                     self.toggle_task_in(line, cx);
                 } else {
                     // A glyph without a toggle (bullet, scheduled or
                     // cancelled task): the click still lands the cursor at
                     // the line's content instead of dying.
-                    let line = self.line_range_at(drag.line_start);
+                    let line = self.line_range_at(drag.range.start);
                     let target = self.hidden_marker_end(&line).unwrap_or(line.start);
                     window.focus(&self.focus_handle);
                     self.move_cursor_to(target, false, cx);
                 }
             } else if let Some(target) = drag.target {
                 let new_start =
-                    self.buffer.move_line(drag.line_start, target, self.cursor, now_ms());
+                    self.buffer.move_block(drag.range, target, self.cursor, now_ms());
                 self.cursor = new_start;
                 self.after_edit(cx);
-            } else if drag.open_task {
+            } else {
                 // Released outside the editor: the workspace decides whether
-                // the pointer was over a reschedule target.
-                cx.emit(NoteEditorEvent::TaskDropped {
-                    line_start: drag.line_start,
+                // the pointer was over a day drop target.
+                cx.emit(NoteEditorEvent::BlockDropped {
+                    range: drag.range,
                     position: drag.position,
                 });
             }
@@ -1260,12 +1295,26 @@ impl NoteEditor {
         None
     }
 
-    /// Mouse movement with no button down: track the hovered link, repainting
-    /// only when it actually changes.
+    /// Mouse movement with no button down: track the hovered link and the
+    /// hovered line (for its drag handle), repainting only on change.
     fn on_hover_move(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
         let target = self.hover_target(pos);
         if target != self.hovered_link {
             self.hovered_link = target;
+            cx.notify();
+        }
+        let line = {
+            let layout = self.layout.borrow();
+            layout.as_ref().filter(|l| l.bounds.contains(&pos)).and_then(|l| {
+                l.slots.iter().find(|slot| {
+                    let top = l.bounds.origin.y + slot.y;
+                    pos.y >= top && pos.y < top + slot.height
+                })
+            })
+            .map(|slot| slot.raw_start)
+        };
+        if line != self.hovered_line {
+            self.hovered_line = line;
             cx.notify();
         }
     }
@@ -1277,32 +1326,59 @@ impl NoteEditor {
         self.after_edit(cx);
     }
 
-    /// The in-flight glyph drag of an open task, once it has actually moved:
-    /// the task's text and the pointer's window position. The workspace
-    /// reads this to draw the drag ghost and light week-strip drop targets.
-    pub fn task_drag(&self) -> Option<(String, Point<Pixels>)> {
-        let drag = self.glyph_drag.as_ref()?;
-        if !drag.moved || !drag.open_task {
+    /// The in-flight line drag, once it has actually moved: the block's
+    /// first line, how many further lines travel with it, and the pointer's
+    /// window position. The workspace reads this to draw the drag ghost and
+    /// light day drop targets.
+    pub fn line_drag(&self) -> Option<(String, usize, Point<Pixels>)> {
+        let drag = self.line_drag.as_ref()?;
+        if !drag.moved {
             return None;
         }
-        let range = self.line_range_at(drag.line_start);
-        Some((self.text()[range].to_string(), drag.position))
+        let block = &self.text()[drag.range.clone()];
+        let mut lines = block.split('\n');
+        let first = lines.next().unwrap_or("").to_string();
+        Some((first, lines.count(), drag.position))
     }
 
-    /// Set the due date of the task line at `line_start`, as an ordinary
-    /// undoable buffer edit that autosaves like typing: the drop half of
-    /// drag-to-reschedule.
-    pub fn reschedule_line_at(
-        &mut self,
-        line_start: usize,
-        due: chrono::NaiveDate,
-        cx: &mut Context<Self>,
-    ) {
-        let range = self.line_range_at(line_start);
-        let line = self.text()[range.clone()].to_string();
-        let Some(updated) = notes::reschedule_task_line(&line, due) else { return };
-        self.buffer.edit(range, &updated, self.cursor, now_ms());
+    /// The text of a block the editor reported dropped, for the workspace's
+    /// cross-note move.
+    pub fn block_text(&self, range: Range<usize>) -> String {
+        let len = self.text().len();
+        self.text()[range.start.min(len)..range.end.min(len)].to_string()
+    }
+
+    /// Remove a dropped block from this note (the source half of a move to
+    /// another day), together with the newline that separated it from its
+    /// neighbours. One undoable step.
+    pub fn remove_block(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
+        let len = self.text().len();
+        let mut start = range.start.min(len);
+        let mut end = range.end.min(len).max(start);
+        if end < len {
+            end += 1;
+        } else if start > 0 {
+            // The block ends the file: take the preceding newline so the
+            // remaining last line keeps the no-trailing-newline convention.
+            start -= 1;
+        }
+        self.cursor = self.buffer.edit(start..end, "", self.cursor, now_ms());
         self.after_edit(cx);
+    }
+
+    /// Move a block within this note to the line boundary `target` (the
+    /// in-buffer half of a drop on the note's own day). One undoable step.
+    pub fn move_block_to(&mut self, range: Range<usize>, target: usize, cx: &mut Context<Self>) {
+        self.cursor = self.buffer.move_block(range, target, self.cursor, now_ms());
+        self.after_edit(cx);
+    }
+
+    /// Abandon any in-flight line drag (Escape): nothing has been edited
+    /// yet, so letting go of the state is the whole cancel.
+    pub fn cancel_drag(&mut self, cx: &mut Context<Self>) {
+        if self.line_drag.take().is_some() {
+            cx.notify();
+        }
     }
 
     // --- layout ------------------------------------------------------------
@@ -1340,7 +1416,8 @@ impl NoteEditor {
         }
         let mut layout = self.layout.borrow_mut();
         let bounds = layout.as_ref().map(|l| l.bounds).unwrap_or_default();
-        *layout = Some(EditorLayout { bounds, slots });
+        let gutter = px(HANDLE_GUTTER * (t.editor_size / theme::EDITOR_BASE_SIZE));
+        *layout = Some(EditorLayout { bounds, gutter, slots });
         y
     }
 
@@ -1461,10 +1538,16 @@ impl Focusable for NoteEditor {
 impl Render for NoteEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = cx.entity().downgrade();
+        let t = cx.kairn();
+        // The handle gutter is baked into every line's indent; pulling the
+        // element left by the same width keeps the text where it was, with
+        // the handles hanging in the note frame's padding.
+        let gutter = px(HANDLE_GUTTER * (t.editor_size / theme::EDITOR_BASE_SIZE));
         div()
             .key_context("NoteEditor")
             .track_focus(&self.focus_handle)
             .cursor_text()
+            .ml(-gutter)
             // Room below the last line so clicking the empty space under a
             // short note lands in the editor and appends.
             .pb(px(140.))
@@ -1712,14 +1795,17 @@ struct KindStyle {
 fn kind_style(line: &Line, t: &KairnTheme) -> (KindStyle, Glyph) {
     // The metrics below are drawn against the default 13px body; a themed
     // editor size scales text, line heights, and the glyph column (indents)
-    // together, leaving only the vertical paddings alone.
+    // together, leaving only the vertical paddings alone. Every indent
+    // includes the handle gutter, so text and hit-testing agree without a
+    // separate offset.
     let scale = t.editor_size / crate::theme::EDITOR_BASE_SIZE;
+    let gutter = HANDLE_GUTTER * scale;
     let body = |color| KindStyle {
         size: px(13. * scale),
         line_height: px(20.5 * scale),
         pad_top: px(1.),
         pad_bottom: px(1.),
-        indent: px(0.),
+        indent: px(gutter),
         color,
         weight: FontWeight::NORMAL,
     };
@@ -1756,7 +1842,7 @@ fn kind_style(line: &Line, t: &KairnTheme) -> (KindStyle, Glyph) {
                 KindStyle {
                     pad_top: px(2.5),
                     pad_bottom: px(2.5),
-                    indent: px(22. * scale),
+                    indent: px(gutter + 22. * scale),
                     ..body(color)
                 },
                 Glyph::Task(*state),
@@ -1766,7 +1852,7 @@ fn kind_style(line: &Line, t: &KairnTheme) -> (KindStyle, Glyph) {
             KindStyle {
                 pad_top: px(2.5),
                 pad_bottom: px(2.5),
-                indent: px(18. * scale),
+                indent: px(gutter + 18. * scale),
                 ..body(t.text)
             },
             Glyph::Bullet,
@@ -1775,7 +1861,7 @@ fn kind_style(line: &Line, t: &KairnTheme) -> (KindStyle, Glyph) {
             KindStyle {
                 pad_top: px(4.),
                 pad_bottom: px(4.),
-                indent: px(14. * scale),
+                indent: px(gutter + 14. * scale),
                 ..body(t.dim)
             },
             Glyph::QuoteBar,
@@ -1814,6 +1900,7 @@ fn shape_entry(
 ) -> ShapedEntry {
     let parsed = notes::parse_line(raw);
     let (style, glyph) = kind_style(&parsed, t);
+    let gutter = px(HANDLE_GUTTER * (t.editor_size / crate::theme::EDITOR_BASE_SIZE));
     let strikethrough = matches!(
         parsed,
         Line::Task { state: TaskState::Done | TaskState::Cancelled, .. }
@@ -1832,7 +1919,7 @@ fn shape_entry(
             text_height: style.line_height,
             pad_top: px(1.),
             pad_bottom: px(1.),
-            indent: px(0.),
+            indent: gutter,
             glyph: Glyph::None,
             active,
             prefix_len: 0,
@@ -1847,7 +1934,7 @@ fn shape_entry(
             text_height: px(1.),
             pad_top: style.pad_top,
             pad_bottom: style.pad_bottom,
-            indent: px(0.),
+            indent: gutter,
             glyph: Glyph::Rule,
             active,
             prefix_len: 0,
@@ -1959,7 +2046,7 @@ fn shape_entry(
             }
         }
         let (indent, glyph) =
-            if prefix > 0 { (style.indent, glyph) } else { (px(0.), Glyph::None) };
+            if prefix > 0 { (style.indent, glyph) } else { (gutter, Glyph::None) };
         (SharedString::from(shown.to_string()), runs, indent, glyph, prefix)
     } else {
         let mut display = String::new();
@@ -2088,7 +2175,9 @@ impl IntoElement for NoteEditorElement {
 
 impl Element for NoteEditorElement {
     type RequestLayoutState = ();
-    type PrepaintState = ();
+    /// The hovered line's handle-gutter hitbox, carried into paint for the
+    /// open-hand cursor (hitboxes can only be inserted during prepaint).
+    type PrepaintState = Option<gpui::Hitbox>;
 
     fn id(&self) -> Option<ElementId> {
         None

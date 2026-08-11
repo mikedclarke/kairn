@@ -237,11 +237,19 @@ Left alone: tasks due today or later (their `>date` token already says
 when), scheduled ([>]) and cancelled ([-]) tasks, and overdue tasks
 living in regular notes (their home is a note, not a day). --dry-run
 prints what would move without writing anything. Nothing to carry is
-success: a clean morning prints one line and exits 0.")]
+success: a clean morning prints one line and exits 0.
+
+Carry looks back 14 days by default, so a vault carrying years of old
+open tasks (an import, a long break) never floods today by accident;
+anything older is counted and reported, never silently dropped. --from
+moves the window: `--from 2025-01-01` carries the lot, deliberately.")]
     Carry {
         /// Day the tasks land on: today, tomorrow, or 2026-08-12
         #[arg(long, value_name = "WHEN", default_value = "today")]
         to: String,
+        /// Oldest due date to carry (default: 14 days back)
+        #[arg(long, value_name = "WHEN")]
+        from: Option<String>,
         /// Section of the destination note to append into
         #[arg(long, value_name = "HEADING")]
         section: Option<String>,
@@ -367,9 +375,10 @@ fn run(cli: Cli) -> Result<(), Failure> {
             };
             cmd_edit(&root, &note, &find, op, &actor, cli.json)
         }
-        Command::Carry { to, section, dry_run } => {
+        Command::Carry { to, from, section, dry_run } => {
             let dest = parse_when(&to)?;
-            cmd_carry(&root, dest, section.as_deref(), dry_run, &actor, cli.json)
+            let from = from.as_deref().map(parse_when).transpose()?;
+            cmd_carry(&root, dest, from, section.as_deref(), dry_run, &actor, cli.json)
         }
         Command::Search { query, limit } => cmd_search(&root, &query, limit, cli.json),
         Command::Recent { days } => cmd_recent(&root, days, cli.json),
@@ -772,6 +781,7 @@ fn cmd_edit(
 fn cmd_carry(
     root: &Path,
     dest: NaiveDate,
+    from: Option<NaiveDate>,
     section: Option<&str>,
     dry_run: bool,
     actor: &str,
@@ -781,10 +791,22 @@ fn cmd_carry(
     if dest < today {
         return Err(Failure::new(2, "carry moves tasks forward: --to must be today or later"));
     }
-    let mut candidates: Vec<TaskRef> = open_tasks_in_vault(root)
+    // The window guards against flooding today from an imported or long-idle
+    // vault; what falls outside it is reported, never silently dropped.
+    let cutoff = from.unwrap_or(today - Duration::days(14));
+    let overdue: Vec<TaskRef> = open_tasks_in_vault(root)
         .into_iter()
         .filter(|t| t.file_date.is_some_and(|d| d < today) && t.due < dest)
         .collect();
+    let older = overdue.iter().filter(|t| t.due < cutoff).count();
+    let mut candidates: Vec<TaskRef> =
+        overdue.into_iter().filter(|t| t.due >= cutoff).collect();
+    if older > 0 {
+        eprintln!(
+            "kairn: {older} older overdue tasks due before {} left where they are; --from moves the window",
+            cutoff.format("%Y-%m-%d")
+        );
+    }
     // Oldest day first, file order within a day, so the destination reads
     // chronologically.
     candidates.sort_by(|a, b| {
@@ -797,6 +819,7 @@ fn cmd_carry(
                 "to": dest.format("%Y-%m-%d").to_string(),
                 "dry_run": dry_run,
                 "tasks": [],
+                "older_than_window": older,
             });
             println!("{body}");
         } else {
@@ -836,6 +859,7 @@ fn cmd_carry(
                 "to": dest.format("%Y-%m-%d").to_string(),
                 "dry_run": true,
                 "tasks": tasks_json,
+                "older_than_window": older,
             });
             println!("{body}");
         } else {
@@ -933,6 +957,7 @@ fn cmd_carry(
             "dry_run": false,
             "tasks": tasks_json,
             "left_in_place": leftovers,
+            "older_than_window": older,
         });
         println!("{body}");
     } else {
