@@ -38,6 +38,8 @@ same fact twice; no em dashes. Rewrite to this standard before releasing.
 
 <!-- Bugs that no longer happen. -->
 
+- Pressing Enter on an empty line moves down a full line; blank lines no longer collapse when the cursor leaves them.
+
 - On macOS the window close button now minimises Kairn to the Dock instead of leaving a stuck app that could only be force quit.
 - Quick capture into a new day now follows the daily template rule, so days the template is set to skip (like weekends on the weekdays setting) stay plain.
 - Typing into a day whose file already existed empty no longer wipes the note into a conflict banner.

@@ -1819,16 +1819,19 @@ fn shape_entry(
         Line::Task { state: TaskState::Done | TaskState::Cancelled, .. }
     );
 
-    // Inactive blank lines are an 8px breather, matching the old renderer;
-    // the cursor line always has full text height so the caret has a home.
+    // Blank lines hold a full text row whether or not the cursor is on
+    // them: uniform height keeps the document from shifting as the cursor
+    // passes through, and Enter on an empty line drops a full line like
+    // any editor. (The active blank falls through to shaping so a
+    // whitespace-only line still positions the caret inside its spaces.)
     if !active && matches!(parsed, Line::Blank) {
         return ShapedEntry {
             display: SharedString::default(),
             wrapped: None,
             line_height: style.line_height,
-            text_height: px(8.),
-            pad_top: px(0.),
-            pad_bottom: px(0.),
+            text_height: style.line_height,
+            pad_top: px(1.),
+            pad_bottom: px(1.),
             indent: px(0.),
             glyph: Glyph::None,
             active,
