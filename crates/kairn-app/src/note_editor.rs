@@ -29,9 +29,13 @@ use kairn_core as notes;
 use notes::{Line, NoteBuffer, SpanKind, TaskState};
 
 use crate::keymap::{
-    EditorBackspace, EditorCopy, EditorCut, EditorDelete, EditorDown, EditorEnter, EditorLeft,
-    EditorPaste, EditorRedo, EditorRight, EditorSelectAll, EditorSelectDown, EditorSelectLeft,
-    EditorSelectRight, EditorSelectUp, EditorUndo, EditorUp,
+    EditorBackspace, EditorCopy, EditorCut, EditorDelete, EditorDeleteToLineStart,
+    EditorDeleteWordBack, EditorDocEnd, EditorDocStart, EditorDown, EditorEnter, EditorLeft,
+    EditorLineEnd, EditorLineStart, EditorPaste, EditorRedo, EditorRight, EditorSelectAll,
+    EditorSelectDocEnd, EditorSelectDocStart, EditorSelectDown, EditorSelectLeft,
+    EditorSelectLineEnd, EditorSelectLineStart, EditorSelectRight, EditorSelectUp,
+    EditorSelectWordLeft, EditorSelectWordRight, EditorUndo, EditorUp, EditorWordLeft,
+    EditorWordRight,
 };
 use crate::theme::{self, KairnTheme, KairnThemeExt as _};
 
@@ -154,8 +158,13 @@ pub(crate) struct ShapedEntry {
     pub pad_bottom: Pixels,
     pub indent: Pixels,
     pub glyph: Glyph,
-    /// Shaped from raw markdown (the cursor line).
+    /// Shaped with inline markers revealed (the cursor line).
     pub active: bool,
+    /// Raw bytes hidden at the start of an active line (the list marker or
+    /// quote prefix, whose glyph stays painted instead): display index i is
+    /// raw column i + prefix_len. Zero on inactive lines, whose mapping goes
+    /// through the span math.
+    pub prefix_len: usize,
 }
 
 #[derive(Default)]
@@ -178,6 +187,58 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Start of the word (or punctuation run) left of `offset`, skipping any
+/// whitespace first; crosses newlines like the platform text engines do.
+fn prev_word_boundary(text: &str, offset: usize) -> usize {
+    let mut i = offset.min(text.len());
+    let mut chars = text[..i].chars().rev().peekable();
+    while let Some(&c) = chars.peek() {
+        if !c.is_whitespace() {
+            break;
+        }
+        i -= c.len_utf8();
+        chars.next();
+    }
+    let Some(&first) = chars.peek() else { return i };
+    let word = is_word_char(first);
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() || is_word_char(c) != word {
+            break;
+        }
+        i -= c.len_utf8();
+        chars.next();
+    }
+    i
+}
+
+/// End of the word (or punctuation run) right of `offset`, skipping any
+/// whitespace first.
+fn next_word_boundary(text: &str, offset: usize) -> usize {
+    let mut i = offset.min(text.len());
+    let mut chars = text[i..].chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if !c.is_whitespace() {
+            break;
+        }
+        i += c.len_utf8();
+        chars.next();
+    }
+    let Some(&first) = chars.peek() else { return i };
+    let word = is_word_char(first);
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() || is_word_char(c) != word {
+            break;
+        }
+        i += c.len_utf8();
+        chars.next();
+    }
+    i
 }
 
 impl NoteEditor {
@@ -397,6 +458,41 @@ impl NoteEditor {
         text[offset..].chars().next().map_or(text.len(), |c| offset + c.len_utf8())
     }
 
+    /// Content start of the line spanning `line`, when that line hides its
+    /// marker behind a glyph (task, bullet, quote): the region before it is
+    /// invisible, so the cursor must never sit inside it.
+    fn hidden_marker_end(&self, line: &Range<usize>) -> Option<usize> {
+        let raw = &self.text()[line.clone()];
+        matches!(
+            notes::parse_line(raw),
+            Line::Task { .. } | Line::Bullet { .. } | Line::Quote { .. }
+        )
+        .then(|| line.start + notes::content_start_col(raw).min(raw.len()))
+        .filter(|cs| *cs > line.start)
+    }
+
+    /// Clamp an offset out of a hidden marker, forward onto the content.
+    fn snap_to_content(&self, offset: usize) -> usize {
+        let line = self.line_range_at(offset);
+        match self.hidden_marker_end(&line) {
+            Some(cs) if offset < cs => cs,
+            _ => offset,
+        }
+    }
+
+    /// Where a plain left-arrow goes: the previous character, except that a
+    /// hidden marker is atomic — from its content start the cursor hops to
+    /// the previous line's end.
+    fn left_target(&self) -> usize {
+        let line = self.line_range_at(self.cursor);
+        if let Some(cs) = self.hidden_marker_end(&line)
+            && self.cursor <= cs
+        {
+            return if line.start > 0 { line.start - 1 } else { self.cursor };
+        }
+        self.prev_char_start(self.cursor)
+    }
+
     // --- selection ---------------------------------------------------------
 
     fn selection(&self) -> Option<Range<usize>> {
@@ -412,7 +508,7 @@ impl NoteEditor {
         } else {
             self.selection_anchor = None;
         }
-        self.cursor = target.min(self.text().len());
+        self.cursor = self.snap_to_content(target.min(self.text().len()));
         self.after_cursor_move(cx);
     }
 
@@ -482,6 +578,19 @@ impl NoteEditor {
         if self.cursor == 0 {
             return;
         }
+        // At the content start of a glyph line the marker is atomic: one
+        // press removes the whole checkbox/bullet/quote prefix, leaving a
+        // plain line.
+        let line = self.line_range_at(self.cursor);
+        if let Some(cs) = self.hidden_marker_end(&line)
+            && self.cursor <= cs
+        {
+            self.buffer.break_undo_group();
+            self.cursor = self.buffer.edit(line.start..cs, "", self.cursor, now_ms());
+            self.buffer.break_undo_group();
+            self.after_edit(cx);
+            return;
+        }
         let prev = self.prev_char_start(self.cursor);
         self.cursor = self.buffer.edit(prev..self.cursor, "", self.cursor, now_ms());
         self.after_edit(cx);
@@ -503,7 +612,7 @@ impl NoteEditor {
     fn on_left(&mut self, _: &EditorLeft, _: &mut Window, cx: &mut Context<Self>) {
         let target = match self.selection() {
             Some(sel) => sel.start,
-            None => self.prev_char_start(self.cursor),
+            None => self.left_target(),
         };
         self.move_cursor_to(target, false, cx);
     }
@@ -525,7 +634,7 @@ impl NoteEditor {
     }
 
     fn on_select_left(&mut self, _: &EditorSelectLeft, _: &mut Window, cx: &mut Context<Self>) {
-        let target = self.prev_char_start(self.cursor);
+        let target = self.left_target();
         self.move_cursor_to(target, true, cx);
     }
 
@@ -540,6 +649,162 @@ impl NoteEditor {
 
     fn on_select_down(&mut self, _: &EditorSelectDown, _: &mut Window, cx: &mut Context<Self>) {
         self.move_vertical(1, true, cx);
+    }
+
+    /// Word-left, with a hidden marker treated as part of the gap between
+    /// lines: from a glyph line's content start the step continues from the
+    /// line start, so it lands on the previous line's last word.
+    fn word_left_target(&self) -> usize {
+        let mut from = self.cursor;
+        let line = self.line_range_at(from);
+        if let Some(cs) = self.hidden_marker_end(&line)
+            && from <= cs
+        {
+            from = line.start;
+        }
+        prev_word_boundary(self.text(), from)
+    }
+
+    fn on_word_left(&mut self, _: &EditorWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        let target = self.word_left_target();
+        self.move_cursor_to(target, false, cx);
+    }
+
+    fn on_word_right(&mut self, _: &EditorWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        let target = next_word_boundary(self.text(), self.cursor);
+        self.move_cursor_to(target, false, cx);
+    }
+
+    fn on_select_word_left(
+        &mut self,
+        _: &EditorSelectWordLeft,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.word_left_target();
+        self.move_cursor_to(target, true, cx);
+    }
+
+    fn on_select_word_right(
+        &mut self,
+        _: &EditorSelectWordRight,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = next_word_boundary(self.text(), self.cursor);
+        self.move_cursor_to(target, true, cx);
+    }
+
+    /// Line-start for the home motion: the visible start of the line, which
+    /// on a glyph line is its content start.
+    fn line_home_target(&self) -> usize {
+        let line = self.line_range_at(self.cursor);
+        self.hidden_marker_end(&line).unwrap_or(line.start)
+    }
+
+    fn on_line_start(&mut self, _: &EditorLineStart, _: &mut Window, cx: &mut Context<Self>) {
+        let target = self.line_home_target();
+        self.move_cursor_to(target, false, cx);
+    }
+
+    fn on_line_end(&mut self, _: &EditorLineEnd, _: &mut Window, cx: &mut Context<Self>) {
+        let target = self.line_range_at(self.cursor).end;
+        self.move_cursor_to(target, false, cx);
+    }
+
+    fn on_select_line_start(
+        &mut self,
+        _: &EditorSelectLineStart,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.line_home_target();
+        self.move_cursor_to(target, true, cx);
+    }
+
+    fn on_select_line_end(
+        &mut self,
+        _: &EditorSelectLineEnd,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.line_range_at(self.cursor).end;
+        self.move_cursor_to(target, true, cx);
+    }
+
+    fn on_doc_start(&mut self, _: &EditorDocStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_cursor_to(0, false, cx);
+    }
+
+    fn on_doc_end(&mut self, _: &EditorDocEnd, _: &mut Window, cx: &mut Context<Self>) {
+        let target = self.text().len();
+        self.move_cursor_to(target, false, cx);
+    }
+
+    fn on_select_doc_start(
+        &mut self,
+        _: &EditorSelectDocStart,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_cursor_to(0, true, cx);
+    }
+
+    fn on_select_doc_end(
+        &mut self,
+        _: &EditorSelectDocEnd,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.text().len();
+        self.move_cursor_to(target, true, cx);
+    }
+
+    fn on_delete_word_back(
+        &mut self,
+        _: &EditorDeleteWordBack,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.delete_selection() {
+            self.after_edit(cx);
+            return;
+        }
+        let target = self.word_left_target();
+        if target >= self.cursor {
+            return;
+        }
+        self.buffer.break_undo_group();
+        self.cursor = self.buffer.edit(target..self.cursor, "", self.cursor, now_ms());
+        self.buffer.break_undo_group();
+        self.after_edit(cx);
+    }
+
+    fn on_delete_to_line_start(
+        &mut self,
+        _: &EditorDeleteToLineStart,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.delete_selection() {
+            self.after_edit(cx);
+            return;
+        }
+        let line = self.line_range_at(self.cursor);
+        // At a glyph line's content start there is nothing visible left of
+        // the caret but the marker itself, so the press removes it.
+        let target = match self.hidden_marker_end(&line) {
+            Some(cs) if self.cursor <= cs => line.start,
+            Some(cs) => cs,
+            None => line.start,
+        };
+        if target >= self.cursor {
+            return;
+        }
+        self.buffer.break_undo_group();
+        self.cursor = self.buffer.edit(target..self.cursor, "", self.cursor, now_ms());
+        self.buffer.break_undo_group();
+        self.after_edit(cx);
     }
 
     fn on_select_all(&mut self, _: &EditorSelectAll, _: &mut Window, cx: &mut Context<Self>) {
@@ -590,7 +855,7 @@ impl NoteEditor {
         let col = self.text()[line.start..self.cursor].chars().count();
         let target_start = if delta < 0 {
             if line.start == 0 {
-                self.cursor = 0;
+                self.cursor = self.snap_to_content(0);
                 self.after_cursor_move(cx);
                 return;
             }
@@ -608,7 +873,7 @@ impl NoteEditor {
             .char_indices()
             .nth(col)
             .map_or(target.end, |(i, _)| target.start + i);
-        self.cursor = byte;
+        self.cursor = self.snap_to_content(byte);
         self.after_cursor_move(cx);
     }
 
@@ -769,7 +1034,7 @@ impl NoteEditor {
                         }
                         notes::raw_col_for_display_char(raw_line, display_chars)
                     }
-                    Some(raw_ix) => raw_ix.min(raw_line.len()),
+                    Some(ix) => (slot.entry.prefix_len + ix).min(raw_line.len()),
                     // Past the end of the line's text: cursor to line end.
                     None => raw_line.len(),
                 };
@@ -865,12 +1130,20 @@ impl NoteEditor {
         }
     }
 
-    fn on_mouse_up(&mut self, cx: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(drag) = self.glyph_drag.take() {
             if !drag.moved {
                 if drag.toggles {
                     let line = self.line_range_at(drag.line_start);
                     self.toggle_task_in(line, cx);
+                } else {
+                    // A glyph without a toggle (bullet, scheduled or
+                    // cancelled task): the click still lands the cursor at
+                    // the line's content instead of dying.
+                    let line = self.line_range_at(drag.line_start);
+                    let target = self.hidden_marker_end(&line).unwrap_or(line.start);
+                    window.focus(&self.focus_handle);
+                    self.move_cursor_to(target, false, cx);
                 }
             } else if let Some(target) = drag.target {
                 let new_start =
@@ -929,7 +1202,7 @@ impl NoteEditor {
                 })
                 .unwrap_or(0);
             let raw_col = if slot.entry.active {
-                ix.min(raw_line.len())
+                (slot.entry.prefix_len + ix).min(raw_line.len())
             } else {
                 let chars = slot.entry.display.get(..ix).map_or(0, |s| s.chars().count());
                 notes::raw_col_for_display_char(raw_line, chars)
@@ -1214,6 +1487,20 @@ impl Render for NoteEditor {
             .on_action(cx.listener(Self::on_select_right))
             .on_action(cx.listener(Self::on_select_up))
             .on_action(cx.listener(Self::on_select_down))
+            .on_action(cx.listener(Self::on_word_left))
+            .on_action(cx.listener(Self::on_word_right))
+            .on_action(cx.listener(Self::on_select_word_left))
+            .on_action(cx.listener(Self::on_select_word_right))
+            .on_action(cx.listener(Self::on_line_start))
+            .on_action(cx.listener(Self::on_line_end))
+            .on_action(cx.listener(Self::on_select_line_start))
+            .on_action(cx.listener(Self::on_select_line_end))
+            .on_action(cx.listener(Self::on_doc_start))
+            .on_action(cx.listener(Self::on_doc_end))
+            .on_action(cx.listener(Self::on_select_doc_start))
+            .on_action(cx.listener(Self::on_select_doc_end))
+            .on_action(cx.listener(Self::on_delete_word_back))
+            .on_action(cx.listener(Self::on_delete_to_line_start))
             .child(NoteEditorElement { editor: cx.entity().clone() })
             .context_menu(move |menu, _, cx| {
                 let Some(strong) = editor.upgrade() else { return menu };
@@ -1365,8 +1652,8 @@ impl gpui::EntityInputHandler for NoteEditor {
             .iter()
             .find(|s| (s.raw_start..=s.raw_start + s.raw_len).contains(&range.start))?;
         let wrapped = slot.entry.wrapped.as_ref()?;
-        let local = wrapped
-            .position_for_index(range.start - slot.raw_start, slot.entry.line_height)?;
+        let ix = (range.start - slot.raw_start).saturating_sub(slot.entry.prefix_len);
+        let local = wrapped.position_for_index(ix, slot.entry.line_height)?;
         let origin = slot.text_origin_in(&element_bounds) + local;
         Some(Bounds::new(origin, size(px(2.), slot.entry.line_height)))
     }
@@ -1394,7 +1681,7 @@ impl gpui::EntityInputHandler for NoteEditor {
             {
                 let raw = &self.text()[slot.raw_start..slot.raw_start + slot.raw_len];
                 let raw_ix = if slot.entry.active {
-                    ix.min(raw.len())
+                    (slot.entry.prefix_len + ix).min(raw.len())
                 } else {
                     let chars =
                         slot.entry.display.get(..ix).map_or(0, |s| s.chars().count());
@@ -1424,8 +1711,8 @@ struct KindStyle {
 
 fn kind_style(line: &Line, t: &KairnTheme) -> (KindStyle, Glyph) {
     // The metrics below are drawn against the default 13px body; a themed
-    // editor size scales text and line heights together, leaving the
-    // paddings and indents (glyph column geometry) alone.
+    // editor size scales text, line heights, and the glyph column (indents)
+    // together, leaving only the vertical paddings alone.
     let scale = t.editor_size / crate::theme::EDITOR_BASE_SIZE;
     let body = |color| KindStyle {
         size: px(13. * scale),
@@ -1469,7 +1756,7 @@ fn kind_style(line: &Line, t: &KairnTheme) -> (KindStyle, Glyph) {
                 KindStyle {
                     pad_top: px(2.5),
                     pad_bottom: px(2.5),
-                    indent: px(22.),
+                    indent: px(22. * scale),
                     ..body(color)
                 },
                 Glyph::Task(*state),
@@ -1479,13 +1766,18 @@ fn kind_style(line: &Line, t: &KairnTheme) -> (KindStyle, Glyph) {
             KindStyle {
                 pad_top: px(2.5),
                 pad_bottom: px(2.5),
-                indent: px(18.),
+                indent: px(18. * scale),
                 ..body(t.text)
             },
             Glyph::Bullet,
         ),
         Line::Quote { .. } => (
-            KindStyle { pad_top: px(4.), pad_bottom: px(4.), indent: px(14.), ..body(t.dim) },
+            KindStyle {
+                pad_top: px(4.),
+                pad_bottom: px(4.),
+                indent: px(14. * scale),
+                ..body(t.dim)
+            },
             Glyph::QuoteBar,
         ),
         Line::Rule => (
@@ -1540,6 +1832,7 @@ fn shape_entry(
             indent: px(0.),
             glyph: Glyph::None,
             active,
+            prefix_len: 0,
         };
     }
     // Inactive rules paint a line, no text.
@@ -1554,6 +1847,7 @@ fn shape_entry(
             indent: px(0.),
             glyph: Glyph::Rule,
             active,
+            prefix_len: 0,
         };
     }
 
@@ -1575,14 +1869,25 @@ fn shape_entry(
         | Line::Text { spans } => spans.as_slice(),
         Line::Rule | Line::Blank => &[],
     };
-    let (display, runs, indent, glyph) = if active {
-        // The cursor line shows its raw markdown, every byte visible so the
-        // mapping between clicks, cursor, and bytes is exact, but keeps the
-        // span styling: markers faint, content styled (what NotePlan does).
-        // While an IME composition is marked, plain runs with the marked
-        // range underlined take over.
+    let (display, runs, indent, glyph, prefix_len) = if active {
+        // The cursor line reveals its raw inline markdown, byte for byte, so
+        // inline markers can be edited in place — but glyph lines (tasks,
+        // bullets, quotes) keep their marker hidden and their glyph painted,
+        // exactly like inactive lines: the checkbox never blinks out from
+        // under the pointer, and the text never shifts when the cursor
+        // arrives. The hidden prefix makes the mapping display index + prefix
+        // = raw column. While an IME composition is marked, plain runs with
+        // the marked range underlined take over.
+        let prefix = match &parsed {
+            Line::Task { .. } | Line::Bullet { .. } | Line::Quote { .. } => {
+                notes::content_start_col(raw).min(raw.len())
+            }
+            _ => 0,
+        };
+        let shown = &raw[prefix..];
         let mut runs = Vec::new();
         if let Some(m) = &marked_local {
+            let m = m.start.saturating_sub(prefix)..m.end.saturating_sub(prefix);
             let mut push = |len: usize, underline: bool| {
                 if len == 0 {
                     return;
@@ -1600,9 +1905,9 @@ fn shape_entry(
                     strikethrough: None,
                 });
             };
-            push(m.start.min(raw.len()), false);
-            push(m.end.min(raw.len()).saturating_sub(m.start.min(raw.len())), true);
-            push(raw.len().saturating_sub(m.end.min(raw.len())), false);
+            push(m.start.min(shown.len()), false);
+            push(m.end.min(shown.len()).saturating_sub(m.start.min(shown.len())), true);
+            push(shown.len().saturating_sub(m.end.min(shown.len())), false);
         } else {
             let mut push = |len: usize, kind: Option<SpanKind>| {
                 if len == 0 {
@@ -1610,8 +1915,8 @@ fn shape_entry(
                 }
                 let (color, bg, weight, font_style) = match kind {
                     Some(k) => span_style(k, style.color, t),
-                    // The line's own prefix (list marker, task bracket)
-                    // and any bytes past the spans.
+                    // The line's own revealed prefix (heading hashes) and
+                    // any bytes past the spans.
                     None => (t.faint, None, FontWeight::NORMAL, FontStyle::Normal),
                 };
                 let mut font = base_font.clone();
@@ -1625,19 +1930,19 @@ fn shape_entry(
                     color,
                     background_color: bg,
                     underline: None,
-                    strikethrough: None,
+                    strikethrough: strike,
                 });
             };
-            let start = notes::spans_start_col(raw).min(raw.len());
+            let start = notes::spans_start_col(raw).min(raw.len()).saturating_sub(prefix);
             push(start, None);
             let mut covered = start;
             for (kind, s) in spans {
-                let len = s.len().min(raw.len().saturating_sub(covered));
+                let len = s.len().min(shown.len().saturating_sub(covered));
                 push(len, Some(*kind));
                 covered += len;
             }
-            if covered < raw.len() {
-                let len = raw.len() - covered;
+            if covered < shown.len() {
+                let len = shown.len() - covered;
                 let mut font = base_font.clone();
                 font.style = FontStyle::Normal;
                 runs.push(TextRun {
@@ -1646,11 +1951,13 @@ fn shape_entry(
                     color: style.color,
                     background_color: None,
                     underline: None,
-                    strikethrough: None,
+                    strikethrough: strike,
                 });
             }
         }
-        (SharedString::from(raw.to_string()), runs, px(0.), Glyph::None)
+        let (indent, glyph) =
+            if prefix > 0 { (style.indent, glyph) } else { (px(0.), Glyph::None) };
+        (SharedString::from(shown.to_string()), runs, indent, glyph, prefix)
     } else {
         let mut display = String::new();
         let mut runs = Vec::new();
@@ -1686,7 +1993,7 @@ fn shape_entry(
             display.push_str(text);
             chars_seen += chars;
         }
-        (SharedString::from(display), runs, style.indent, glyph)
+        (SharedString::from(display), runs, style.indent, glyph, 0)
     };
 
     let wrap_width = (width - indent).max(px(50.));
@@ -1713,6 +2020,52 @@ fn shape_entry(
         indent,
         glyph,
         active,
+        prefix_len,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{next_word_boundary, prev_word_boundary};
+
+    #[test]
+    fn word_left_lands_on_word_starts() {
+        let t = "hello brave world";
+        assert_eq!(prev_word_boundary(t, 17), 12); // from end -> "world"
+        assert_eq!(prev_word_boundary(t, 12), 6); // -> "brave"
+        assert_eq!(prev_word_boundary(t, 8), 6); // mid-word -> its start
+        assert_eq!(prev_word_boundary(t, 6), 0);
+        assert_eq!(prev_word_boundary(t, 0), 0);
+    }
+
+    #[test]
+    fn word_right_lands_on_word_ends() {
+        let t = "hello brave world";
+        assert_eq!(next_word_boundary(t, 0), 5);
+        assert_eq!(next_word_boundary(t, 5), 11);
+        assert_eq!(next_word_boundary(t, 8), 11); // mid-word -> its end
+        assert_eq!(next_word_boundary(t, 17), 17);
+    }
+
+    #[test]
+    fn word_motion_crosses_newlines() {
+        let t = "one\ntwo";
+        assert_eq!(next_word_boundary(t, 3), 7);
+        assert_eq!(prev_word_boundary(t, 4), 0);
+    }
+
+    #[test]
+    fn punctuation_runs_are_their_own_stops() {
+        let t = "a -- b";
+        assert_eq!(next_word_boundary(t, 1), 4);
+        assert_eq!(prev_word_boundary(t, 5), 2);
+    }
+
+    #[test]
+    fn word_boundaries_respect_utf8() {
+        let t = "café über";
+        assert_eq!(next_word_boundary(t, 0), 5); // café is 5 bytes
+        assert_eq!(prev_word_boundary(t, t.len()), 6);
     }
 }
 
@@ -1849,11 +2202,11 @@ impl Element for NoteEditorElement {
         });
         window.on_mouse_event({
             let editor = self.editor.clone();
-            move |event: &MouseUpEvent, phase, _window, cx| {
+            move |event: &MouseUpEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
                     return;
                 }
-                editor.update(cx, |ed, cx| ed.on_mouse_up(cx));
+                editor.update(cx, |ed, cx| ed.on_mouse_up(window, cx));
             }
         });
 
@@ -1886,7 +2239,8 @@ impl Element for NoteEditorElement {
                     match &slot.entry.wrapped {
                         Some(wrapped) => {
                             let (s_ix, e_ix) = if slot.entry.active {
-                                (s_raw, e_raw)
+                                let p = slot.entry.prefix_len;
+                                (s_raw.saturating_sub(p), e_raw.saturating_sub(p))
                             } else {
                                 // `text` is always present when a selection is.
                                 let raw_line = text
@@ -1964,8 +2318,9 @@ impl Element for NoteEditorElement {
                     ));
                 }
                 Glyph::Task(state) => {
+                    let scale = t.editor_size / theme::EDITOR_BASE_SIZE;
                     paint_task_box(
-                        point(bounds.origin.x, text_origin.y + px(4.)),
+                        point(bounds.origin.x, text_origin.y + px(4. * scale)),
                         state,
                         &t,
                         window,
@@ -1973,9 +2328,10 @@ impl Element for NoteEditorElement {
                     );
                 }
                 Glyph::Bullet => {
+                    let scale = t.editor_size / theme::EDITOR_BASE_SIZE;
                     let dash = window.text_system().shape_line(
                         SharedString::from("–"),
-                        px(13.),
+                        px(13. * scale),
                         &[TextRun {
                             len: "–".len(),
                             font: window.text_style().font(),
@@ -2038,7 +2394,9 @@ impl Element for NoteEditorElement {
                     .wrapped
                     .as_ref()
                     .and_then(|w| {
-                        w.position_for_index(cursor - slot.raw_start, slot.entry.line_height)
+                        let ix =
+                            (cursor - slot.raw_start).saturating_sub(slot.entry.prefix_len);
+                        w.position_for_index(ix, slot.entry.line_height)
                     })
                     .unwrap_or(point(px(0.), px(0.)));
                 window.paint_quad(fill(
@@ -2095,9 +2453,11 @@ fn paint_task_box(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let box_bounds = Bounds::new(origin, size(px(13.), px(13.)));
+    let scale = t.editor_size / theme::EDITOR_BASE_SIZE;
+    let side = px(13. * scale);
+    let box_bounds = Bounds::new(origin, size(side, side));
     let mut quad = fill(box_bounds, gpui::transparent_black());
-    quad.corner_radii = Corners::all(px(4.));
+    quad.corner_radii = Corners::all(px(4. * scale));
     match state {
         TaskState::Done => {
             quad.background = t.accent.into();
@@ -2110,9 +2470,9 @@ fn paint_task_box(
     window.paint_quad(quad);
 
     let (mark, color, size_px) = match state {
-        TaskState::Done => ("✓", t.bg, px(9.)),
-        TaskState::Cancelled => ("✕", t.faint, px(8.)),
-        TaskState::Scheduled => ("›", t.faint, px(8.)),
+        TaskState::Done => ("✓", t.bg, px(9. * scale)),
+        TaskState::Cancelled => ("✕", t.faint, px(8. * scale)),
+        TaskState::Scheduled => ("›", t.faint, px(8. * scale)),
         TaskState::Open => return,
     };
     let mut font = window.text_style().font();
@@ -2131,8 +2491,8 @@ fn paint_task_box(
         None,
     );
     let inset = point(
-        origin.x + (px(13.) - line.width).max(px(0.)) / 2.,
-        origin.y + (px(13.) - size_px * 1.2) / 2.,
+        origin.x + (side - line.width).max(px(0.)) / 2.,
+        origin.y + (side - size_px * 1.2) / 2.,
     );
     let _ = line.paint(inset, size_px * 1.2, window, cx);
 }
