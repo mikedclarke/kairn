@@ -136,6 +136,12 @@ impl VaultScan {
         Self { days, periods, notes: notes_files(root) }
     }
 
+    /// Every note file under `Notes/`, tree order, without reading any of
+    /// them: for callers that need paths (mtimes, counts), not content.
+    pub fn note_files(&self) -> impl Iterator<Item = &PathBuf> {
+        self.notes.iter().map(|(_, path)| path)
+    }
+
     /// Every daily note read once, newest day first.
     pub fn read_dailies(&self) -> Vec<DayText> {
         self.read_dailies_cached(&mut TextCache::default())
