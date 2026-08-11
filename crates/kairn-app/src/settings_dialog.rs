@@ -403,11 +403,14 @@ impl SettingsEditor {
             .upgrade()
             .map(|ws| ws.read(cx).settings.day_timeline)
             .unwrap_or(true);
-        let show_agents = self
+        let (show_agents, show_daily, show_tasks) = self
             .workspace
             .upgrade()
-            .map(|ws| ws.read(cx).settings.show_agents)
-            .unwrap_or(true);
+            .map(|ws| {
+                let s = &ws.read(cx).settings;
+                (s.show_agents, s.show_daily, s.show_tasks)
+            })
+            .unwrap_or((true, true, true));
         let resolved = self
             .workspace
             .upgrade()
@@ -444,15 +447,31 @@ impl SettingsEditor {
                 cx.notify();
             }))
         };
-        let agents_button = |id: &'static str, label: &'static str, on: bool| {
-            let btn = Button::new(id).label(label);
-            let btn = if on == show_agents { btn.primary() } else { btn.outline() };
+        // One Shown/Hidden pair per hideable sidebar section; the setter is
+        // picked by label to keep the three rows one closure.
+        let vis_button = |id: &'static str, section: &'static str, on: bool, current: bool| {
+            let btn = Button::new(id).label(if on { "Shown" } else { "Hidden" });
+            let btn = if on == current { btn.primary() } else { btn.outline() };
             btn.on_click(cx.listener(move |this, _, _, cx| {
-                let _ = this.workspace.update(cx, |ws, cx| {
-                    ws.set_show_agents(on, cx);
+                let _ = this.workspace.update(cx, |ws, cx| match section {
+                    "daily" => ws.set_show_daily(on, cx),
+                    "tasks" => ws.set_show_tasks(on, cx),
+                    _ => ws.set_show_agents(on, cx),
                 });
                 cx.notify();
             }))
+        };
+        let vis_row = |label: &'static str,
+                       section: &'static str,
+                       on_id: &'static str,
+                       off_id: &'static str,
+                       current: bool| {
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(div().w(px(90.)).text_size(px(12.5)).child(label))
+                .child(vis_button(on_id, section, true, current))
+                .child(vis_button(off_id, section, false, current))
         };
 
         v_flex()
@@ -545,16 +564,13 @@ impl SettingsEditor {
             .child(div().text_size(px(11.)).opacity(0.55).child(
                 "The pill row of timed lines (09:00 standup) at the top of a daily note.",
             ))
-            .child(Self::section("Agents section"))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(agents_button("agents-on", "Shown", true))
-                    .child(agents_button("agents-off", "Hidden", false)),
-            )
+            .child(Self::section("Sidebar sections"))
+            .child(vis_row("Daily", "daily", "daily-vis-on", "daily-vis-off", show_daily))
+            .child(vis_row("Tasks", "tasks", "tasks-vis-on", "tasks-vis-off", show_tasks))
+            .child(vis_row("Agents", "agents", "agents-on", "agents-off", show_agents))
             .child(div().text_size(px(11.)).opacity(0.55).child(
-                "The sidebar feed of agent CLI activity. Hide it if agents only run on \
-                 other machines over SSH.",
+                "Hidden sections disappear from the sidebar entirely. Agents is the feed \
+                 of agent CLI activity on this machine.",
             ))
             .child(Self::section("Command line tool"))
             .child(self.render_cli(cx))

@@ -16,7 +16,7 @@ same fact twice; no em dashes. Rewrite to this standard before releasing.
 - A start page listing shells, hosts and shortcuts replaces the shell that auto-started on launch.
 - The Notes and Sessions sidebar headers gained plus buttons: add a note or folder at the top level, or start a session from the quick list.
 - Folders can now be created in the notes list.
-- The sidebar Agents section can be hidden in Settings.
+- The sidebar Daily, Tasks and Agents sections can each be hidden in Settings.
 
 ## Improved
 

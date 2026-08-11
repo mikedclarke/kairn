@@ -74,6 +74,12 @@ pub struct Settings {
     /// stays empty.
     #[serde(default = "default_true")]
     pub show_agents: bool,
+    /// Whether the sidebar shows the Daily section.
+    #[serde(default = "default_true")]
+    pub show_daily: bool,
+    /// Whether the sidebar shows the Tasks section.
+    #[serde(default = "default_true")]
+    pub show_tasks: bool,
     /// The sidebar Daily section looks forward (today plus the next two
     /// days) when true, back (today plus the previous two) when false.
     #[serde(default = "default_true")]
@@ -145,6 +151,8 @@ impl Default for Settings {
             ssh_hosts: Vec::new(),
             local_apps: Vec::new(),
             show_agents: true,
+            show_daily: true,
+            show_tasks: true,
             daily_forward: true,
             sidebar_collapsed: Vec::new(),
             week_strip: default_week_strip(),

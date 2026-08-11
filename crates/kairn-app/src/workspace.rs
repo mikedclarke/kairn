@@ -432,6 +432,30 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Show or hide the sidebar's Daily section.
+    pub fn set_show_daily(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.settings.show_daily == on {
+            return;
+        }
+        self.settings.show_daily = on;
+        if let Err(e) = self.settings.save() {
+            eprintln!("kairn: failed to save settings: {e}");
+        }
+        cx.notify();
+    }
+
+    /// Show or hide the sidebar's Tasks section.
+    pub fn set_show_tasks(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.settings.show_tasks == on {
+            return;
+        }
+        self.settings.show_tasks = on;
+        if let Err(e) = self.settings.save() {
+            eprintln!("kairn: failed to save settings: {e}");
+        }
+        cx.notify();
+    }
+
     /// Point the sidebar Daily section forward (today + next two days) or
     /// back (today + previous two).
     pub fn set_daily_forward(&mut self, forward: bool, cx: &mut Context<Self>) {

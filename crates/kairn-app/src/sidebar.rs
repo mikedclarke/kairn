@@ -29,59 +29,63 @@ impl Workspace {
             .child(self.render_calendar(t, cx));
 
         // Daily: today plus the next (or previous, per settings) two days.
-        let collapsed = self.section_collapsed("Daily");
-        side = side.child(
-            sechead(t, "sec-daily", "Daily", None, collapsed).on_click(cx.listener(
-                |this, _, _, cx| this.toggle_section("Daily", cx),
-            )),
-        );
-        if !collapsed {
-            let forward = self.settings.daily_forward;
-            for i in 0..3u64 {
-                let day = if forward { today + Days::new(i) } else { today - Days::new(i) };
-                let selected = day == self.selected_day;
-                let has_note = self.note_days.contains_key(&day);
-                let mut row = nav_item(t, ("daily", i as usize))
-                    .when(selected, |d| d.bg(t.sel).text_color(t.text))
-                    .when(has_note, |d| {
-                        d.child(div().w(px(7.)).h(px(7.)).flex_none().rounded_full().bg(t.amber))
-                    })
-                    .child(div().flex_1().child(day_label(day)));
-                if day == today {
-                    row = row.child(count_label(t, "today", false));
+        if self.settings.show_daily {
+            let collapsed = self.section_collapsed("Daily");
+            side = side.child(
+                sechead(t, "sec-daily", "Daily", None, collapsed).on_click(cx.listener(
+                    |this, _, _, cx| this.toggle_section("Daily", cx),
+                )),
+            );
+            if !collapsed {
+                let forward = self.settings.daily_forward;
+                for i in 0..3u64 {
+                    let day = if forward { today + Days::new(i) } else { today - Days::new(i) };
+                    let selected = day == self.selected_day;
+                    let has_note = self.note_days.contains_key(&day);
+                    let mut row = nav_item(t, ("daily", i as usize))
+                        .when(selected, |d| d.bg(t.sel).text_color(t.text))
+                        .when(has_note, |d| {
+                            d.child(div().w(px(7.)).h(px(7.)).flex_none().rounded_full().bg(t.amber))
+                        })
+                        .child(div().flex_1().child(day_label(day)));
+                    if day == today {
+                        row = row.child(count_label(t, "today", false));
+                    }
+                    side = side.child(row.on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_day(day, cx);
+                    })));
                 }
-                side = side.child(row.on_click(cx.listener(move |this, _, _, cx| {
-                    this.select_day(day, cx);
-                })));
             }
         }
 
         // Tasks: real counts from the daily-note scan; each row opens a view.
-        let collapsed = self.section_collapsed("Tasks");
-        side = side.child(
-            sechead(t, "sec-tasks", "Tasks", None, collapsed).on_click(cx.listener(
-                |this, _, _, cx| this.toggle_section("Tasks", cx),
-            )),
-        );
-        if !collapsed {
-            let queries = [
-                ("tasks-today", "Today", TaskQuery::Today),
-                ("tasks-open", "Open", TaskQuery::Open),
-                ("tasks-overdue", "Overdue", TaskQuery::Overdue),
-            ];
-            for (id, label, query) in queries {
-                let count = self.task_count(query);
-                let active = self.view == PaneView::Tasks(query);
-                let hot = query == TaskQuery::Overdue && count > 0;
-                side = side.child(
-                    nav_item(t, id)
-                        .when(active, |d| d.bg(t.sel).text_color(t.text))
-                        .child(div().flex_1().child(label))
-                        .child(count_label(t, &count.to_string(), hot))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_task_view(query, cx);
-                        })),
-                );
+        if self.settings.show_tasks {
+            let collapsed = self.section_collapsed("Tasks");
+            side = side.child(
+                sechead(t, "sec-tasks", "Tasks", None, collapsed).on_click(cx.listener(
+                    |this, _, _, cx| this.toggle_section("Tasks", cx),
+                )),
+            );
+            if !collapsed {
+                let queries = [
+                    ("tasks-today", "Today", TaskQuery::Today),
+                    ("tasks-open", "Open", TaskQuery::Open),
+                    ("tasks-overdue", "Overdue", TaskQuery::Overdue),
+                ];
+                for (id, label, query) in queries {
+                    let count = self.task_count(query);
+                    let active = self.view == PaneView::Tasks(query);
+                    let hot = query == TaskQuery::Overdue && count > 0;
+                    side = side.child(
+                        nav_item(t, id)
+                            .when(active, |d| d.bg(t.sel).text_color(t.text))
+                            .child(div().flex_1().child(label))
+                            .child(count_label(t, &count.to_string(), hot))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_task_view(query, cx);
+                            })),
+                    );
+                }
             }
         }
 
