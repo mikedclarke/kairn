@@ -5,7 +5,7 @@ use std::time::Duration;
 use chrono::{Local, NaiveDate};
 use gpui::{
     Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, Render, SharedString, Styled, Task, Window, div,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Task, Window, div,
     prelude::FluentBuilder as _, px,
 };
 use gpui_component::Root;
@@ -13,12 +13,11 @@ use kairn_core as notes;
 
 use crate::overlays::Overlay;
 use crate::session::{Session, SessionKind, spawn};
-use crate::theme::{self, KairnThemeExt, Mode};
+use crate::theme::{self, KairnTheme, KairnThemeExt, Mode};
 
 // The keymap (actions, chord labels) and small UI helpers are re-exported
 // here so the render modules keep one import surface for workspace types.
 pub use crate::keymap::*;
-pub use crate::ui::kbd;
 pub use kairn_core::TaskQuery;
 use kairn_core::settings::Settings;
 
@@ -568,6 +567,7 @@ impl Render for Workspace {
             .on_key_down(cx.listener(Self::on_key_down))
             .child(self.render_titlebar(&t, cx))
             .child(body)
+            .child(self.render_settings_fab(&t, cx))
             .children(self.render_statusbar(&t, cx))
             .children(self.render_picker(&t, window, cx))
             .children(self.render_switcher(&t, cx))
@@ -579,6 +579,35 @@ impl Render for Workspace {
 }
 
 impl Workspace {
+    /// The way into Settings: a floating gear pinned to the window's
+    /// bottom-left corner, above the pane content but under every overlay.
+    fn render_settings_fab(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {
+        let hover_bg = t.hover;
+        let hover_text = t.text;
+        div()
+            .id("settings-fab")
+            .absolute()
+            .left(px(10.))
+            .bottom(px(10.))
+            .size(px(30.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .bg(t.panel2)
+            .border_1()
+            .border_color(t.border)
+            .shadow_md()
+            .text_size(t.ui_px(14.))
+            .text_color(t.dim)
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover_bg).text_color(hover_text))
+            .child("⚙")
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_settings(window, cx);
+            }))
+    }
+
     /// The floating ghost that follows a task's drag-to-reschedule: a small
     /// card with the task's text, offset from the pointer so it never sits
     /// under it (which would block the week strip's hit-testing).

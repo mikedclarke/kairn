@@ -16,6 +16,10 @@ same fact twice; no em dashes. Rewrite to this standard before releasing.
 
 <!-- Refinements to existing workflows, reliability, performance, or UX. -->
 
+- Settings moved from the sidebar footer to a floating gear in the window's bottom left corner.
+- The calendar's month and year heading is larger.
+- The Ocean theme now uses neutral dark grey and black backgrounds instead of the olive tinted ones.
+
 ## Fixed
 
 <!-- Bugs that no longer happen. -->

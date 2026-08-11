@@ -218,9 +218,9 @@ impl KairnTheme {
 }
 
 /// Built-in themes offered in the picker beyond the two base modes. Each is
-/// the dark base with a different accent family, so the proven neutral
-/// backgrounds stay and only the colour that carries headings, links, ticks,
-/// and bold shifts. Ids are stable (settings store them); names are shown.
+/// the dark base with a different accent family; Ocean additionally swaps the
+/// base's olive-tinted surfaces for untinted greys, so only its accent carries
+/// any colour. Ids are stable (settings store them); names are shown.
 pub const BUILTIN_PRESETS: &[(&str, &str)] = &[
     ("ocean", "Ocean"),
     ("rose", "Rose"),
@@ -243,6 +243,18 @@ fn preset(id: &str) -> Option<KairnTheme> {
     t.bold = amber;
     t.sel = accent.opacity(0.25);
     t.highlight = amber.opacity(0.28);
+    if id == "ocean" {
+        t.bg = c(0x151515);
+        t.panel = c(0x1b1b1b);
+        t.panel2 = c(0x212121);
+        t.hover = c(0x272727);
+        t.border = c(0x2e2e2e);
+        t.text = c(0xd9d9d9);
+        t.dim = c(0x8f8f8f);
+        t.faint = c(0x5e5e5e);
+        t.term_bg = c(0x101010);
+        t.term_colors = terminal_palette(&ThemeTerminal::default(), (0x10, 0x10, 0x10));
+    }
     Some(t)
 }
 

@@ -8,7 +8,7 @@ use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
 
 use crate::session::SessionKind;
 use crate::theme::KairnTheme;
-use crate::workspace::{PaneView, TaskQuery, Workspace, chord, kbd};
+use crate::workspace::{PaneView, TaskQuery, Workspace, chord};
 
 /// The file manager by its platform name, for context-menu labels.
 const REVEAL_LABEL: &str = if cfg!(target_os = "macos") {
@@ -347,29 +347,6 @@ impl Workspace {
             }
         }
 
-        // Pinned footer: the always-visible way into Settings.
-        let hover_bg = t.hover;
-        let hover_text = t.text;
-        let settings_row = div()
-            .id("sidebar-settings")
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .px(px(14.))
-            .py(px(9.))
-            .border_t_1()
-            .border_color(t.border)
-            .text_color(t.dim)
-            .cursor_pointer()
-            .hover(move |s| s.bg(hover_bg).text_color(hover_text))
-            .child(div().text_size(t.ui_px(13.)).child("⚙"))
-            .child(div().flex_1().child("Settings"))
-            .child(kbd(t, chord(",")))
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.open_settings(window, cx);
-            }));
-
         div()
             .w(px(272.))
             .flex_none()
@@ -381,7 +358,6 @@ impl Workspace {
             .border_color(t.border)
             .text_size(t.ui_px(12.5))
             .child(side)
-            .child(settings_row)
     }
 
     fn render_calendar(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -420,6 +396,7 @@ impl Workspace {
                         // open today's daily note.
                         div()
                             .id("cal-today")
+                            .text_size(t.ui_px(15.))
                             .cursor_pointer()
                             .hover(move |s| s.text_color(today_hover))
                             .child(title)
