@@ -7,7 +7,7 @@ use gpui_terminal::{TerminalConfig, TerminalView};
 use parking_lot::Mutex;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
-use kairn_core::settings::SshHost;
+use kairn_core::settings::{HostApp, SshHost};
 use crate::theme::KairnThemeExt as _;
 use crate::workspace::Workspace;
 
@@ -18,6 +18,19 @@ const SCROLLBACK_LINES: usize = 10_000;
 pub enum SessionKind {
     Local,
     Ssh(SshHost),
+    /// A saved launch shortcut: a command in its own session, on this
+    /// machine (`host: None`) or on an SSH host.
+    App { host: Option<SshHost>, app: HostApp },
+}
+
+impl SessionKind {
+    /// Whether the session runs on another machine (shows the SSH chip).
+    pub fn is_remote(&self) -> bool {
+        matches!(
+            self,
+            SessionKind::Ssh(_) | SessionKind::App { host: Some(_), .. }
+        )
+    }
 }
 
 pub struct Session {
@@ -40,9 +53,9 @@ impl Session {
     /// the shell itself (i.e. a command is running). SSH sessions count as
     /// busy while connected: the remote foreground process isn't visible here.
     pub fn is_busy(&self) -> bool {
-        match self.kind {
-            SessionKind::Ssh(_) => true,
-            SessionKind::Local => {
+        match &self.kind {
+            SessionKind::Ssh(_) | SessionKind::App { host: Some(_), .. } => true,
+            SessionKind::Local | SessionKind::App { host: None, .. } => {
                 let leader = self.master.lock().process_group_leader();
                 match (leader, self.shell_pid) {
                     (Some(leader), Some(pid)) => leader > 0 && leader as u32 != pid,
@@ -89,7 +102,47 @@ fn shell_command(kind: &SessionKind) -> (CommandBuilder, SharedString) {
             cmd.args(&args[1..]);
             (cmd, host.name.clone().into())
         }
+        SessionKind::App { host: None, app } => {
+            // An interactive login shell (`-i -l`) so the command sees the
+            // same PATH a typed command would (rc files, not just profiles),
+            // with an exec tail so the pane drops to a shell when the app
+            // exits instead of dying.
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+            let mut cmd = CommandBuilder::new(&shell);
+            cmd.args([
+                "-i",
+                "-l",
+                "-c",
+                &format!("{}; exec {} -il", app.command, sq(&shell)),
+            ]);
+            (cmd, app.display_name().into())
+        }
+        SessionKind::App { host: Some(host), app } => {
+            // `-t` allocates the remote TTY an interactive app needs; the
+            // remote command re-wraps in the user's login shell for the same
+            // PATH and exec-tail reasons as the local arm.
+            let mut args = vec!["ssh".to_string(), "-t".to_string()];
+            if let Some(port) = host.port {
+                args.push("-p".to_string());
+                args.push(port.to_string());
+            }
+            args.push(host.target.clone());
+            args.push(format!(
+                "exec $SHELL -il -c {}",
+                sq(&format!("{}; exec $SHELL -il", app.command))
+            ));
+            let mut cmd = CommandBuilder::new(&args[0]);
+            cmd.args(&args[1..]);
+            let name = format!("{} · {}", host.name, app.display_name());
+            (cmd, name.into())
+        }
     }
+}
+
+/// Single-quote a string for a POSIX shell (`'` becomes `'\''`), so a saved
+/// command travels into the wrapping shell verbatim.
+fn sq(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 pub fn spawn(
@@ -180,7 +233,7 @@ pub fn spawn(
     });
 
     Ok(Session {
-        busy: matches!(kind, SessionKind::Ssh(_)),
+        busy: kind.is_remote(),
         id,
         kind,
         display_name,

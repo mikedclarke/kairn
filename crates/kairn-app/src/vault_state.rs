@@ -521,6 +521,26 @@ impl Workspace {
         self.create_new_note(dir, window, cx);
     }
 
+    /// New-folder prompt: a one-field dialog, then a plain directory under
+    /// `dir`, expanded so the empty folder is visible in the tree.
+    pub fn prompt_new_folder(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        crate::name_dialog::open(
+            "New folder",
+            "Create",
+            None,
+            window,
+            cx,
+            move |ws, name, window, cx| match notes::create_folder_in(&dir, name) {
+                Ok(path) => {
+                    ws.notes_expanded.insert(path);
+                    ws.reload_notes(cx);
+                    cx.notify();
+                }
+                Err(e) => window.push_notification(format!("Could not create folder: {e}"), cx),
+            },
+        );
+    }
+
     /// Flush pending editor changes now instead of waiting for the autosave.
     pub(crate) fn on_save_note(
         &mut self,
@@ -623,6 +643,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.settings.ssh_hosts = patch.hosts;
+        self.settings.local_apps = patch.local_apps;
         self.settings.notes_root = patch.notes_root;
         self.settings.daily_template_rule = patch.daily_template_rule;
         self.settings.theme = patch.theme;
@@ -679,6 +700,7 @@ impl Workspace {
 pub struct SettingsPatch {
     pub notes_root: Option<String>,
     pub hosts: Vec<kairn_core::settings::SshHost>,
+    pub local_apps: Vec<kairn_core::settings::HostApp>,
     pub daily_template_rule: String,
     /// The daily template body, only when the dialog changed it.
     pub template_body: Option<String>,

@@ -12,6 +12,12 @@ same fact twice; no em dashes. Rewrite to this standard before releasing.
 
 <!-- New user-visible capabilities. -->
 
+- Launch shortcuts: named commands saved in Settings for this machine or any SSH host, each opening in its own session.
+- A start page listing shells, hosts and shortcuts replaces the shell that auto-started on launch.
+- The Notes and Sessions sidebar headers gained plus buttons: add a note or folder at the top level, or start a session from the quick list.
+- Folders can now be created in the notes list.
+- The sidebar Agents section can be hidden in Settings.
+
 ## Improved
 
 <!-- Refinements to existing workflows, reliability, performance, or UX. -->

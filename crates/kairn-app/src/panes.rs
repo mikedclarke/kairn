@@ -1,8 +1,9 @@
 use chrono::{Datelike, Days, Local};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, Context, HighlightStyle, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, StyledText, Window, div, px, relative,
+    AnyElement, Context, ElementId, HighlightStyle, InteractiveElement, IntoElement,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, StyledText, Window, div, px,
+    relative,
 };
 use gpui_component::h_flex;
 use gpui_component::resizable::{h_resizable, resizable_panel};
@@ -38,24 +39,132 @@ impl Workspace {
         }
     }
 
-    fn render_terminal_pane(&self, t: &KairnTheme, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_terminal_pane(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {
         let pane = div().size_full().min_w(px(0.)).min_h(px(0.)).bg(t.term_bg);
         match self.sessions.get(self.active_session) {
             Some(session) => pane.child(session.view.clone()),
-            None => pane
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap(px(8.))
-                .text_color(t.faint)
-                .child("No session")
-                .child(
-                    div()
-                        .text_size(t.ui_px(11.5))
-                        .child(format!("{} starts a new shell", chord("N"))),
-                ),
+            None => pane.child(self.render_start_page(t, cx)),
         }
+    }
+
+    /// The start page: with no session open (including on launch, which no
+    /// longer auto-starts a shell), the terminal pane lists everything that
+    /// can be started — the local shell, then each saved shortcut and SSH
+    /// host — as one calm click-to-open column.
+    fn render_start_page(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::session::SessionKind;
+
+        let group = |label: SharedString| {
+            div()
+                .mt(px(14.))
+                .mb(px(2.))
+                .px(px(12.))
+                .text_size(t.ui_px(10.5))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(t.faint)
+                .child(label.to_uppercase())
+        };
+        let hover_bg = t.hover;
+        let hover_text = t.text;
+        let row = move |id: ElementId| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .px(px(12.))
+                .py(px(7.))
+                .rounded(px(7.))
+                .text_color(t.dim)
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover_bg).text_color(hover_text))
+        };
+        let detail = |text: SharedString| {
+            div().text_size(t.ui_px(11.)).text_color(t.faint).child(text)
+        };
+
+        let shell = std::env::var("SHELL").unwrap_or_default();
+        let shell_name: SharedString = std::path::PathBuf::from(&shell)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "shell".into())
+            .into();
+
+        let mut col = div()
+            .w(px(340.))
+            .flex()
+            .flex_col()
+            .child(group("This machine".into()))
+            .child(
+                row("start-shell".into())
+                    .child(div().flex_1().child("New shell"))
+                    .child(detail(shell_name))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.spawn_session(SessionKind::Local, window, cx);
+                    })),
+            );
+        for (i, app) in self.settings.local_apps.iter().enumerate() {
+            let kind = SessionKind::App { host: None, app: app.clone() };
+            col = col.child(
+                row(("start-local-app", i).into())
+                    .child(div().flex_1().child(app.display_name()))
+                    .child(detail(app.command.clone().into()))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.spawn_session(kind.clone(), window, cx);
+                    })),
+            );
+        }
+        for (i, host) in self.settings.ssh_hosts.iter().enumerate() {
+            col = col.child(group(host.name.clone().into()));
+            let kind = SessionKind::Ssh(host.clone());
+            col = col.child(
+                row(("start-host", i).into())
+                    .child(div().flex_1().child("Shell"))
+                    .child(detail(host.target.clone().into()))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.spawn_session(kind.clone(), window, cx);
+                    })),
+            );
+            for (j, app) in host.apps.iter().enumerate() {
+                let kind = SessionKind::App {
+                    host: Some(host.clone()),
+                    app: app.clone(),
+                };
+                col = col.child(
+                    row(("start-host-app", i * 64 + j).into())
+                        .child(div().flex_1().child(app.display_name()))
+                        .child(detail(app.command.clone().into()))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.spawn_session(kind.clone(), window, cx);
+                        })),
+                );
+            }
+        }
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .text_size(t.ui_px(15.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(t.text)
+                    .child("Start a session"),
+            )
+            .child(col)
+            .child(
+                div()
+                    .mt(px(18.))
+                    .text_size(t.ui_px(11.))
+                    .text_color(t.faint)
+                    .child(format!(
+                        "{} starts a shell · shortcuts live in Settings",
+                        chord("N")
+                    )),
+            )
     }
 
     fn render_note_pane(

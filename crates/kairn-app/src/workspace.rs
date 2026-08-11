@@ -256,7 +256,9 @@ impl Workspace {
             _notes_watch_task: notes_watch_task,
         };
         this.reload_notes(cx);
-        this.spawn_session(SessionKind::Local, window, cx);
+        // No session on launch: the terminal pane opens on the start page
+        // and the first session is whatever the user picks there.
+        let _ = window;
         this
     }
 
@@ -418,6 +420,18 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Show or hide the sidebar's Agents activity section.
+    pub fn set_show_agents(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.settings.show_agents == on {
+            return;
+        }
+        self.settings.show_agents = on;
+        if let Err(e) = self.settings.save() {
+            eprintln!("kairn: failed to save settings: {e}");
+        }
+        cx.notify();
+    }
+
     /// Point the sidebar Daily section forward (today + next two days) or
     /// back (today + previous two).
     pub fn set_daily_forward(&mut self, forward: bool, cx: &mut Context<Self>) {
@@ -570,6 +584,7 @@ impl Render for Workspace {
             .child(self.render_settings_fab(&t, cx))
             .children(self.render_statusbar(&t, cx))
             .children(self.render_picker(&t, window, cx))
+            .children(self.render_notes_menu(&t, window, cx))
             .children(self.render_switcher(&t, cx))
             .children(self.render_capture(&t, cx))
             .children(self.render_drag_ghost(&t, cx))

@@ -4,6 +4,34 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
+/// A saved launch shortcut: a command that opens in its own session, either
+/// on this machine (`Settings::local_apps`) or on the SSH host that owns it
+/// (`SshHost::apps`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct HostApp {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    pub command: String,
+}
+
+impl HostApp {
+    /// The label shown for the shortcut: the trimmed name, else the command's
+    /// first word capitalized ("tmux attach" reads as "Tmux"), so a blank
+    /// name still yields something readable.
+    pub fn display_name(&self) -> String {
+        let name = self.name.trim();
+        if !name.is_empty() {
+            return name.to_string();
+        }
+        let word = self.command.trim().split_whitespace().next().unwrap_or("App");
+        let mut chars = word.chars();
+        match chars.next() {
+            Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+            None => "App".to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SshHost {
     pub name: String,
@@ -11,6 +39,9 @@ pub struct SshHost {
     pub target: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// Launch shortcuts that run on this host, in the user's order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub apps: Vec<HostApp>,
 }
 
 impl SshHost {
@@ -35,6 +66,14 @@ pub struct Settings {
     pub notes_root: Option<String>,
     #[serde(default)]
     pub ssh_hosts: Vec<SshHost>,
+    /// Launch shortcuts that run on this machine, in the user's order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_apps: Vec<HostApp>,
+    /// Whether the sidebar shows the Agents activity section; hiding it
+    /// suits working fully remote over SSH, where local agent activity
+    /// stays empty.
+    #[serde(default = "default_true")]
+    pub show_agents: bool,
     /// The sidebar Daily section looks forward (today plus the next two
     /// days) when true, back (today plus the previous two) when false.
     #[serde(default = "default_true")]
@@ -104,6 +143,8 @@ impl Default for Settings {
             theme: default_theme(),
             notes_root: None,
             ssh_hosts: Vec::new(),
+            local_apps: Vec::new(),
+            show_agents: true,
             daily_forward: true,
             sidebar_collapsed: Vec::new(),
             week_strip: default_week_strip(),

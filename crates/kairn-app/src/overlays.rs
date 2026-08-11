@@ -29,6 +29,9 @@ use crate::workspace::{LayoutMode, Workspace};
 pub enum Overlay {
     /// The new-session menu, anchored near the click.
     Picker { pos: Point<Pixels> },
+    /// The Notes section's add menu (note or folder at the top level),
+    /// anchored near the click.
+    NotesMenu { pos: Point<Pixels> },
     /// The jump/search switcher.
     Switcher {
         input: gpui::Entity<InputState>,
@@ -84,6 +87,17 @@ impl Workspace {
         // The picker has no input of its own to take focus, so focus the
         // overlay layer itself: Escape then dispatches through the
         // backdrop's key context.
+        self.overlay_focus.focus(window);
+        cx.notify();
+    }
+
+    pub fn open_notes_menu(
+        &mut self,
+        pos: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.overlay = Some(Overlay::NotesMenu { pos });
         self.overlay_focus.focus(window);
         cx.notify();
     }
@@ -347,7 +361,9 @@ impl Workspace {
 
         // Keep the menu inside the window when the anchor row sits near the
         // bottom edge.
-        let item_count = 3 + self.settings.ssh_hosts.len().max(1);
+        let app_count = self.settings.local_apps.len()
+            + self.settings.ssh_hosts.iter().map(|h| h.apps.len()).sum::<usize>();
+        let item_count = 3 + self.settings.ssh_hosts.len().max(1) + app_count;
         let est_height = px(item_count as f32 * 30.0 + 32.0);
         let viewport = window.viewport_size();
         let top = pos
@@ -380,8 +396,24 @@ impl Workspace {
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.spawn_session(SessionKind::Local, window, cx);
                     })),
-            )
-            .child(picker_rule(t));
+            );
+        for (i, app) in self.settings.local_apps.iter().enumerate() {
+            let kind = SessionKind::App { host: None, app: app.clone() };
+            menu = menu.child(
+                picker_item(t, ("picker-local-app", i), cx)
+                    .child(div().flex_1().child(app.display_name()))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(t.faint)
+                            .child("this machine"),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.spawn_session(kind.clone(), window, cx);
+                    })),
+            );
+        }
+        menu = menu.child(picker_rule(t));
 
         if self.settings.ssh_hosts.is_empty() {
             menu = menu.child(
@@ -407,6 +439,25 @@ impl Workspace {
                             this.spawn_session(kind.clone(), window, cx);
                         })),
                 );
+                for (j, app) in host.apps.iter().enumerate() {
+                    let kind = SessionKind::App {
+                        host: Some(host.clone()),
+                        app: app.clone(),
+                    };
+                    menu = menu.child(
+                        picker_item(t, ("picker-host-app", i * 64 + j), cx)
+                            .child(div().flex_1().pl(px(12.)).child(app.display_name()))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(t.faint)
+                                    .child(host.name.clone()),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.spawn_session(kind.clone(), window, cx);
+                            })),
+                    );
+                }
             }
         }
 
@@ -427,6 +478,71 @@ impl Workspace {
                 // Escape closes: the same key context as every other
                 // overlay backdrop, with the overlay focus tracked so the
                 // binding has a dispatch path.
+                .track_focus(&self.overlay_focus)
+                .key_context("Overlay")
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        this.close_overlays(window, cx);
+                    }),
+                )
+                .child(menu),
+        )
+    }
+
+    /// The Notes section's + menu: create a note or folder at the top level.
+    /// Deeper levels keep their right-click menus.
+    pub(crate) fn render_notes_menu(
+        &self,
+        t: &KairnTheme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let Some(Overlay::NotesMenu { pos }) = &self.overlay else {
+            return None;
+        };
+        let pos = *pos;
+        let est_height = px(2. * 30.0 + 12.0);
+        let viewport = window.viewport_size();
+        let top = pos.y.min(viewport.height - est_height - px(8.)).max(px(0.));
+        let notes_dir = self.notes_root.join("Notes");
+        let folder_dir = notes_dir.clone();
+
+        let menu = div()
+            .absolute()
+            .left(pos.x)
+            .top(top)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .min_w(px(180.))
+            .p(px(5.))
+            .rounded(px(9.))
+            .border_1()
+            .border_color(t.border)
+            .bg(t.panel2)
+            .shadow_lg()
+            .text_size(px(12.5))
+            .child(
+                picker_item(t, "notes-menu-note", cx)
+                    .child("New note…")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.overlay = None;
+                        this.prompt_new_note(notes_dir.clone(), window, cx);
+                    })),
+            )
+            .child(
+                picker_item(t, "notes-menu-folder", cx)
+                    .child("New folder…")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.overlay = None;
+                        this.prompt_new_folder(folder_dir.clone(), window, cx);
+                    })),
+            );
+
+        Some(
+            div()
+                .id("notes-menu-backdrop")
+                .absolute()
+                .inset_0()
                 .track_focus(&self.overlay_focus)
                 .key_context("Overlay")
                 .on_mouse_down(
@@ -606,14 +722,14 @@ impl Workspace {
         for (i, session) in self.sessions.iter().enumerate() {
             let busy = session.busy;
             let meta = match &session.kind {
-                SessionKind::Local => {
+                SessionKind::Local | SessionKind::App { host: None, .. } => {
                     if busy {
                         "local · running"
                     } else {
                         "local · idle"
                     }
                 }
-                SessionKind::Ssh(_) => "SSH · connected",
+                SessionKind::Ssh(_) | SessionKind::App { host: Some(_), .. } => "SSH · connected",
             };
             card = card.child(
                 switcher_item(t, ("switcher-session", i), cx)

@@ -192,6 +192,21 @@ pub fn new_note_in(dir: &Path, name: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Create a subfolder of `dir` named by the user. Never overwrites: an
+/// existing file or folder of that name is an error. Returns the new path.
+pub fn create_folder_in(dir: &Path, name: &str) -> io::Result<PathBuf> {
+    let name = checked_stem(name)?;
+    let path = dir.join(name);
+    if path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("\"{name}\" already exists here"),
+        ));
+    }
+    fs::create_dir(&path)?;
+    Ok(path)
+}
+
 /// Create a fresh, untitled note in `dir`, seeded with an empty `# ` heading
 /// so the caret can land after it and the user just types the title — which
 /// then renames the file (see [`note_title_stem`]), NotePlan-style. Picks the
