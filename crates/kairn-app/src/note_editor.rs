@@ -1357,10 +1357,10 @@ impl NoteEditor {
         let mut end = range.end.min(len).max(start);
         if end < len {
             end += 1;
-        } else if start > 0 {
+        } else {
             // The block ends the file: take the preceding newline so the
             // remaining last line keeps the no-trailing-newline convention.
-            start -= 1;
+            start = start.saturating_sub(1);
         }
         self.cursor = self.buffer.edit(start..end, "", self.cursor, now_ms());
         self.after_edit(cx);
@@ -1379,6 +1379,23 @@ impl NoteEditor {
         if self.line_drag.take().is_some() {
             cx.notify();
         }
+    }
+
+    /// The hovered line's slot geometry (content-relative y, height) when
+    /// its drag handle should show: a non-blank line with no drag in flight.
+    fn hover_handle_slot(&self) -> Option<(Pixels, Pixels)> {
+        if self.line_drag.is_some() {
+            return None;
+        }
+        let start = self.hovered_line?;
+        let layout = self.layout.borrow();
+        let layout = layout.as_ref()?;
+        let slot = layout.slots.iter().find(|s| s.raw_start == start)?;
+        let raw = &self.text()[slot.raw_start..slot.raw_start + slot.raw_len];
+        if raw.trim().is_empty() {
+            return None;
+        }
+        Some((slot.y, slot.height))
     }
 
     // --- layout ------------------------------------------------------------
@@ -2236,7 +2253,15 @@ impl Element for NoteEditorElement {
             if ed.follow_cursor.take() {
                 ed.follow_cursor_now();
             }
-        });
+            // The hovered line's handle cell gets a hitbox so paint can give
+            // it the open-hand cursor.
+            let handle_cell = ed.hover_handle_slot().map(|(y, height)| {
+                let gutter =
+                    ed.layout.borrow().as_ref().map(|l| l.gutter).unwrap_or_default();
+                Bounds::new(point(bounds.origin.x, bounds.origin.y + y), size(gutter, height))
+            });
+            handle_cell.map(|cell| window.insert_hitbox(cell, gpui::HitboxBehavior::Normal))
+        })
     }
 
     fn paint(
@@ -2245,12 +2270,12 @@ impl Element for NoteEditorElement {
         _inspector: Option<&gpui::InspectorElementId>,
         bounds: Bounds<Pixels>,
         _request: &mut Self::RequestLayoutState,
-        _prepaint: &mut Self::PrepaintState,
+        prepaint: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
         let t = cx.kairn().clone();
-        let (focus_handle, cursor, blink_visible, selection, text, drag_target, drag_lifted) = {
+        let (focus_handle, cursor, blink_visible, selection, text, drag_target, drag_lifted, handle_slot) = {
             let ed = self.editor.read(cx);
             let selection = ed.selection();
             // The document text is only consulted for mapping a selection's
@@ -2263,8 +2288,9 @@ impl Element for NoteEditorElement {
                 ed.blink_visible,
                 selection,
                 text,
-                ed.glyph_drag.as_ref().filter(|d| d.moved).and_then(|d| d.target),
-                ed.glyph_drag.as_ref().filter(|d| d.moved).map(|d| d.line_start),
+                ed.line_drag.as_ref().filter(|d| d.moved).and_then(|d| d.target),
+                ed.line_drag.as_ref().filter(|d| d.moved).map(|d| d.range.clone()),
+                ed.hover_handle_slot(),
             )
         };
         window.handle_input(
@@ -2299,6 +2325,18 @@ impl Element for NoteEditorElement {
                     return;
                 }
                 editor.update(cx, |ed, cx| ed.on_mouse_up(window, cx));
+            }
+        });
+        // Escape abandons an in-flight drag. Window-level like the mouse
+        // handlers: a handle grab never focuses the editor, so an action
+        // binding wouldn't reach it.
+        window.on_key_event({
+            let editor = self.editor.clone();
+            move |event: &gpui::KeyDownEvent, phase, _window, cx| {
+                if phase != DispatchPhase::Bubble || event.keystroke.key != "escape" {
+                    return;
+                }
+                editor.update(cx, |ed, cx| ed.cancel_drag(cx));
             }
         });
 
@@ -2399,12 +2437,15 @@ impl Element for NoteEditorElement {
                 }
             }
 
+            // Glyphs sit in the column between the handle gutter and the
+            // text.
+            let glyph_x = bounds.origin.x + layout.gutter;
             match &slot.entry.glyph {
                 Glyph::Rule => {
                     window.paint_quad(fill(
                         Bounds::new(
-                            point(bounds.origin.x, block_top + slot.entry.pad_top),
-                            size(bounds.size.width, px(1.)),
+                            point(glyph_x, block_top + slot.entry.pad_top),
+                            size(bounds.size.width - layout.gutter, px(1.)),
                         ),
                         t.border,
                     ));
@@ -2412,7 +2453,7 @@ impl Element for NoteEditorElement {
                 Glyph::Task(state) => {
                     let scale = t.editor_size / theme::EDITOR_BASE_SIZE;
                     paint_task_box(
-                        point(bounds.origin.x, text_origin.y + px(4. * scale)),
+                        point(glyph_x, text_origin.y + px(4. * scale)),
                         state,
                         &t,
                         window,
@@ -2435,7 +2476,7 @@ impl Element for NoteEditorElement {
                         None,
                     );
                     let _ = dash.paint(
-                        point(bounds.origin.x, text_origin.y),
+                        point(glyph_x, text_origin.y),
                         slot.entry.line_height,
                         window,
                         cx,
@@ -2444,7 +2485,7 @@ impl Element for NoteEditorElement {
                 Glyph::QuoteBar => {
                     window.paint_quad(fill(
                         Bounds::new(
-                            point(bounds.origin.x, block_top + slot.entry.pad_top),
+                            point(glyph_x, block_top + slot.entry.pad_top),
                             size(px(2.), slot.entry.text_height),
                         ),
                         t.border,
@@ -2501,18 +2542,61 @@ impl Element for NoteEditorElement {
             }
         }
 
-        // The dragged line lifts (dims) while a glyph drag is in flight, so
+        // The dragged block lifts (dims) while a line drag is in flight, so
         // it reads as picked up rather than duplicated by the ghost.
-        if let Some(lifted) = drag_lifted
-            && let Some(slot) = layout.slots.iter().find(|s| s.raw_start == lifted)
-        {
-            window.paint_quad(fill(
-                Bounds::new(
-                    point(bounds.origin.x, bounds.origin.y + slot.y),
-                    size(bounds.size.width, slot.height),
-                ),
-                t.bg.opacity(0.65),
-            ));
+        if let Some(lifted) = &drag_lifted {
+            let mut span: Option<(Pixels, Pixels)> = None;
+            for slot in &layout.slots {
+                if slot.raw_start >= lifted.start && slot.raw_start < lifted.end.max(lifted.start + 1) {
+                    let top = bounds.origin.y + slot.y;
+                    let bottom = top + slot.height;
+                    span = Some(match span {
+                        Some((t0, b0)) => (t0.min(top), b0.max(bottom)),
+                        None => (top, bottom),
+                    });
+                }
+            }
+            if let Some((top, bottom)) = span {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(bounds.origin.x, top),
+                        size(bounds.size.width, bottom - top),
+                    ),
+                    t.bg.opacity(0.65),
+                ));
+            }
+        }
+
+        // The hovered line's drag handle: a quiet grip in the gutter that
+        // invites the pick-up.
+        if let Some((y, _height)) = handle_slot {
+            let scale = t.editor_size / theme::EDITOR_BASE_SIZE;
+            let grip = window.text_system().shape_line(
+                SharedString::from("⠿"),
+                px(11. * scale),
+                &[TextRun {
+                    len: "⠿".len(),
+                    font: window.text_style().font(),
+                    color: t.faint,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }],
+                None,
+            );
+            let slot = layout.slots.iter().find(|s| s.y == y);
+            if let Some(slot) = slot {
+                let x = bounds.origin.x + (layout.gutter - grip.width).max(px(0.)) / 2.;
+                let _ = grip.paint(
+                    point(x, bounds.origin.y + slot.y + slot.entry.pad_top),
+                    slot.entry.line_height,
+                    window,
+                    cx,
+                );
+            }
+        }
+        if let Some(hitbox) = prepaint {
+            window.set_cursor_style(gpui::CursorStyle::OpenHand, hitbox);
         }
 
         // The drop indicator for an in-flight glyph drag: a line across the

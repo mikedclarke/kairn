@@ -249,14 +249,14 @@ impl Workspace {
         let selected = self.selected_day;
         let monday = selected - Days::new(selected.weekday().num_days_from_monday() as u64);
 
-        // Drag-to-reschedule: while an open task's glyph drag is in flight,
-        // the day under the pointer rings as the drop target (hit-tested
-        // against the cells' last-painted bounds, which a drag can't move).
+        // Drag-to-a-day: while a line drag is in flight, the day under the
+        // pointer rings as the drop target (hit-tested against the cells'
+        // last-painted bounds, which a drag can't move).
         let drag_pos = self
             .note_editor
             .as_ref()
-            .and_then(|e| e.read(cx).task_drag())
-            .map(|(_, position)| position);
+            .and_then(|e| e.read(cx).line_drag())
+            .map(|(_, _, position)| position);
         let drop_day = drag_pos.and_then(|position| {
             self.week_strip_bounds
                 .borrow()

@@ -168,36 +168,75 @@ impl Workspace {
                 }
                 NoteEditorEvent::OpenDate(date) => this.select_day(*date, cx),
                 NoteEditorEvent::OpenUrl(url) => cx.open_url(url),
-                NoteEditorEvent::TaskDropped { line_start, position } => {
-                    this.on_task_dropped(*line_start, *position, cx);
+                NoteEditorEvent::BlockDropped { range, position } => {
+                    this.on_block_dropped(range.clone(), *position, cx);
                 }
             },
         ));
         self.note_editor = Some(editor);
     }
 
-    /// The drop half of drag-to-reschedule: an open task's glyph drag was
-    /// released outside the editor. If the pointer sat on a week-strip day,
-    /// rewrite the task's `>date` through the editor buffer (undoable,
-    /// autosaved); anywhere else the drag just ends.
-    pub(crate) fn on_task_dropped(
+    /// The drop half of drag-to-a-day: a line drag was released outside the
+    /// editor. If the pointer sat on a day drop target the block moves into
+    /// that day's note; anywhere else the drag just ends.
+    pub(crate) fn on_block_dropped(
         &mut self,
-        line_start: usize,
+        range: std::ops::Range<usize>,
         position: gpui::Point<gpui::Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let day = self
-            .week_strip_bounds
+        if let Some(day) = self.resolve_day_drop(position) {
+            self.move_block_to_day(range, day, cx);
+        }
+        cx.notify();
+    }
+
+    /// The day whose drop target contains `position`, if any.
+    pub(crate) fn resolve_day_drop(
+        &self,
+        position: gpui::Point<gpui::Pixels>,
+    ) -> Option<NaiveDate> {
+        self.week_strip_bounds
             .borrow()
             .iter()
             .find(|(_, bounds)| bounds.contains(&position))
-            .map(|(day, _)| *day);
-        if let Some(day) = day
-            && let Some(editor) = &self.note_editor
-        {
-            editor.update(cx, |ed, cx| ed.reschedule_line_at(line_start, day, cx));
+            .map(|(day, _)| *day)
+    }
+
+    /// Move a block out of the open note into `day`'s note, landing at the
+    /// top. The target's own day is an in-buffer move (one undo step);
+    /// anything else inserts on disk first and removes from the buffer
+    /// second, so a crash duplicates rather than loses.
+    fn move_block_to_day(
+        &mut self,
+        range: std::ops::Range<usize>,
+        day: NaiveDate,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.note_editor.clone() else { return };
+        let target = notes::daily_file(&self.notes_root, day)
+            .unwrap_or_else(|| notes::daily_path(&self.notes_root, day));
+        if editor.read(cx).path == target {
+            editor.update(cx, |ed, cx| ed.move_block_to(range, 0, cx));
+            return;
         }
-        cx.notify();
+        let block = editor.read(cx).block_text(range.clone());
+        if block.trim().is_empty() {
+            return;
+        }
+        match notes::insert_block_at_top(
+            &self.notes_root,
+            day,
+            &block,
+            &self.settings.daily_template_rule,
+        ) {
+            Ok(path) => {
+                self.note_self_write(&path);
+                editor.update(cx, |ed, cx| ed.remove_block(range, cx));
+                self.reload_notes(cx);
+            }
+            Err(e) => eprintln!("kairn: could not move block to {day}: {e}"),
+        }
     }
 
     pub fn notes_expanded_contains(&self, path: &std::path::Path) -> bool {

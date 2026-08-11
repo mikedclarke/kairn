@@ -647,22 +647,24 @@ impl Workspace {
             }))
     }
 
-    /// The floating ghost that follows a task's drag-to-reschedule: a small
-    /// card with the task's text, offset from the pointer so it never sits
-    /// under it (which would block the week strip's hit-testing).
+    /// The floating ghost that follows a line drag: a small card with the
+    /// block's first line, offset from the pointer so it never sits under it
+    /// (which would block the drop targets' hit-testing).
     fn render_drag_ghost(
         &self,
         t: &theme::KairnTheme,
         cx: &Context<Self>,
     ) -> Option<impl IntoElement> {
-        let (line, position) = self.note_editor.as_ref()?.read(cx).task_drag()?;
+        let (line, extra, position) = self.note_editor.as_ref()?.read(cx).line_drag()?;
         let text = line.trim_start();
-        let text = ["* ", "+ ", "- "]
+        let is_task = ["* ", "+ "].iter().any(|m| text.starts_with(m));
+        let text = ["* ", "+ ", "- ", "> "]
             .iter()
             .find_map(|m| text.strip_prefix(m))
             .unwrap_or(text)
             .trim_start();
         let text = text.strip_prefix("[ ]").map(str::trim_start).unwrap_or(text);
+        let text = text.trim_start_matches('#').trim_start();
         let text: String = text.chars().take(48).collect();
         Some(
             div()
@@ -681,16 +683,30 @@ impl Workspace {
                 .shadow_md()
                 .text_size(t.ui_px(12.))
                 .text_color(t.dim)
-                .child(
-                    div()
-                        .w(px(10.))
-                        .h(px(10.))
-                        .flex_none()
-                        .rounded(px(3.))
-                        .border_1()
-                        .border_color(t.faint),
-                )
-                .child(text),
+                .when(is_task, |d| {
+                    d.child(
+                        div()
+                            .w(px(10.))
+                            .h(px(10.))
+                            .flex_none()
+                            .rounded(px(3.))
+                            .border_1()
+                            .border_color(t.faint),
+                    )
+                })
+                .child(text)
+                .when(extra > 0, |d| {
+                    d.child(
+                        div()
+                            .flex_none()
+                            .px(px(5.))
+                            .rounded(px(4.))
+                            .bg(t.sel)
+                            .text_size(t.ui_px(10.))
+                            .text_color(t.faint)
+                            .child(format!("+{extra}")),
+                    )
+                }),
         )
     }
 }
