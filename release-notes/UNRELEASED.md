@@ -26,6 +26,10 @@ same fact twice; no em dashes. Rewrite to this standard before releasing.
 - kairn recent lists notes by file modification time, so backfilled edits surface.
 - kairn tasks can list completed tasks with --done and filter by due date with --since.
 - kairn add can place a task inside a named section, and note arguments accept today, tomorrow, and yesterday.
+- Every line in the editor shows a drag handle on hover; dragging reorders within the note, and indented sub-lines travel with their parent line.
+- Dragging a line onto a week strip day, a calendar day, or a sidebar Daily row moves it to the top of that day's note.
+- Holding a drag over a day for a second opens that day's headings, and releasing on one files the line at the end of that section.
+- Escape cancels an in-flight line drag.
 
 ## Improved
 

@@ -55,8 +55,8 @@ No cloud, no accounts, no database. Just a folder of markdown.
 - Real due dates: a `>2026-08-12` token means due that day, daily-note tasks default to
   their day, and dated tasks from any note join the views
 - Today / Open / Overdue views with live counts and click-through to the source note
-- Click a checkbox anywhere to complete it (writes `[x]` plus an `@done(...)` timestamp
-  back to disk)
+- Click a checkbox anywhere to complete it (writes `[x]` back to disk in the line's own
+  style)
 - Drag a task onto a week-strip day to reschedule it
 - Calendar and week-strip indicators for open, done, and overdue days
 
@@ -71,9 +71,9 @@ No cloud, no accounts, no database. Just a folder of markdown.
 
 ### Agents
 
-- The `kairn` CLI is the agent surface: read notes, list tasks, add, complete, capture,
-  search, backlinks, all with `--json` output and stable exit codes designed for
-  models reading `--help`
+- The `kairn` CLI is the agent surface: read, search, and append to notes, edit single
+  lines safely, work tasks (list, add, complete, carry forward), all with `--json`
+  output and stable exit codes designed for models reading `--help`
 - Every CLI write is logged to `.kairn/activity.jsonl` in the vault (so it syncs), and
   the app shows the feed live in an Agents sidebar section, with named actors via
   `--actor` / `$KAIRN_ACTOR`

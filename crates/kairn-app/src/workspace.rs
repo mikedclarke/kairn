@@ -72,10 +72,12 @@ pub(crate) struct HoldMenu {
     /// Rows' painted bounds, keyed by heading line index (`TOP_OF_NOTE` for
     /// the synthetic first row): the release hit-tests these. The mouse
     /// button is down throughout, so rows carry no click handlers.
-    pub item_bounds:
-        std::rc::Rc<std::cell::RefCell<Vec<(usize, gpui::Bounds<gpui::Pixels>)>>>,
+    pub item_bounds: HoldItemBounds,
     pub menu_bounds: std::rc::Rc<std::cell::RefCell<Option<gpui::Bounds<gpui::Pixels>>>>,
 }
+
+pub(crate) type HoldItemBounds =
+    std::rc::Rc<std::cell::RefCell<Vec<(usize, gpui::Bounds<gpui::Pixels>)>>>;
 
 pub(crate) struct HoldItem {
     pub line_idx: usize,
