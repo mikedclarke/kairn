@@ -467,13 +467,19 @@ impl Workspace {
                     .id(("cal-cell", (week * 7 + wd) as usize))
                     .flex_1()
                     .pt(px(2.))
-                    .pb(px(1.))
+                    .pb(px(3.))
                     .rounded(px(5.))
                     .flex()
                     .flex_col()
                     .items_center()
                     .cursor_pointer()
-                    .child(div().child(day.format("%-d").to_string()));
+                    // A tight line height keeps the indicator slot snug under
+                    // the digits instead of drifting to the cell's bottom edge.
+                    .child(
+                        div()
+                            .line_height(t.ui_px(13.))
+                            .child(day.format("%-d").to_string()),
+                    );
                 let cell = if is_today {
                     cell.bg(t.amber)
                         .text_color(t.on_amber)

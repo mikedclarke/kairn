@@ -33,6 +33,7 @@ same fact twice; no em dashes. Rewrite to this standard before releasing.
 - Completed tasks keep their strikethrough while being edited.
 - Task checkboxes and bullet glyphs scale with the editor text size setting.
 - Clicking the glyph of a bullet or a scheduled or cancelled task places the cursor instead of doing nothing.
+- Calendar day indicators sit closer under their date numbers and the rows are tighter.
 
 ## Fixed
 
