@@ -142,10 +142,10 @@ and refuses rather than guesses, appends are atomic, and `carry` previews with
 Download the latest build for your platform from the
 [releases page](https://github.com/mikedclarke/kairn/releases):
 
-- **macOS** — open `Kairn-<version>.dmg` and drag Kairn to Applications. The build is
+- **macOS**: open `Kairn-<version>.dmg` and drag Kairn to Applications. The build is
   signed and notarized, so it opens without a Gatekeeper prompt. Universal binary (Apple
   Silicon and Intel), macOS 15 or later.
-- **Linux** — the `.AppImage` runs on any distribution (`chmod +x` it, then run); the
+- **Linux**: the `.AppImage` runs on any distribution (`chmod +x` it, then run); the
   `.deb` installs on Debian and Ubuntu (`sudo dpkg -i kairn_<version>_amd64.deb`). Both add
   Kairn to your application launcher.
 
