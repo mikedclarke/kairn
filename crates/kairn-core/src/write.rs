@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{Local, NaiveDate};
 
+use crate::blocks::section_end_line as section_end_insert_idx;
 use crate::tasks::toggle_task_line;
 use crate::vault::{daily_file, daily_path};
 
@@ -512,30 +513,6 @@ fn section_insert_idx(lines: &[&str], section: &str) -> Option<usize> {
     Some(section_end_insert_idx(lines, start, level))
 }
 
-/// Where an addition lands to sit at the end of the section whose heading is
-/// at `start` with `level`: after the section's last content line, before
-/// any trailing blank lines or `---` rules (those belong to the boundary,
-/// not the content).
-fn section_end_insert_idx(lines: &[&str], start: usize, level: u8) -> usize {
-    let level_of = |line: &str| match crate::parse::parse_line(line) {
-        crate::parse::Line::Heading { level, .. } => Some(level),
-        _ => None,
-    };
-    let end = lines
-        .iter()
-        .enumerate()
-        .skip(start + 1)
-        .find_map(|(i, l)| level_of(l).filter(|lv| *lv <= level).map(|_| i))
-        .unwrap_or(lines.len());
-    let is_content = |i: usize| {
-        !matches!(
-            crate::parse::parse_line(lines[i]),
-            crate::parse::Line::Blank | crate::parse::Line::Rule
-        )
-    };
-    let last_content = (start..end).rev().find(|&i| is_content(i));
-    last_content.map_or(end, |i| i + 1)
-}
 
 /// Append `text` (which may span lines) to a note so it lands at the end of
 /// the section headed by `section`: after the section's last non-blank line,

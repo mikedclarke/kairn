@@ -27,6 +27,26 @@ pub(crate) type SelfWrites = Arc<parking_lot::Mutex<HashMap<PathBuf, (Instant, u
 pub(crate) type DayBounds =
     std::rc::Rc<std::cell::RefCell<Vec<(NaiveDate, gpui::Bounds<gpui::Pixels>)>>>;
 
+/// The line index holding `expected`: `line_idx` when it still matches,
+/// else the unique content match; `None` when it is gone or ambiguous (the
+/// same relocation contract as kairn-core's disk edits).
+fn relocate_line(text: &str, line_idx: usize, expected: &str) -> Option<usize> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.get(line_idx).is_some_and(|l| *l == expected) {
+        return Some(line_idx);
+    }
+    let mut matches =
+        lines.iter().enumerate().filter(|(_, l)| **l == expected).map(|(i, _)| i);
+    let only = matches.next()?;
+    matches.next().is_none().then_some(only)
+}
+
+/// Byte offset where line `line_idx` starts (the text length when past the
+/// end, which `move_block` treats as "the end of the note").
+fn line_start_offset(text: &str, line_idx: usize) -> usize {
+    text.split('\n').take(line_idx).map(|l| l.len() + 1).sum::<usize>().min(text.len())
+}
+
 fn file_hash(path: &Path) -> Option<u64> {
     let bytes = std::fs::read(path).ok()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -177,23 +197,179 @@ impl Workspace {
                 NoteEditorEvent::BlockDropped { range, position } => {
                     this.on_block_dropped(range.clone(), *position, cx);
                 }
+                NoteEditorEvent::DragMoved { position } => {
+                    this.on_drag_moved(*position, cx);
+                }
             },
         ));
         self.note_editor = Some(editor);
     }
 
     /// The drop half of drag-to-a-day: a line drag was released outside the
-    /// editor. If the pointer sat on a day drop target the block moves into
-    /// that day's note; anywhere else the drag just ends.
+    /// editor. An open hold menu's rows are checked first (a release on a
+    /// heading drops at that section's end; on the menu's body, the day's
+    /// top); otherwise a day drop target under the pointer takes the block
+    /// at its top, and anywhere else the drag just ends.
     pub(crate) fn on_block_dropped(
         &mut self,
         range: std::ops::Range<usize>,
         position: gpui::Point<gpui::Pixels>,
         cx: &mut Context<Self>,
     ) {
-        if let Some(day) = self.resolve_day_drop(position) {
-            self.move_block_to_day(range, day, cx);
+        use crate::workspace::{HoldState, TOP_OF_NOTE};
+
+        let menu_choice = if let HoldState::Open(menu) = &self.hold {
+            let item = menu
+                .item_bounds
+                .borrow()
+                .iter()
+                .find(|(_, bounds)| bounds.contains(&position))
+                .map(|(idx, _)| *idx);
+            match item {
+                Some(TOP_OF_NOTE) => Some((menu.day, None)),
+                Some(idx) => Some((
+                    menu.day,
+                    menu.items
+                        .iter()
+                        .find(|it| it.line_idx == idx)
+                        .map(|it| (it.line_idx, it.raw.clone())),
+                )),
+                None if menu
+                    .menu_bounds
+                    .borrow()
+                    .is_some_and(|b| b.contains(&position)) =>
+                {
+                    Some((menu.day, None))
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        self.hold = HoldState::Idle;
+
+        if let Some((day, heading)) = menu_choice {
+            self.move_block_to_day(range, day, heading, cx);
+        } else if let Some(day) = self.resolve_day_drop(position) {
+            self.move_block_to_day(range, day, None, cx);
         }
+        cx.notify();
+    }
+
+    /// Tick the hold-for-heading state machine on every drag move: dwell on
+    /// a day arms a timer, drifting re-arms it, leaving folds the menu.
+    pub(crate) fn on_drag_moved(
+        &mut self,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::workspace::HoldState;
+
+        let over = self.resolve_day_drop(position);
+        match &self.hold {
+            HoldState::Idle => {
+                if let Some(day) = over {
+                    self.arm_hold(day, position, cx);
+                }
+            }
+            HoldState::Arming { day, anchor, .. } => {
+                let drifted = (position.x - anchor.x).abs() > gpui::px(4.)
+                    || (position.y - anchor.y).abs() > gpui::px(4.);
+                if over != Some(*day) {
+                    self.hold = HoldState::Idle;
+                    if let Some(day) = over {
+                        self.arm_hold(day, position, cx);
+                    }
+                } else if drifted {
+                    // Still on the day but moving: the dwell restarts from
+                    // here (dropping the old timer cancels it).
+                    let day = *day;
+                    self.arm_hold(day, position, cx);
+                }
+            }
+            HoldState::Open(menu) => {
+                let near_menu = menu.menu_bounds.borrow().is_some_and(|b| {
+                    gpui::Bounds::new(
+                        b.origin - gpui::point(gpui::px(8.), gpui::px(8.)),
+                        b.size + gpui::size(gpui::px(16.), gpui::px(16.)),
+                    )
+                    .contains(&position)
+                });
+                if !near_menu && over != Some(menu.day) {
+                    self.hold = HoldState::Idle;
+                    if let Some(day) = over {
+                        self.arm_hold(day, position, cx);
+                    }
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    fn arm_hold(
+        &mut self,
+        day: NaiveDate,
+        anchor: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::workspace::HoldState;
+        let timer = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1000))
+                .await;
+            let _ = this.update(cx, |ws, cx| ws.open_hold_menu(cx));
+        });
+        self.hold = HoldState::Arming { day, anchor, _timer: timer };
+    }
+
+    /// The dwell timer fired: list the target day's headings and open the
+    /// menu at the pointer. No file or no headings means no menu.
+    fn open_hold_menu(&mut self, cx: &mut Context<Self>) {
+        use crate::workspace::{HoldItem, HoldMenu, HoldState};
+
+        let HoldState::Arming { day, .. } = self.hold else { return };
+        let Some(editor) = &self.note_editor else {
+            self.hold = HoldState::Idle;
+            return;
+        };
+        let Some((_, _, position)) = editor.read(cx).line_drag() else {
+            self.hold = HoldState::Idle;
+            return;
+        };
+        // Headings come from the live buffer when the target day is the
+        // open note (disk may lag the autosave), else from the file.
+        let target = notes::daily_file(&self.notes_root, day)
+            .unwrap_or_else(|| notes::daily_path(&self.notes_root, day));
+        let text = if editor.read(cx).path == target {
+            Some(editor.read(cx).doc().to_string())
+        } else {
+            std::fs::read_to_string(&target).ok()
+        };
+        let Some(text) = text else {
+            self.hold = HoldState::Idle;
+            return;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        let items: Vec<HoldItem> = notes::note_headings(&text)
+            .into_iter()
+            .map(|h| HoldItem {
+                line_idx: h.line_idx,
+                raw: lines.get(h.line_idx).copied().unwrap_or_default().to_string(),
+                display: h.text,
+                level: h.level,
+            })
+            .collect();
+        if items.is_empty() {
+            self.hold = HoldState::Idle;
+            return;
+        }
+        self.hold = HoldState::Open(HoldMenu {
+            day,
+            items,
+            origin: position + gpui::point(gpui::px(12.), gpui::px(-6.)),
+            item_bounds: Default::default(),
+            menu_bounds: Default::default(),
+        });
         cx.notify();
     }
 
@@ -223,33 +399,65 @@ impl Workspace {
         hit(&self.calendar_drop_bounds).or_else(|| hit(&self.daily_drop_bounds))
     }
 
-    /// Move a block out of the open note into `day`'s note, landing at the
-    /// top. The target's own day is an in-buffer move (one undo step);
+    /// Move a block out of the open note into `day`'s note: to the top, or
+    /// to the end of the section named by `heading` (a hold-menu choice,
+    /// `(line_idx, raw line)`), falling back to the top when the heading has
+    /// vanished. The target's own day is an in-buffer move (one undo step);
     /// anything else inserts on disk first and removes from the buffer
     /// second, so a crash duplicates rather than loses.
     fn move_block_to_day(
         &mut self,
         range: std::ops::Range<usize>,
         day: NaiveDate,
+        heading: Option<(usize, String)>,
         cx: &mut Context<Self>,
     ) {
         let Some(editor) = self.note_editor.clone() else { return };
         let target = notes::daily_file(&self.notes_root, day)
             .unwrap_or_else(|| notes::daily_path(&self.notes_root, day));
+
         if editor.read(cx).path == target {
-            editor.update(cx, |ed, cx| ed.move_block_to(range, 0, cx));
+            let offset = heading
+                .and_then(|(idx, raw)| {
+                    let text = editor.read(cx).doc();
+                    let idx = relocate_line(text, idx, &raw)?;
+                    let line = notes::section_insert_line(text, idx)?;
+                    Some(line_start_offset(text, line))
+                })
+                .unwrap_or(0);
+            editor.update(cx, |ed, cx| ed.move_block_to(range, offset, cx));
             return;
         }
+
         let block = editor.read(cx).block_text(range.clone());
         if block.trim().is_empty() {
             return;
         }
-        match notes::insert_block_at_top(
-            &self.notes_root,
-            day,
-            &block,
-            &self.settings.daily_template_rule,
-        ) {
+        let written = match heading {
+            Some((idx, raw)) => {
+                match notes::insert_block_under_heading(&target, idx, &raw, &block) {
+                    Ok(Some(_)) => Ok(Some(target.clone())),
+                    // The heading (or the whole file) vanished or went
+                    // ambiguous underneath the menu: land at the top rather
+                    // than guessing.
+                    Ok(None) => Ok(None),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(e) => Err(e),
+                }
+            }
+            None => Ok(None),
+        };
+        let written = match written {
+            Ok(Some(path)) => Ok(path),
+            Ok(None) => notes::insert_block_at_top(
+                &self.notes_root,
+                day,
+                &block,
+                &self.settings.daily_template_rule,
+            ),
+            Err(e) => Err(e),
+        };
+        match written {
             Ok(path) => {
                 self.note_self_write(&path);
                 editor.update(cx, |ed, cx| ed.remove_block(range, cx));

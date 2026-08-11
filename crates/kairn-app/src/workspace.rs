@@ -49,6 +49,48 @@ pub enum PaneView {
     Tasks(TaskQuery),
 }
 
+/// The hold-for-heading gesture over a day drop target: dwelling an
+/// in-flight line drag on a day for a moment opens a menu of that day's
+/// headings; sliding onto one and releasing drops at that section's end.
+pub(crate) enum HoldState {
+    Idle,
+    /// The pointer is dwelling on a day; the timer opens the menu unless
+    /// the pointer moves away first (dropping the task cancels it).
+    Arming {
+        day: NaiveDate,
+        anchor: gpui::Point<gpui::Pixels>,
+        _timer: Task<()>,
+    },
+    Open(HoldMenu),
+}
+
+pub(crate) struct HoldMenu {
+    pub day: NaiveDate,
+    pub items: Vec<HoldItem>,
+    /// Anchor for the popup, near the pointer at open time.
+    pub origin: gpui::Point<gpui::Pixels>,
+    /// Rows' painted bounds, keyed by heading line index (`TOP_OF_NOTE` for
+    /// the synthetic first row): the release hit-tests these. The mouse
+    /// button is down throughout, so rows carry no click handlers.
+    pub item_bounds:
+        std::rc::Rc<std::cell::RefCell<Vec<(usize, gpui::Bounds<gpui::Pixels>)>>>,
+    pub menu_bounds: std::rc::Rc<std::cell::RefCell<Option<gpui::Bounds<gpui::Pixels>>>>,
+}
+
+pub(crate) struct HoldItem {
+    pub line_idx: usize,
+    /// The raw heading line, for verify-by-content at drop time.
+    pub raw: String,
+    pub display: String,
+    pub level: u8,
+}
+
+/// Sentinel item key for the menu's "Top of note" row.
+pub(crate) const TOP_OF_NOTE: usize = usize::MAX;
+/// Most headings the hold menu lists: it can't scroll mid-drag, so the tail
+/// of a very long note is summarised instead.
+pub(crate) const HOLD_MENU_CAP: usize = 16;
+
 pub struct Workspace {
     pub settings: Settings,
     focus_handle: FocusHandle,
@@ -134,6 +176,9 @@ pub struct Workspace {
     /// sidebar drop must also fall inside this to count.
     pub(crate) sidebar_bounds:
         std::rc::Rc<std::cell::RefCell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    /// Hold-for-heading state: dwelling a drag on a day target for a moment
+    /// opens a menu of that day's headings to drop under.
+    pub(crate) hold: HoldState,
     _activity_timer: Task<()>,
     /// Watches the notes root so outside edits (agents, Syncthing, NotePlan
     /// elsewhere) appear without a restart. Dropped with the workspace.
@@ -262,6 +307,7 @@ impl Workspace {
             calendar_drop_bounds: Default::default(),
             daily_drop_bounds: Default::default(),
             sidebar_bounds: Default::default(),
+            hold: HoldState::Idle,
             _activity_timer: activity_timer,
             _notes_watcher: notes_watcher,
             _notes_watch_task: notes_watch_task,
@@ -573,6 +619,19 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.kairn().clone();
 
+        // The hold menu lives only as long as its drag: mouse-up and Escape
+        // end the drag in the editor, and this render-side sweep folds the
+        // menu (and any armed timer) the frame after.
+        if !matches!(self.hold, HoldState::Idle) {
+            let drag_live = self
+                .note_editor
+                .as_ref()
+                .is_some_and(|e| e.read(cx).line_drag().is_some());
+            if !drag_live {
+                self.hold = HoldState::Idle;
+            }
+        }
+
         let mut body = div().flex().flex_1().min_h(px(0.));
         // Writing is the focused layout: the note at a comfortable measure,
         // no sidebar.
@@ -629,6 +688,7 @@ impl Render for Workspace {
             .children(self.render_switcher(&t, cx))
             .children(self.render_capture(&t, cx))
             .children(self.render_drag_ghost(&t, cx))
+            .children(self.render_hold_menu(&t, window, cx))
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_notification_layer(window, cx))
     }
@@ -662,6 +722,105 @@ impl Workspace {
             .on_click(cx.listener(|this, _, window, cx| {
                 this.open_settings(window, cx);
             }))
+    }
+
+    /// The hold-for-heading menu: a floating card of the target day's
+    /// headings while a drag dwells on its day cell. Rows carry no click
+    /// handlers (the mouse button is down for the whole gesture) — their
+    /// painted bounds are captured and the release hit-tests them.
+    fn render_hold_menu(
+        &self,
+        t: &theme::KairnTheme,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let HoldState::Open(menu) = &self.hold else { return None };
+        let (_, _, position) = self.note_editor.as_ref()?.read(cx).line_drag()?;
+        let hovered = menu
+            .item_bounds
+            .borrow()
+            .iter()
+            .find(|(_, b)| b.contains(&position))
+            .map(|(idx, _)| *idx);
+        menu.item_bounds.borrow_mut().clear();
+
+        const MENU_W: f32 = 230.;
+        let row_h = 26.;
+        let shown = menu.items.len().min(HOLD_MENU_CAP);
+        let truncated = menu.items.len() - shown;
+        let approx_h = px(12. + row_h * (shown + 1 + usize::from(truncated > 0)) as f32);
+        let viewport = window.viewport_size();
+        let x = menu.origin.x.min(viewport.width - px(MENU_W + 8.)).max(px(8.));
+        let y = menu.origin.y.min(viewport.height - approx_h - px(8.)).max(px(8.));
+
+        let menu_store = menu.menu_bounds.clone();
+        let mut card = div()
+            .absolute()
+            .left(x)
+            .top(y)
+            .w(px(MENU_W))
+            .py(px(6.))
+            .rounded(px(10.))
+            .bg(t.panel)
+            .border_1()
+            .border_color(t.border)
+            .shadow_lg()
+            .text_size(t.ui_px(12.))
+            .text_color(t.dim)
+            .child(
+                gpui::canvas(
+                    move |bounds, _, _| {
+                        menu_store.borrow_mut().replace(bounds);
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            );
+
+        let row = |key: usize, indent: f32, label: String, faint: bool| {
+            let bounds_store = menu.item_bounds.clone();
+            let is_hover = hovered == Some(key);
+            div()
+                .relative()
+                .h(px(row_h))
+                .flex()
+                .items_center()
+                .mx(px(5.))
+                .pl(px(9. + indent))
+                .pr(px(9.))
+                .rounded(px(6.))
+                .when(is_hover, |d| d.bg(t.sel).text_color(t.accent))
+                .when(faint, |d| d.text_color(t.faint))
+                .child(
+                    gpui::canvas(
+                        move |bounds, _, _| bounds_store.borrow_mut().push((key, bounds)),
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+                .child(label)
+        };
+
+        card = card.child(row(TOP_OF_NOTE, 0., "↑  Top of note".into(), false));
+        let min_level = menu.items.iter().map(|i| i.level).min().unwrap_or(1);
+        for item in menu.items.iter().take(HOLD_MENU_CAP) {
+            let indent = f32::from(item.level.saturating_sub(min_level)) * 10.;
+            card = card.child(row(item.line_idx, indent, item.display.clone(), false));
+        }
+        if truncated > 0 {
+            card = card.child(
+                div()
+                    .h(px(row_h))
+                    .flex()
+                    .items_center()
+                    .pl(px(14.))
+                    .text_color(t.faint)
+                    .child(format!("… {truncated} more")),
+            );
+        }
+        Some(card)
     }
 
     /// The floating ghost that follows a line drag: a small card with the

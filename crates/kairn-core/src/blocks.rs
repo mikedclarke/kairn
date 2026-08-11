@@ -60,6 +60,37 @@ pub struct HeadingRef {
     pub line_idx: usize,
 }
 
+/// Where an addition lands to sit at the end of the section whose heading
+/// is at line `start` with `level`: after the section's last content line,
+/// before any trailing blank lines or `---` rules (those belong to the
+/// boundary, not the content). The section runs to the next heading of the
+/// same or higher level.
+pub fn section_end_line(lines: &[&str], start: usize, level: u8) -> usize {
+    let level_of = |line: &str| match parse_line(line) {
+        Line::Heading { level, .. } => Some(level),
+        _ => None,
+    };
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find_map(|(i, l)| level_of(l).filter(|lv| *lv <= level).map(|_| i))
+        .unwrap_or(lines.len());
+    let is_content = |i: usize| !matches!(parse_line(lines[i]), Line::Blank | Line::Rule);
+    let last_content = (start..end).rev().find(|&i| is_content(i));
+    last_content.map_or(end, |i| i + 1)
+}
+
+/// [`section_end_line`] addressed by heading line index over raw text:
+/// `None` when the line isn't a heading.
+pub fn section_insert_line(text: &str, heading_line_idx: usize) -> Option<usize> {
+    let lines: Vec<&str> = text.lines().collect();
+    let Line::Heading { level, .. } = parse_line(lines.get(heading_line_idx)?) else {
+        return None;
+    };
+    Some(section_end_line(&lines, heading_line_idx, level))
+}
+
 /// Every heading in `text`, in order.
 pub fn note_headings(text: &str) -> Vec<HeadingRef> {
     text.lines()
@@ -155,6 +186,20 @@ mod tests {
         let text = "\t* one\n\t\tsub\n\t* two\n";
         let range = block_range(text, 1);
         assert_eq!(&text[range], "\t* one\n\t\tsub");
+    }
+
+    #[test]
+    fn section_insert_line_lands_at_section_end() {
+        let text = "## A\n* one\n#### Deep\n* deep\n\n---\n## B\nprose\n";
+        // Sub-headings don't end the section; trailing blanks and rules do.
+        assert_eq!(section_insert_line(text, 0), Some(4));
+        // Last section runs to the end.
+        assert_eq!(section_insert_line(text, 6), Some(8));
+        // Empty section: right under the heading, above the blank boundary.
+        assert_eq!(section_insert_line("## A\n\n## B\n", 0), Some(1));
+        // Not a heading (or out of range): None.
+        assert_eq!(section_insert_line(text, 1), None);
+        assert_eq!(section_insert_line(text, 99), None);
     }
 
     #[test]

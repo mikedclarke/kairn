@@ -63,6 +63,9 @@ pub enum NoteEditorEvent {
     /// A line drag was released outside the editor; the workspace moves the
     /// block if the pointer sat on a day drop target.
     BlockDropped { range: Range<usize>, position: Point<Pixels> },
+    /// A moved line drag's pointer position, every move: the workspace's
+    /// hold-menu state machine ticks on these.
+    DragMoved { position: Point<Pixels> },
 }
 
 pub struct NoteEditor {
@@ -1146,6 +1149,7 @@ impl NoteEditor {
                     .as_ref()
                     .is_some_and(|l| l.bounds.contains(&event.position));
                 drag.target = inside.then(|| self.drop_target_for_y(event.position.y));
+                cx.emit(NoteEditorEvent::DragMoved { position: event.position });
                 cx.notify();
             }
             self.line_drag = Some(drag);
@@ -1346,6 +1350,12 @@ impl NoteEditor {
     pub fn block_text(&self, range: Range<usize>) -> String {
         let len = self.text().len();
         self.text()[range.start.min(len)..range.end.min(len)].to_string()
+    }
+
+    /// The buffer's current text: the live document, ahead of whatever the
+    /// autosave has flushed to disk.
+    pub fn doc(&self) -> &str {
+        self.text()
     }
 
     /// Remove a dropped block from this note (the source half of a move to
