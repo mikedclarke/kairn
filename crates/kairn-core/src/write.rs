@@ -509,6 +509,18 @@ fn section_insert_idx(lines: &[&str], section: &str) -> Option<usize> {
         .iter()
         .enumerate()
         .find_map(|(i, l)| level_of(l).filter(|_| section_key(l) == key).map(|lv| (i, lv)))?;
+    Some(section_end_insert_idx(lines, start, level))
+}
+
+/// Where an addition lands to sit at the end of the section whose heading is
+/// at `start` with `level`: after the section's last content line, before
+/// any trailing blank lines or `---` rules (those belong to the boundary,
+/// not the content).
+fn section_end_insert_idx(lines: &[&str], start: usize, level: u8) -> usize {
+    let level_of = |line: &str| match crate::parse::parse_line(line) {
+        crate::parse::Line::Heading { level, .. } => Some(level),
+        _ => None,
+    };
     let end = lines
         .iter()
         .enumerate()
@@ -522,7 +534,7 @@ fn section_insert_idx(lines: &[&str], section: &str) -> Option<usize> {
         )
     };
     let last_content = (start..end).rev().find(|&i| is_content(i));
-    Some(last_content.map_or(end, |i| i + 1))
+    last_content.map_or(end, |i| i + 1)
 }
 
 /// Append `text` (which may span lines) to a note so it lands at the end of
@@ -577,6 +589,98 @@ pub fn append_to_section(path: &Path, section: &str, text: &str) -> io::Result<u
     }
     atomic_write(path, &out)?;
     Ok(idx)
+}
+
+/// Insert `block` (which may span lines) at the very top of `date`'s daily
+/// note, above everything already there. The file is created if the day has
+/// none; a new today-or-future file is seeded from the daily template first
+/// when `template_rule` applies, and the block still lands above the seeded
+/// layout. Line-ending and trailing-newline conventions are preserved.
+/// Returns the file written.
+pub fn insert_block_at_top(
+    root: &Path,
+    date: NaiveDate,
+    block: &str,
+    template_rule: &str,
+) -> io::Result<PathBuf> {
+    let path = ensure_day_note(root, date, template_rule)?;
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let crlf = text.contains("\r\n");
+    let ending = if crlf { "\r\n" } else { "\n" };
+    let block = if crlf { block.replace('\n', "\r\n") } else { block.to_string() };
+    let mut out = String::with_capacity(block.len() + text.len() + 2);
+    out.push_str(&block);
+    out.push_str(ending);
+    out.push_str(&text);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    atomic_write(&path, &out)?;
+    Ok(path)
+}
+
+/// Insert `block` (which may span lines) at the end of the section owned by
+/// the heading at `heading_line_idx`, verified against `expected` and found
+/// again by content when the file changed underneath us — but only when the
+/// match is unambiguous, like every other line edit here. The block lands
+/// after the section's last content line, before trailing blank lines or
+/// rules. Returns the line index the block starts at; `Ok(None)` when the
+/// heading is gone or ambiguous and nothing was written.
+pub fn insert_block_under_heading(
+    path: &Path,
+    heading_line_idx: usize,
+    expected: &str,
+    block: &str,
+) -> io::Result<Option<usize>> {
+    let text = fs::read_to_string(path)?;
+    let lines: Vec<&str> = text.lines().collect();
+    let idx = if lines.get(heading_line_idx).is_some_and(|l| *l == expected) {
+        heading_line_idx
+    } else {
+        let mut matches = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| **l == expected)
+            .map(|(i, _)| i);
+        let Some(only) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Ok(None);
+        }
+        only
+    };
+    let crate::parse::Line::Heading { level, .. } = crate::parse::parse_line(lines[idx]) else {
+        return Ok(None);
+    };
+    let insert = section_end_insert_idx(&lines, idx, level);
+    let crlf = text.contains("\r\n");
+    let ending = if crlf { "\r\n" } else { "\n" };
+    let block = if crlf { block.replace('\n', "\r\n") } else { block.to_string() };
+    let mut out = String::with_capacity(text.len() + block.len() + 2);
+    for (i, line) in lines.iter().enumerate() {
+        if i == insert {
+            out.push_str(&block);
+            out.push_str(ending);
+        }
+        out.push_str(line);
+        out.push_str(ending);
+    }
+    if insert == lines.len() {
+        out.push_str(&block);
+        out.push_str(ending);
+    }
+    if !text.ends_with('\n') && !text.is_empty() {
+        while out.ends_with('\n') || out.ends_with('\r') {
+            out.pop();
+        }
+    }
+    atomic_write(path, &out)?;
+    Ok(Some(insert))
 }
 
 /// Replace two adjacent lines with one `replacement` line. The pair is
@@ -729,6 +833,10 @@ pub fn toggle_task_on_disk(path: &Path, line_idx: usize, expected: &str) -> io::
 mod tests {
     use super::*;
     use crate::ScratchRoot;
+
+    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).expect("valid date")
+    }
 
     #[test]
     fn toggle_in_text_tracks_moved_lines() {
@@ -1120,6 +1228,108 @@ mod tests {
         let mon_path =
             capture(&root.0, monday, "stand-up", "weekdays").expect("io").expect("written");
         assert_eq!(fs::read_to_string(&mon_path).expect("read"), "### Tasks\n* stand-up\n");
+    }
+
+    #[test]
+    fn block_at_top_lands_above_everything() {
+        let root = ScratchRoot::new("block-top");
+        let path = root.write("Calendar/20260805.md", "# Day\n* existing\n");
+        insert_block_at_top(&root.0, date(2026, 8, 5), "* moved\n\tsub", "off").expect("io");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "* moved\n\tsub\n# Day\n* existing\n"
+        );
+        // No trailing newline stays that way.
+        let bare = root.write("Calendar/20260806.md", "* one");
+        insert_block_at_top(&root.0, date(2026, 8, 6), "* zero", "off").expect("io");
+        assert_eq!(fs::read_to_string(&bare).expect("read"), "* zero\n* one");
+        // CRLF files keep their endings, block converted to match.
+        let crlf = root.write("Calendar/20260807.md", "# Day\r\n* a\r\n");
+        insert_block_at_top(&root.0, date(2026, 8, 7), "* new\n\tsub", "off").expect("io");
+        assert_eq!(
+            fs::read_to_string(&crlf).expect("read"),
+            "* new\r\n\tsub\r\n# Day\r\n* a\r\n"
+        );
+    }
+
+    #[test]
+    fn block_at_top_seeds_new_days_below_the_block() {
+        let root = ScratchRoot::new("block-top-seed");
+        root.write("Notes/@Templates/Daily.md", "### Tasks\n\n### Notes\n");
+        let future = Local::now().date_naive() + chrono::Days::new(1);
+        let path =
+            insert_block_at_top(&root.0, future, "* dropped", "always").expect("io");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "* dropped\n### Tasks\n\n### Notes\n"
+        );
+        // A past day gets the block alone, never today's template.
+        let past = date(2020, 1, 2);
+        let past_path = insert_block_at_top(&root.0, past, "* old", "always").expect("io");
+        assert_eq!(fs::read_to_string(&past_path).expect("read"), "* old\n");
+    }
+
+    #[test]
+    fn block_under_heading_lands_at_section_end() {
+        let root = ScratchRoot::new("block-heading");
+        let path = root.write(
+            "Calendar/20260805.md",
+            "## Alpha\n* one\n#### Deep\n* deep\n\n---\n## Beta\nprose\n",
+        );
+        // Sub-headings don't end the section; trailing blanks and rules do.
+        assert_eq!(
+            insert_block_under_heading(&path, 0, "## Alpha", "* two\n\tsub").expect("io"),
+            Some(4)
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "## Alpha\n* one\n#### Deep\n* deep\n* two\n\tsub\n\n---\n## Beta\nprose\n"
+        );
+        // Last section runs to the end of the file.
+        assert_eq!(
+            insert_block_under_heading(&path, 8, "## Beta", "* tail").expect("io"),
+            Some(10)
+        );
+        assert!(fs::read_to_string(&path).expect("read").ends_with("## Beta\nprose\n* tail\n"));
+    }
+
+    #[test]
+    fn block_under_heading_verifies_and_relocates() {
+        let root = ScratchRoot::new("block-relocate");
+        let path = root.write("Notes/Plan.md", "intro\n## Tasks\n* a\n");
+        // The heading moved since render: found again by content.
+        assert_eq!(
+            insert_block_under_heading(&path, 0, "## Tasks", "* b").expect("io"),
+            Some(3)
+        );
+        assert_eq!(fs::read_to_string(&path).expect("read"), "intro\n## Tasks\n* a\n* b\n");
+        // Gone or not a heading: nothing written.
+        assert_eq!(insert_block_under_heading(&path, 1, "## Missing", "* x").expect("io"), None);
+        assert_eq!(insert_block_under_heading(&path, 0, "intro", "* x").expect("io"), None);
+        // Ambiguous duplicate headings at the wrong index: nothing written.
+        let dup = root.write("Notes/Dup.md", "## Log\n* a\n## Log\n* b\n");
+        assert_eq!(insert_block_under_heading(&dup, 1, "## Log", "* x").expect("io"), None);
+        assert_eq!(fs::read_to_string(&dup).expect("read"), "## Log\n* a\n## Log\n* b\n");
+        // At the right index a duplicate heading is trusted.
+        assert_eq!(insert_block_under_heading(&dup, 2, "## Log", "* x").expect("io"), Some(4));
+        assert_eq!(
+            fs::read_to_string(&dup).expect("read"),
+            "## Log\n* a\n## Log\n* b\n* x\n"
+        );
+        // Empty section: the block lands right under the heading.
+        let empty = root.write("Notes/Empty.md", "## Open\n\n## Next\n* n\n");
+        assert_eq!(insert_block_under_heading(&empty, 0, "## Open", "* first").expect("io"), Some(1));
+        assert_eq!(
+            fs::read_to_string(&empty).expect("read"),
+            "## Open\n* first\n\n## Next\n* n\n"
+        );
+        // CRLF file: endings preserved, block converted.
+        let crlf = root.write("Notes/Crlf.md", "## A\r\n* one\r\n## B\r\n");
+        assert_eq!(insert_block_under_heading(&crlf, 0, "## A", "* two\n\tsub").expect("io"), Some(2));
+        assert_eq!(
+            fs::read_to_string(&crlf).expect("read"),
+            "## A\r\n* one\r\n* two\r\n\tsub\r\n## B\r\n"
+        );
     }
 
     #[cfg(unix)]

@@ -304,6 +304,81 @@ impl NoteBuffer {
         new_start
     }
 
+    /// Move a whole block of lines (`range` spans the first line's start to
+    /// the last line's end, final newline excluded, as `block_range` returns)
+    /// so its first line sits at the line boundary `target` (a line-start
+    /// offset, or the text length for the end). One undoable step; a target
+    /// inside the block's own span is a no-op. Returns the byte offset the
+    /// block starts at afterwards.
+    pub fn move_block(
+        &mut self,
+        range: Range<usize>,
+        target: usize,
+        cursor_before: usize,
+        now_ms: u64,
+    ) -> usize {
+        let start = floor_boundary(&self.text, range.start.min(range.end));
+        let block_start = self.text[..start].rfind('\n').map_or(0, |i| i + 1);
+        let end = floor_boundary(&self.text, range.end.min(self.text.len())).max(start);
+        let block_end = self.text[end..].find('\n').map_or(self.text.len(), |i| end + i);
+        let target = floor_boundary(&self.text, target);
+        if target >= block_start && target <= block_end + 1 {
+            return block_start;
+        }
+
+        let trailing_nl = self.text.ends_with('\n');
+        let mut lines: Vec<String> = self.text.split('\n').map(str::to_string).collect();
+        if trailing_nl {
+            lines.pop();
+        }
+        let src = self.text[..block_start].matches('\n').count();
+        let count = self.text[block_start..block_end].matches('\n').count() + 1;
+        let mut dst = if target >= self.text.len() {
+            lines.len()
+        } else {
+            self.text[..target].matches('\n').count()
+        };
+        if dst > src {
+            dst -= count;
+        }
+        let block: Vec<String> = lines.drain(src..(src + count).min(lines.len())).collect();
+        let dst = dst.min(lines.len());
+        lines.splice(dst..dst, block);
+        let mut new_text = lines.join("\n");
+        if trailing_nl {
+            new_text.push('\n');
+        }
+        let new_start: usize = lines.iter().take(dst).map(|l| l.len() + 1).sum();
+
+        // Reordering never changes the length; apply just the region that
+        // moved as a single op so undo restores it in one step.
+        let len = self.text.len();
+        let mut prefix =
+            self.text.bytes().zip(new_text.bytes()).take_while(|(a, b)| a == b).count();
+        while !self.text.is_char_boundary(prefix) {
+            prefix -= 1;
+        }
+        let mut suffix = self
+            .text
+            .bytes()
+            .rev()
+            .zip(new_text.bytes().rev())
+            .take_while(|(a, b)| a == b)
+            .count()
+            .min(len - prefix);
+        while !self.text.is_char_boundary(len - suffix) {
+            suffix -= 1;
+        }
+        self.edit_with_kind(
+            prefix..len - suffix,
+            &new_text[prefix..new_text.len() - suffix],
+            cursor_before,
+            now_ms,
+            GroupKind::Other,
+        );
+        new_start
+    }
+
     /// Absorb the file's current content into the buffer without writing:
     /// the merge path for watcher events landing mid-edit and for saves over
     /// a changed file. After this, `text()` holds the merge and the baseline
@@ -525,6 +600,62 @@ mod tests {
         assert_eq!(b.text(), "a\nb\nc\n");
         assert!(b.redo().is_some());
         assert_eq!(b.text(), "b\nc\na\n");
+    }
+
+    #[test]
+    fn move_block_down_and_up_with_children() {
+        // "* a" and its two children move as one; "z" stays put.
+        let mut b = NoteBuffer::new("* a\n\tone\n\ttwo\nz\nend\n");
+        let block = 0..13; // "* a\n\tone\n\ttwo"
+        assert_eq!(b.move_block(block, 16, 0, 1000), 2);
+        assert_eq!(b.text(), "z\n* a\n\tone\n\ttwo\nend\n");
+        // And back to the top.
+        assert_eq!(b.move_block(2..15, 0, 0, 2000), 0);
+        assert_eq!(b.text(), "* a\n\tone\n\ttwo\nz\nend\n");
+    }
+
+    #[test]
+    fn move_block_with_interior_blank_line() {
+        let mut b = NoteBuffer::new("* a\n\tone\n\n\ttwo\nz\n");
+        let block = 0..14; // includes the interior blank
+        assert_eq!(b.move_block(block, 17, 0, 1000), 2);
+        assert_eq!(b.text(), "z\n* a\n\tone\n\n\ttwo\n");
+    }
+
+    #[test]
+    fn move_block_to_end_without_trailing_newline() {
+        let mut b = NoteBuffer::new("* a\n\tsub\nz");
+        assert_eq!(b.move_block(0..8, 10, 0, 1000), 2);
+        assert_eq!(b.text(), "z\n* a\n\tsub");
+    }
+
+    #[test]
+    fn move_block_onto_itself_is_a_no_op() {
+        let mut b = NoteBuffer::new("* a\n\tsub\nz\n");
+        // Anywhere inside its own span, including the boundary just below.
+        assert_eq!(b.move_block(0..8, 0, 0, 1000), 0);
+        assert_eq!(b.move_block(0..8, 4, 0, 1000), 0);
+        assert_eq!(b.move_block(0..8, 9, 0, 1000), 0);
+        assert_eq!(b.text(), "* a\n\tsub\nz\n");
+        assert_eq!(b.undo(), None);
+    }
+
+    #[test]
+    fn move_block_is_one_undo_step() {
+        let mut b = NoteBuffer::new("* a\n\tsub\nz\nend\n");
+        b.move_block(0..8, 11, 5, 1000);
+        assert_eq!(b.text(), "z\n* a\n\tsub\nend\n");
+        assert_eq!(b.undo(), Some(5));
+        assert_eq!(b.text(), "* a\n\tsub\nz\nend\n");
+        assert!(b.redo().is_some());
+        assert_eq!(b.text(), "z\n* a\n\tsub\nend\n");
+    }
+
+    #[test]
+    fn move_block_of_one_line_matches_move_line() {
+        let mut b = NoteBuffer::new("a\nb\nc\n");
+        assert_eq!(b.move_block(0..1, 4, 0, 1000), 2);
+        assert_eq!(b.text(), "b\na\nc\n");
     }
 
     #[test]

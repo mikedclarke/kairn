@@ -16,6 +16,7 @@
 //! bracketed.
 
 pub mod activity;
+pub mod blocks;
 pub mod buffer;
 pub mod links;
 pub mod merge;
@@ -29,6 +30,7 @@ pub mod vault;
 pub mod write;
 
 pub use activity::*;
+pub use blocks::*;
 pub use buffer::*;
 pub use links::*;
 pub use merge::*;
