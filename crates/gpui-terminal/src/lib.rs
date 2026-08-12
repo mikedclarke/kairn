@@ -342,6 +342,7 @@ pub mod clipboard;
 pub mod colors;
 pub mod event;
 pub mod input;
+mod links;
 pub mod mouse;
 pub mod render;
 pub mod terminal;

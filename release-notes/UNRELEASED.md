@@ -12,6 +12,9 @@ same fact twice; no em dashes. Rewrite to this standard before releasing.
 
 <!-- New user-visible capabilities. -->
 
+- Cmd+click (Ctrl+click on Linux) opens links in terminal output, covering OSC 8 hyperlinks and plain URLs, including URLs that wrap across lines.
+- Holding Cmd underlines the terminal link under the pointer.
+
 ## Improved
 
 <!-- Refinements to existing workflows, reliability, performance, or UX. -->

@@ -126,6 +126,8 @@ struct RowLayout {
 struct FrameLayout {
     generation: u64,
     font_sig: (String, i32),
+    /// Buffer-coordinate span underlined as the hovered link, inclusive.
+    hover_link: Option<(AlacPoint, AlacPoint)>,
     cols: usize,
     default_bg: Hsla,
     /// Cursor as (visible row, col), if on screen and not hidden.
@@ -621,6 +623,8 @@ impl TerminalRenderer {
     /// * `padding` - Padding around the terminal content
     /// * `term` - The terminal state
     /// * `generation` - The terminal's mutation counter at paint time
+    /// * `hover_link` - Buffer-coordinate span to underline as the hovered
+    ///   link (inclusive), or None
     /// * `window` - The GPUI window
     /// * `cx` - The application context
     pub fn paint(
@@ -629,16 +633,17 @@ impl TerminalRenderer {
         padding: Edges<Pixels>,
         term: &Term<GpuiEventProxy>,
         generation: u64,
+        hover_link: Option<(AlacPoint, AlacPoint)>,
         window: &mut Window,
         cx: &mut App,
     ) {
         let font_sig = self.font_sig();
         let mut cache = self.frame_cache.lock();
-        let valid = cache
-            .as_ref()
-            .is_some_and(|f| f.generation == generation && f.font_sig == font_sig);
+        let valid = cache.as_ref().is_some_and(|f| {
+            f.generation == generation && f.font_sig == font_sig && f.hover_link == hover_link
+        });
         if !valid {
-            *cache = Some(self.layout_frame(term, generation, font_sig, window));
+            *cache = Some(self.layout_frame(term, generation, font_sig, hover_link, window));
         }
         let frame = cache.as_ref().expect("frame cache filled above");
         self.paint_frame(frame, bounds, padding, window, cx);
@@ -651,6 +656,7 @@ impl TerminalRenderer {
         term: &Term<GpuiEventProxy>,
         generation: u64,
         font_sig: (String, i32),
+        hover_link: Option<(AlacPoint, AlacPoint)>,
         window: &mut Window,
     ) -> FrameLayout {
         let grid = term.grid();
@@ -690,7 +696,13 @@ impl TerminalRenderer {
                 .map(|col_idx| {
                     let col = Column(col_idx);
                     let point = AlacPoint::new(line, col);
-                    let cell = grid[point].clone();
+                    let mut cell = grid[point].clone();
+                    if let Some((start, end)) = hover_link
+                        && point >= start
+                        && point <= end
+                    {
+                        cell.flags.insert(Flags::UNDERLINE);
+                    }
                     (col_idx, cell)
                 })
                 .collect();
@@ -777,6 +789,7 @@ impl TerminalRenderer {
         FrameLayout {
             generation,
             font_sig,
+            hover_link,
             cols: num_cols,
             default_bg,
             cursor,
