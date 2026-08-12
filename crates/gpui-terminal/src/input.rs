@@ -83,6 +83,17 @@
 //!
 //! - **APP_CURSOR**: Changes unmodified arrow key sequences from CSI to SS3
 //!   format
+//! - **DISAMBIGUATE_ESC_CODES** (kitty keyboard protocol): Esc becomes
+//!   `\x1b[27u`, Ctrl/Alt-modified printables become `\x1b[<codepoint>;<mods>u`,
+//!   and modified Enter/Tab/Backspace/Space take the same CSI u form, so
+//!   applications can tell Shift+Enter from Enter. Unmodified printables,
+//!   Enter, Tab, Backspace, arrows, navigation and function keys keep their
+//!   legacy sequences.
+//! - **REPORT_ALL_KEYS_AS_ESC** is deliberately never honoured: herdr requests
+//!   it but its prefix matcher cannot decode CSI u printables, so encoding
+//!   plain keys as CSI u kills its `Ctrl+B <letter>` bindings. Masking the
+//!   flag in the encoder keeps plain keys legacy while the other kitty flags
+//!   still work.
 //!
 //! # Example
 //!
@@ -154,6 +165,45 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u
             format!("\x1b[{num}~").into_bytes()
         }
     };
+
+    // Kitty keyboard protocol: when the application has negotiated
+    // disambiguation, the ambiguous legacy keys switch to CSI u sequences
+    // (`\x1b[<codepoint>u`, or `\x1b[<codepoint>;<mods>u` with modifiers).
+    // REPORT_ALL_KEYS_AS_ESC is deliberately ignored (see the module docs:
+    // honouring it breaks herdr's prefix keys), so unmodified printables,
+    // Enter, Tab and Backspace always keep their legacy bytes, and arrows,
+    // navigation and function keys keep their legacy CSI forms below.
+    if mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
+        let csi_u = |code: u32| -> Vec<u8> {
+            if modified {
+                format!("\x1b[{code};{param}u").into_bytes()
+            } else {
+                format!("\x1b[{code}u").into_bytes()
+            }
+        };
+        match keystroke.key.as_str() {
+            // A bare Esc must not be a raw 0x1b: under disambiguation that
+            // reads as the start of an escape sequence.
+            "escape" => return Some(csi_u(27)),
+            "enter" if modified => return Some(csi_u(13)),
+            "tab" if modified => return Some(csi_u(9)),
+            "backspace" if modified => return Some(csi_u(127)),
+            "space" if mods.control || mods.alt => return Some(csi_u(32)),
+            key => {
+                // Ctrl/Alt-modified printables: CSI u on the unshifted
+                // codepoint (kitty reports lowercase letters). Shift alone
+                // stays legacy text; arrows/nav/function keys have multi-char
+                // names and fall through to their legacy forms.
+                if (mods.control || mods.alt)
+                    && key.chars().count() == 1
+                    && let Some(ch) = key.chars().next()
+                    && !ch.is_control()
+                {
+                    return Some(csi_u(ch.to_ascii_lowercase() as u32));
+                }
+            }
+        }
+    }
 
     // Handle special keys first
     match keystroke.key.as_str() {
@@ -621,5 +671,170 @@ mod tests {
 
         let space = Keystroke::parse("space").unwrap();
         assert_eq!(keystroke_to_bytes(&space, mode), Some(b" ".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_escape_disambiguated() {
+        let mode = TermMode::DISAMBIGUATE_ESC_CODES;
+
+        // A raw 0x1b would read as the start of a sequence; kitty sends CSI 27u.
+        let esc = Keystroke::parse("escape").unwrap();
+        assert_eq!(keystroke_to_bytes(&esc, mode), Some(b"\x1b[27u".to_vec()));
+
+        let alt_esc = Keystroke::parse("alt-escape").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&alt_esc, mode),
+            Some(b"\x1b[27;3u".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_kitty_shift_enter_distinct_from_enter() {
+        let mode = TermMode::DISAMBIGUATE_ESC_CODES;
+
+        let enter = Keystroke::parse("enter").unwrap();
+        assert_eq!(keystroke_to_bytes(&enter, mode), Some(b"\r".to_vec()));
+
+        let shift_enter = Keystroke::parse("shift-enter").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&shift_enter, mode),
+            Some(b"\x1b[13;2u".to_vec())
+        );
+
+        let ctrl_enter = Keystroke::parse("ctrl-enter").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_enter, mode),
+            Some(b"\x1b[13;5u".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_kitty_modified_tab_backspace_space() {
+        let mode = TermMode::DISAMBIGUATE_ESC_CODES;
+
+        // Unmodified keep their legacy bytes.
+        let tab = Keystroke::parse("tab").unwrap();
+        assert_eq!(keystroke_to_bytes(&tab, mode), Some(b"\t".to_vec()));
+        let backspace = Keystroke::parse("backspace").unwrap();
+        assert_eq!(keystroke_to_bytes(&backspace, mode), Some(b"\x7f".to_vec()));
+
+        // Modified switch to CSI u.
+        let shift_tab = Keystroke::parse("shift-tab").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&shift_tab, mode),
+            Some(b"\x1b[9;2u".to_vec())
+        );
+        let ctrl_backspace = Keystroke::parse("ctrl-backspace").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_backspace, mode),
+            Some(b"\x1b[127;5u".to_vec())
+        );
+        let ctrl_space = Keystroke::parse("ctrl-space").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_space, mode),
+            Some(b"\x1b[32;5u".to_vec())
+        );
+        // Shift+Space still types a space.
+        let shift_space = Keystroke::parse("shift-space").unwrap();
+        assert_eq!(keystroke_to_bytes(&shift_space, mode), Some(b" ".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_ctrl_and_alt_printables() {
+        let mode = TermMode::DISAMBIGUATE_ESC_CODES;
+
+        // Ctrl+letter: CSI u on the lowercase codepoint instead of the
+        // control byte.
+        let ctrl_c = Keystroke::parse("ctrl-c").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_c, mode),
+            Some(b"\x1b[99;5u".to_vec())
+        );
+        let ctrl_b = Keystroke::parse("ctrl-b").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_b, mode),
+            Some(b"\x1b[98;5u".to_vec())
+        );
+        // Ctrl+[ no longer collides with Esc.
+        let ctrl_bracket = Keystroke::parse("ctrl-[").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_bracket, mode),
+            Some(b"\x1b[91;5u".to_vec())
+        );
+
+        // Alt+letter: CSI u instead of the ESC prefix.
+        let alt_a = Keystroke::parse("alt-a").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&alt_a, mode),
+            Some(b"\x1b[97;3u".to_vec())
+        );
+        let ctrl_alt_a = Keystroke::parse("ctrl-alt-a").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_alt_a, mode),
+            Some(b"\x1b[97;7u".to_vec())
+        );
+        let ctrl_shift_a = Keystroke::parse("ctrl-shift-a").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_shift_a, mode),
+            Some(b"\x1b[97;6u".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_kitty_plain_keys_and_arrows_stay_legacy() {
+        let mode = TermMode::DISAMBIGUATE_ESC_CODES;
+
+        let p = Keystroke::parse("p").unwrap();
+        assert_eq!(keystroke_to_bytes(&p, mode), Some(b"p".to_vec()));
+
+        let up = Keystroke::parse("up").unwrap();
+        assert_eq!(keystroke_to_bytes(&up, mode), Some(b"\x1b[A".to_vec()));
+
+        let ctrl_right = Keystroke::parse("ctrl-right").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_right, mode),
+            Some(b"\x1b[1;5C".to_vec())
+        );
+
+        let home = Keystroke::parse("home").unwrap();
+        assert_eq!(keystroke_to_bytes(&home, mode), Some(b"\x1b[H".to_vec()));
+
+        let f5 = Keystroke::parse("f5").unwrap();
+        assert_eq!(keystroke_to_bytes(&f5, mode), Some(b"\x1b[15~".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_report_all_keys_flag_is_masked() {
+        // herdr requests REPORT_ALL_KEYS_AS_ESC but cannot decode CSI u
+        // printables; the encoder must never honour it.
+        let mode = TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_ALL_KEYS_AS_ESC;
+
+        // Plain printables and Enter stay legacy so `Ctrl+B p` keeps working.
+        let p = Keystroke::parse("p").unwrap();
+        assert_eq!(keystroke_to_bytes(&p, mode), Some(b"p".to_vec()));
+        let enter = Keystroke::parse("enter").unwrap();
+        assert_eq!(keystroke_to_bytes(&enter, mode), Some(b"\r".to_vec()));
+        let tab = Keystroke::parse("tab").unwrap();
+        assert_eq!(keystroke_to_bytes(&tab, mode), Some(b"\t".to_vec()));
+
+        // Disambiguation itself still applies.
+        let esc = Keystroke::parse("escape").unwrap();
+        assert_eq!(keystroke_to_bytes(&esc, mode), Some(b"\x1b[27u".to_vec()));
+        let ctrl_b = Keystroke::parse("ctrl-b").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_b, mode),
+            Some(b"\x1b[98;5u".to_vec())
+        );
+
+        // The flag alone (no disambiguation negotiated) changes nothing.
+        let only_report_all = TermMode::REPORT_ALL_KEYS_AS_ESC;
+        assert_eq!(
+            keystroke_to_bytes(&esc, only_report_all),
+            Some(b"\x1b".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_b, only_report_all),
+            Some(vec![0x02])
+        );
     }
 }

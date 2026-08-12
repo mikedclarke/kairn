@@ -166,9 +166,14 @@ impl TerminalState {
     /// let terminal = TerminalState::new(80, 24, event_proxy);
     /// ```
     pub fn new(cols: usize, rows: usize, event_proxy: GpuiEventProxy) -> Self {
-        // Create a default configuration
-        // The Config struct controls various terminal behaviors like scrolling history
-        let config = Config::default();
+        // The Config struct controls various terminal behaviors like scrolling
+        // history. kitty_keyboard lets applications negotiate the kitty
+        // keyboard protocol (push/pop/query of CSI u flags); the key encoder
+        // in `input.rs` honours the resulting TermMode flags.
+        let config = Config {
+            kitty_keyboard: true,
+            ..Config::default()
+        };
 
         // Create dimensions for terminal initialization
         let dimensions = TermDimensions::new(cols, rows);
