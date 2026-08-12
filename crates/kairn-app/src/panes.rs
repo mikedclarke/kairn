@@ -581,7 +581,18 @@ impl Workspace {
                     .unwrap_or_default()
                     .to_string();
                 let open = path.clone();
+                let keep_mine = path.clone();
+                let keep_copy = path.clone();
+                let full_path = path.to_string_lossy().into_owned();
                 let hover = t.text;
+                let action = |label: &'static str, id: (&'static str, usize)| {
+                    div()
+                        .id(id)
+                        .text_color(t.dim)
+                        .cursor_pointer()
+                        .hover(move |s| s.text_color(hover))
+                        .child(label)
+                };
                 div()
                     .mb(px(10.))
                     .px(px(12.))
@@ -592,26 +603,42 @@ impl Workspace {
                     .bg(t.amber.opacity(0.08))
                     .text_size(t.ui_px(12.))
                     .child(div().text_color(t.dim).child(
-                        "A sync conflict copy of this note exists; it may hold changes this version is missing.",
+                        "A sync conflict copy of this note exists; it may hold changes this version is missing. Resolving moves the losing file to the vault trash.",
                     ))
+                    .child(div().mt(px(2.)).text_color(t.faint).child(name.clone()))
                     .child(
                         h_flex()
                             .mt(px(4.))
                             .gap(px(14.))
                             .text_size(t.ui_px(11.5))
+                            .child(action("Open the copy", ("conflict-open", i)).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.open_note(open.clone(), cx);
+                                }),
+                            ))
                             .child(
-                                div()
-                                    .id(("conflict-open", i))
-                                    .text_color(t.dim)
-                                    .cursor_pointer()
-                                    .hover(move |s| s.text_color(hover))
-                                    .child("Open the copy")
+                                action("Keep this version", ("conflict-keep-mine", i))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         cx.stop_propagation();
-                                        this.open_note(open.clone(), cx);
+                                        this.resolve_conflict(&keep_mine, false, cx);
                                     })),
                             )
-                            .child(div().text_color(t.faint).child(name)),
+                            .child(
+                                action("Use the copy instead", ("conflict-keep-copy", i))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.resolve_conflict(&keep_copy, true, cx);
+                                    })),
+                            )
+                            .child(action("Copy path", ("conflict-copy-path", i)).on_click(
+                                cx.listener(move |_, _, _, cx| {
+                                    cx.stop_propagation();
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        full_path.clone(),
+                                    ));
+                                }),
+                            )),
                     )
                     .into_any_element()
             })

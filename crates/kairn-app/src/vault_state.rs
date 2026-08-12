@@ -597,6 +597,7 @@ impl Workspace {
             .as_deref()
             .map(notes::conflict_copies)
             .unwrap_or_default();
+        self.vault_conflicts = notes::vault_conflicts(&self.notes_root);
         self.doc_path = path;
         self.note_days = scan.days;
         self.sync_note_editor(disk_text.as_deref(), seed.as_deref(), cx);
@@ -820,6 +821,43 @@ impl Workspace {
 
     /// Dismiss the orphaned-line banner, optionally appending its text to
     /// the note it was bound for so nothing typed is lost.
+    /// Resolve a sync conflict, keeping either the current note or the
+    /// conflict copy. The losing file moves to `Notes/@Trash/` (nothing is
+    /// destroyed); adopting the copy renames it into the note's place, and
+    /// the file watcher plus reload pick the new content up everywhere.
+    pub fn resolve_conflict(&mut self, copy: &Path, keep_copy: bool, cx: &mut Context<Self>) {
+        let result = if keep_copy {
+            match notes::conflict_owner(copy) {
+                Some(owner) => notes::adopt_conflict_copy(&self.notes_root, &owner, copy),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "not a sync-conflict file name",
+                )),
+            }
+        } else {
+            notes::trash_note(&self.notes_root, copy).map(|_| ())
+        };
+        match result {
+            Ok(()) => self.reload_notes(cx),
+            Err(e) => eprintln!("kairn: could not resolve conflict {}: {e}", copy.display()),
+        }
+        cx.notify();
+    }
+
+    /// Jump to the note a conflict copy shadows, where the banner offers the
+    /// resolution actions: a day opens on the calendar, anything else as a
+    /// note.
+    pub fn open_conflict_owner(&mut self, owner: &Path, cx: &mut Context<Self>) {
+        let day = owner
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|stem| chrono::NaiveDate::parse_from_str(stem, "%Y%m%d").ok());
+        match day {
+            Some(date) => self.select_day(date, cx),
+            None => self.open_note(owner.to_path_buf(), cx),
+        }
+    }
+
     pub fn resolve_orphan(&mut self, append: bool, cx: &mut Context<Self>) {
         let Some((path, text)) = self.orphaned.take() else { return };
         if append {

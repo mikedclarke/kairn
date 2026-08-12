@@ -127,6 +127,10 @@ pub struct Workspace {
     pub mentions: Vec<notes::Mention>,
     /// Syncthing conflict copies sitting next to the pane's document.
     pub conflicts: Vec<PathBuf>,
+    /// Every Syncthing conflict in the vault as (owner note, conflict copy),
+    /// for the sidebar's conflict list: conflicts on notes that aren't open
+    /// would otherwise stay invisible.
+    pub vault_conflicts: Vec<(PathBuf, PathBuf)>,
     /// Read error for the pane's document: the file exists but couldn't be
     /// read (permissions, invalid UTF-8). Rendered instead of pretending
     /// there is no note.
@@ -290,6 +294,7 @@ impl Workspace {
             doc_path: None,
             mentions: Vec::new(),
             conflicts: Vec::new(),
+            vault_conflicts: Vec::new(),
             doc_error: None,
             dailies_skipped: 0,
             root_missing,

@@ -49,6 +49,54 @@ impl Workspace {
             )
             .child(self.render_calendar(t, drop_day, cx));
 
+        // Sync conflicts anywhere in the vault: without this list, a
+        // conflict copy of a note that isn't open stays invisible forever.
+        // A rare blocking state, so the section only exists while conflicts
+        // do; each row jumps to the note, whose banner offers resolution.
+        if !self.vault_conflicts.is_empty() {
+            let mut owners: Vec<(std::path::PathBuf, usize)> = Vec::new();
+            for (owner, _) in &self.vault_conflicts {
+                match owners.last_mut() {
+                    Some((o, n)) if o == owner => *n += 1,
+                    _ => owners.push((owner.clone(), 1)),
+                }
+            }
+            let collapsed = self.section_collapsed("Conflicts");
+            side = side.child(
+                sechead(
+                    t,
+                    "sec-conflicts",
+                    "Sync conflicts",
+                    Some(owners.len().to_string()),
+                    collapsed,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_section("Conflicts", cx))),
+            );
+            if !collapsed {
+                for (i, (owner, copies)) in owners.into_iter().enumerate() {
+                    let stem = owner
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let label: SharedString = match NaiveDate::parse_from_str(&stem, "%Y%m%d") {
+                        Ok(date) => day_label(date),
+                        Err(_) => stem.into(),
+                    };
+                    let row = nav_item(t, ("conflict-row", i))
+                        .cursor_pointer()
+                        .child(div().w(px(7.)).h(px(7.)).flex_none().rounded_full().bg(t.amber))
+                        .child(div().flex_1().child(label))
+                        .when(copies > 1, |d| {
+                            d.child(count_label(t, &copies.to_string(), true))
+                        });
+                    side = side.child(row.on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_conflict_owner(&owner, cx);
+                    })));
+                }
+            }
+        }
+
         // Daily: today plus the next (or previous, per settings) two days.
         // The bounds store clears before the visibility checks so a hidden
         // or collapsed section always clears its drop targets.
