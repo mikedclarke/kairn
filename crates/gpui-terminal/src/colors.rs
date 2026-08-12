@@ -390,6 +390,42 @@ impl ColorPalette {
     pub fn cursor(&self) -> Hsla {
         self.cursor
     }
+
+    /// Resolve a color-query index (OSC 4 palette queries, OSC 10/11/12
+    /// dynamic colors) to concrete RGB bytes from this palette.
+    ///
+    /// Runtime overrides the application set with OSC 4 are not consulted:
+    /// the terminal is locked while the query event fires, so this answers
+    /// from the configured palette only.
+    pub fn query_color(&self, index: usize) -> Option<Rgb> {
+        let dim = |mut color: Hsla| {
+            color.l *= 0.7;
+            color
+        };
+        let hsla = match index {
+            0..=255 => self.extended_colors[index],
+            i if i == NamedColor::Foreground as usize => self.foreground,
+            i if i == NamedColor::Background as usize => self.background,
+            i if i == NamedColor::Cursor as usize => self.cursor,
+            i if i == NamedColor::BrightForeground as usize => self.foreground,
+            i if i == NamedColor::DimForeground as usize => dim(self.foreground),
+            i if (NamedColor::DimBlack as usize..=NamedColor::DimWhite as usize).contains(&i) => {
+                dim(self.ansi_colors[i - NamedColor::DimBlack as usize])
+            }
+            _ => return None,
+        };
+        Some(hsla_to_rgb(hsla))
+    }
+}
+
+/// Converts a GPUI Hsla color to terminal RGB bytes.
+fn hsla_to_rgb(color: Hsla) -> Rgb {
+    let rgba = gpui::Rgba::from(color);
+    Rgb {
+        r: (rgba.r * 255.0).round().clamp(0.0, 255.0) as u8,
+        g: (rgba.g * 255.0).round().clamp(0.0, 255.0) as u8,
+        b: (rgba.b * 255.0).round().clamp(0.0, 255.0) as u8,
+    }
 }
 
 /// Converts an RGB color to GPUI's Hsla color format.

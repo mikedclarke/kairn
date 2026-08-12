@@ -25,8 +25,13 @@
 //! | `Event::ChildExit(_)` | `Exit` | Child process exited |
 //! | `Event::ResetTitle` | `Title("")` | Reset to empty title |
 //!
-//! Events like `MouseCursorDirty`, `PtyWrite`, and `CursorBlinkingChange` are
-//! ignored as they're handled internally or not needed for GPUI integration.
+//! `Event::PtyWrite` (query responses: cursor position reports, device
+//! attributes, kitty keyboard queries) and `Event::ColorRequest` (OSC
+//! 4/10/11/12 color queries) are answered directly on the PTY when the
+//! proxy was built with [`GpuiEventProxy::with_pty_responder`]; applications
+//! block waiting for these replies, so they must not be dropped.
+//! `MouseCursorDirty` and `CursorBlinkingChange` are ignored as they're not
+//! needed for GPUI integration.
 //!
 //! # Example
 //!
@@ -43,8 +48,18 @@
 //!
 //! [`EventListener`]: alacritty_terminal::event::EventListener
 
+use crate::colors::ColorPalette;
 use alacritty_terminal::event::{Event, EventListener};
+use std::io::Write;
+use std::sync::Arc;
 use std::sync::mpsc::Sender;
+
+/// Shared handle to the PTY input, for writing query responses.
+pub type PtyWriter = Arc<parking_lot::Mutex<Box<dyn Write + Send>>>;
+
+/// Shared handle to the palette, for answering color queries after runtime
+/// config updates.
+pub type SharedPalette = Arc<parking_lot::Mutex<ColorPalette>>;
 
 /// Events emitted by the terminal that the GPUI application cares about.
 ///
@@ -78,6 +93,12 @@ pub enum TerminalEvent {
 pub struct GpuiEventProxy {
     /// Channel sender for forwarding events to the GPUI application.
     tx: Sender<TerminalEvent>,
+
+    /// PTY writer and palette for answering terminal queries (cursor
+    /// position, device attributes, color queries) directly. Responses
+    /// bypass the event channel: applications block waiting for them, and
+    /// the channel is only drained on render.
+    responder: Option<(PtyWriter, SharedPalette)>,
 }
 
 impl GpuiEventProxy {
@@ -101,7 +122,27 @@ impl GpuiEventProxy {
     /// let proxy = GpuiEventProxy::new(tx);
     /// ```
     pub fn new(tx: Sender<TerminalEvent>) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            responder: None,
+        }
+    }
+
+    /// Attach a PTY writer and palette so the proxy can answer terminal
+    /// queries (`PtyWrite`, `ColorRequest`) directly. Without this, query
+    /// responses are dropped and applications waiting on them stall.
+    pub fn with_pty_responder(mut self, writer: PtyWriter, palette: SharedPalette) -> Self {
+        self.responder = Some((writer, palette));
+        self
+    }
+
+    /// Write a query response to the PTY, if a responder is attached.
+    fn respond(&self, bytes: &[u8]) {
+        if let Some((writer, _)) = &self.responder {
+            let mut writer = writer.lock();
+            let _ = writer.write_all(bytes);
+            let _ = writer.flush();
+        }
     }
 
     /// Sends a terminal event through the channel.
@@ -142,16 +183,27 @@ impl EventListener for GpuiEventProxy {
             Event::Exit => {
                 self.send(TerminalEvent::Exit);
             }
+            Event::PtyWrite(data) => {
+                // Query responses the application is blocked waiting for:
+                // cursor position reports (CSI 6n), device attributes,
+                // kitty keyboard queries.
+                self.respond(data.as_bytes());
+            }
+            Event::ColorRequest(index, format) => {
+                // OSC 4/10/11/12 color queries; applications use OSC 11 to
+                // detect light/dark background.
+                if let Some((_, palette)) = &self.responder {
+                    let rgb = palette.lock().query_color(index);
+                    if let Some(rgb) = rgb {
+                        self.respond(format(rgb).as_bytes());
+                    }
+                }
+            }
             // Ignore events we don't care about
             Event::MouseCursorDirty => {}
-            Event::PtyWrite(ref _data) => {
-                // This is handled internally by alacritty
-            }
-            Event::ColorRequest(ref _index, ref _format) => {
-                // Color requests are not commonly used
-            }
             Event::TextAreaSizeRequest(ref _format) => {
-                // Text area size requests are handled internally
+                // Answering CSI 14t needs the terminal's dimensions, but the
+                // terminal is locked while this event fires; left unanswered.
             }
             Event::CursorBlinkingChange => {
                 // Cursor blinking changes could be handled if needed
@@ -177,6 +229,66 @@ mod tests {
     fn test_event_proxy_creation() {
         let (tx, _rx) = channel();
         let _proxy = GpuiEventProxy::new(tx);
+    }
+
+    /// A writer that appends into a shared buffer, standing in for the PTY.
+    struct SinkWriter(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl Write for SinkWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn responder_proxy() -> (GpuiEventProxy, Arc<parking_lot::Mutex<Vec<u8>>>) {
+        let (tx, _rx) = channel();
+        let sink = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let writer: PtyWriter = Arc::new(parking_lot::Mutex::new(
+            Box::new(SinkWriter(sink.clone())) as Box<dyn Write + Send>,
+        ));
+        let palette: SharedPalette = Arc::new(parking_lot::Mutex::new(ColorPalette::default()));
+        let proxy = GpuiEventProxy::new(tx).with_pty_responder(writer, palette);
+        (proxy, sink)
+    }
+
+    #[test]
+    fn test_cursor_position_query_is_answered() {
+        let (proxy, sink) = responder_proxy();
+        let mut state = crate::terminal::TerminalState::new(80, 24, proxy);
+
+        // DSR: the application asks where the cursor is and blocks on the
+        // reply.
+        state.process_bytes(b"\x1b[6n");
+
+        assert_eq!(&*sink.lock(), b"\x1b[1;1R");
+    }
+
+    #[test]
+    fn test_background_color_query_is_answered() {
+        let (proxy, sink) = responder_proxy();
+        let mut state = crate::terminal::TerminalState::new(80, 24, proxy);
+
+        // OSC 11: query the background color (light/dark detection).
+        state.process_bytes(b"\x1b]11;?\x07");
+
+        let response = sink.lock().clone();
+        assert!(
+            response.starts_with(b"\x1b]11;rgb:"),
+            "unexpected response: {response:?}"
+        );
+    }
+
+    #[test]
+    fn test_queries_are_dropped_without_responder() {
+        let (tx, _rx) = channel();
+        let proxy = GpuiEventProxy::new(tx);
+
+        // No responder attached: must not panic.
+        proxy.send_event(Event::PtyWrite("\x1b[1;1R".into()));
     }
 
     #[test]

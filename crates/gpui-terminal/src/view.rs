@@ -386,6 +386,10 @@ pub struct TerminalView {
     /// Writer for sending input to the terminal process
     stdin_writer: Arc<parking_lot::Mutex<Box<dyn Write + Send>>>,
 
+    /// Palette shared with the event proxy, which answers color queries
+    /// from it; kept in sync by `update_config`
+    shared_palette: Arc<parking_lot::Mutex<ColorPalette>>,
+
     /// Receiver for terminal events from the event proxy
     event_rx: mpsc::Receiver<TerminalEvent>,
 
@@ -477,8 +481,20 @@ impl TerminalView {
         // Clone event_tx for the reader task to send Exit event when PTY closes
         let exit_event_tx = event_tx.clone();
 
+        // Wrap stdin writer in Arc<Mutex> for thread-safe access. Created
+        // before the event proxy so the proxy can answer terminal queries
+        // (cursor position, color queries) directly on the PTY.
+        let stdin_writer = Arc::new(parking_lot::Mutex::new(
+            Box::new(stdin_writer) as Box<dyn Write + Send>
+        ));
+
+        // The palette is shared with the proxy so color queries stay correct
+        // after runtime config updates.
+        let shared_palette = Arc::new(parking_lot::Mutex::new(config.colors.clone()));
+
         // Create event proxy for alacritty
-        let event_proxy = GpuiEventProxy::new(event_tx);
+        let event_proxy = GpuiEventProxy::new(event_tx)
+            .with_pty_responder(stdin_writer.clone(), shared_palette.clone());
 
         // Create terminal state
         let state = TerminalState::new(config.cols, config.rows, event_proxy);
@@ -493,11 +509,6 @@ impl TerminalView {
 
         // Create focus handle
         let focus_handle = cx.focus_handle();
-
-        // Wrap stdin writer in Arc<Mutex> for thread-safe access
-        let stdin_writer = Arc::new(parking_lot::Mutex::new(
-            Box::new(stdin_writer) as Box<dyn Write + Send>
-        ));
 
         // Create async channel for bytes (push-based notification)
         // Using flume instead of smol::channel because flume is executor-agnostic
@@ -545,6 +556,7 @@ impl TerminalView {
             renderer,
             focus_handle,
             stdin_writer,
+            shared_palette,
             event_rx,
             config,
             _reader_task: reader_task,
@@ -1077,6 +1089,8 @@ impl TerminalView {
         self.renderer.font_size = config.font_size;
         self.renderer.line_height_multiplier = config.line_height_multiplier;
         self.renderer.palette = config.colors.clone();
+        // Keep the event proxy's color-query palette in sync
+        *self.shared_palette.lock() = config.colors.clone();
         // Palette and metrics feed the cached layouts; start fresh
         self.renderer.invalidate_caches();
 
@@ -1137,6 +1151,10 @@ impl Render for TerminalView {
         div()
             .size_full()
             .bg(rgb(0x1e1e1e))
+            // Named so embedders can scope key bindings to the terminal, and
+            // in particular disable ancestor bindings (focus-cycling Tab) that
+            // would otherwise consume keys before they reach the PTY.
+            .key_context("Terminal")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
