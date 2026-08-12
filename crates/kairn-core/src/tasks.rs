@@ -9,7 +9,7 @@ use chrono::NaiveDate;
 use crate::parse::{Line, Span, SpanKind, TaskState, bracket_state, parse_line};
 use crate::vault::{DayText, NoteText, VaultScan};
 
-/// One open task found in a note, addressable for toggling.
+/// One task found in a note, addressable for toggling.
 #[derive(Clone, Debug)]
 pub struct TaskRef {
     pub path: PathBuf,
@@ -52,6 +52,51 @@ pub fn open_tasks_in_vault(root: &Path) -> Vec<TaskRef> {
 /// lines doesn't swamp the Open view with undated noise.
 pub fn open_tasks_in(dailies: &[DayText], notes: &[NoteText]) -> Vec<TaskRef> {
     scan_tasks(dailies, notes).open
+}
+
+/// Every done (`[x]`) task across the vault, newest due date first: the
+/// same population [`open_tasks_in_vault`] draws from — the daily notes,
+/// plus dated (`>date`) tasks from period and regular notes. Cancelled
+/// tasks are not done tasks and stay out.
+pub fn done_tasks_in_vault(root: &Path) -> Vec<TaskRef> {
+    let scan = VaultScan::new(root);
+    let dailies = scan.read_dailies();
+    let notes = scan.read_notes_cached(&mut Default::default());
+    let mut tasks = Vec::new();
+    for day in dailies.iter() {
+        for (line_idx, raw) in day.text.lines().enumerate() {
+            let Line::Task { state: TaskState::Done, spans } = parse_line(raw) else {
+                continue;
+            };
+            let due = due_token(&spans).unwrap_or(day.date);
+            tasks.push(TaskRef {
+                path: day.path.clone(),
+                due,
+                file_date: Some(day.date),
+                line_idx,
+                line: raw.to_string(),
+                spans,
+            });
+        }
+    }
+    for note in notes.iter() {
+        for (line_idx, raw) in note.text.lines().enumerate() {
+            let Line::Task { state: TaskState::Done, spans } = parse_line(raw) else {
+                continue;
+            };
+            let Some(due) = due_token(&spans) else { continue };
+            tasks.push(TaskRef {
+                path: note.path.clone(),
+                due,
+                file_date: None,
+                line_idx,
+                line: raw.to_string(),
+                spans,
+            });
+        }
+    }
+    tasks.sort_by(|a, b| b.due.cmp(&a.due).then_with(|| a.path.cmp(&b.path)));
+    tasks
 }
 
 /// Per-day task tallies for calendar indicators, by due date.
@@ -324,6 +369,34 @@ mod tests {
         );
         // A day with no tasks has no entry at all.
         assert!(!result.day_stats.contains_key(&d(2026, 8, 7)));
+    }
+
+    #[test]
+    fn done_tasks_mirror_the_open_population() {
+        let root = ScratchRoot::new("done");
+        root.write(
+            "Calendar/20260805.md",
+            "* open here\n* [x] done here\n* [x] done for later >2026-08-20\n+ [-] cancelled\n",
+        );
+        root.write(
+            "Notes/Project.md",
+            "* [x] dated done >2026-08-06\n* [x] undated done stays out\n",
+        );
+
+        let done = done_tasks_in_vault(&root.0);
+        let lines: Vec<&str> = done.iter().map(|t| t.line.as_str()).collect();
+        // Daily done tasks with and without tokens, dated note tasks; open,
+        // cancelled, and undated note tasks all stay out. Newest due first.
+        assert_eq!(
+            lines,
+            vec![
+                "* [x] done for later >2026-08-20",
+                "* [x] dated done >2026-08-06",
+                "* [x] done here",
+            ]
+        );
+        assert_eq!(done[2].due, d(2026, 8, 5));
+        assert_eq!(done[1].file_date, None);
     }
 
     #[test]

@@ -6,9 +6,8 @@ use gpui::{
 };
 use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
 
-use crate::session::SessionKind;
 use crate::theme::KairnTheme;
-use crate::workspace::{PaneView, TaskQuery, Workspace, chord, kbd};
+use crate::workspace::{PaneView, TaskQuery, Workspace, chord};
 
 /// The file manager by its platform name, for context-menu labels.
 const REVEAL_LABEL: &str = if cfg!(target_os = "macos") {
@@ -22,67 +21,109 @@ impl Workspace {
         let session_count = self.sessions.len();
         let today = Local::now().date_naive();
 
+        // While a line drag is in flight, the day row or cell under the
+        // pointer rings as the drop target (hit-tested against last-painted
+        // bounds, like the week strip).
+        let drop_day = self
+            .note_editor
+            .as_ref()
+            .and_then(|e| e.read(cx).line_drag())
+            .and_then(|(_, _, position)| self.resolve_day_drop(position));
+        self.sidebar_bounds.borrow_mut().take();
+
+        let sidebar_store = self.sidebar_bounds.clone();
         let mut side = div()
             .id("sidebar-scroll")
             .flex_1()
             .min_h(px(0.))
             .overflow_y_scroll()
-            .child(self.render_calendar(t, cx));
+            .child(
+                gpui::canvas(
+                    move |bounds, _, _| {
+                        sidebar_store.borrow_mut().replace(bounds);
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(self.render_calendar(t, drop_day, cx));
 
         // Daily: today plus the next (or previous, per settings) two days.
-        let collapsed = self.section_collapsed("Daily");
-        side = side.child(
-            sechead(t, "sec-daily", "Daily", None, collapsed).on_click(cx.listener(
-                |this, _, _, cx| this.toggle_section("Daily", cx),
-            )),
-        );
-        if !collapsed {
-            let forward = self.settings.daily_forward;
-            for i in 0..3u64 {
-                let day = if forward { today + Days::new(i) } else { today - Days::new(i) };
-                let selected = day == self.selected_day;
-                let has_note = self.note_days.contains_key(&day);
-                let mut row = nav_item(t, ("daily", i as usize))
-                    .when(selected, |d| d.bg(t.sel).text_color(t.text))
-                    .when(has_note, |d| {
-                        d.child(div().w(px(7.)).h(px(7.)).flex_none().rounded_full().bg(t.amber))
-                    })
-                    .child(div().flex_1().child(day_label(day)));
-                if day == today {
-                    row = row.child(count_label(t, "today", false));
+        // The bounds store clears before the visibility checks so a hidden
+        // or collapsed section always clears its drop targets.
+        self.daily_drop_bounds.borrow_mut().clear();
+        if self.settings.show_daily {
+            let collapsed = self.section_collapsed("Daily");
+            side = side.child(
+                sechead(t, "sec-daily", "Daily", None, collapsed).on_click(cx.listener(
+                    |this, _, _, cx| this.toggle_section("Daily", cx),
+                )),
+            );
+            if !collapsed {
+                let forward = self.settings.daily_forward;
+                for i in 0..3u64 {
+                    let day = if forward { today + Days::new(i) } else { today - Days::new(i) };
+                    let selected = day == self.selected_day;
+                    let has_note = self.note_days.contains_key(&day);
+                    let is_drop = drop_day == Some(day);
+                    let bounds_store = self.daily_drop_bounds.clone();
+                    let mut row = nav_item(t, ("daily", i as usize))
+                        .relative()
+                        .when(selected, |d| d.bg(t.sel).text_color(t.text))
+                        .child(
+                            gpui::canvas(
+                                move |bounds, _, _| bounds_store.borrow_mut().push((day, bounds)),
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .size_full(),
+                        )
+                        .when(has_note, |d| {
+                            d.child(div().w(px(7.)).h(px(7.)).flex_none().rounded_full().bg(t.amber))
+                        })
+                        .child(div().flex_1().child(day_label(day)));
+                    if day == today {
+                        row = row.child(count_label(t, "today", false));
+                    }
+                    if is_drop {
+                        row = row.bg(t.sel).text_color(t.accent).border_1().border_color(t.accent);
+                    }
+                    side = side.child(row.on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_day(day, cx);
+                    })));
                 }
-                side = side.child(row.on_click(cx.listener(move |this, _, _, cx| {
-                    this.select_day(day, cx);
-                })));
             }
         }
 
         // Tasks: real counts from the daily-note scan; each row opens a view.
-        let collapsed = self.section_collapsed("Tasks");
-        side = side.child(
-            sechead(t, "sec-tasks", "Tasks", None, collapsed).on_click(cx.listener(
-                |this, _, _, cx| this.toggle_section("Tasks", cx),
-            )),
-        );
-        if !collapsed {
-            let queries = [
-                ("tasks-today", "Today", TaskQuery::Today),
-                ("tasks-open", "Open", TaskQuery::Open),
-                ("tasks-overdue", "Overdue", TaskQuery::Overdue),
-            ];
-            for (id, label, query) in queries {
-                let count = self.task_count(query);
-                let active = self.view == PaneView::Tasks(query);
-                let hot = query == TaskQuery::Overdue && count > 0;
-                side = side.child(
-                    nav_item(t, id)
-                        .when(active, |d| d.bg(t.sel).text_color(t.text))
-                        .child(div().flex_1().child(label))
-                        .child(count_label(t, &count.to_string(), hot))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_task_view(query, cx);
-                        })),
-                );
+        if self.settings.show_tasks {
+            let collapsed = self.section_collapsed("Tasks");
+            side = side.child(
+                sechead(t, "sec-tasks", "Tasks", None, collapsed).on_click(cx.listener(
+                    |this, _, _, cx| this.toggle_section("Tasks", cx),
+                )),
+            );
+            if !collapsed {
+                let queries = [
+                    ("tasks-today", "Today", TaskQuery::Today),
+                    ("tasks-open", "Open", TaskQuery::Open),
+                    ("tasks-overdue", "Overdue", TaskQuery::Overdue),
+                ];
+                for (id, label, query) in queries {
+                    let count = self.task_count(query);
+                    let active = self.view == PaneView::Tasks(query);
+                    let hot = query == TaskQuery::Overdue && count > 0;
+                    side = side.child(
+                        nav_item(t, id)
+                            .when(active, |d| d.bg(t.sel).text_color(t.text))
+                            .child(div().flex_1().child(label))
+                            .child(count_label(t, &count.to_string(), hot))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_task_view(query, cx);
+                            })),
+                    );
+                }
             }
         }
 
@@ -102,7 +143,18 @@ impl Workspace {
                             this.prompt_new_note(dir.clone(), window, cx);
                         });
                     }))
-                }),
+                })
+                .child(sechead_plus(t, "notes-plus").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.open_notes_menu(
+                            point(ev.position.x, ev.position.y + px(8.)),
+                            window,
+                            cx,
+                        );
+                    }),
+                )),
         );
         if !collapsed {
             if self.notes_tree.is_empty() {
@@ -198,7 +250,18 @@ impl Workspace {
         let collapsed = self.section_collapsed("Sessions");
         side = side.child(
             sechead(t, "sec-sessions", "Sessions", Some(session_count.to_string()), collapsed)
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_section("Sessions", cx))),
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_section("Sessions", cx)))
+                .child(sechead_plus(t, "sessions-plus").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.open_picker(
+                            point(ev.position.x, ev.position.y + px(8.)),
+                            window,
+                            cx,
+                        );
+                    }),
+                )),
         );
         if !collapsed {
             for (i, session) in self.sessions.iter().enumerate() {
@@ -227,7 +290,7 @@ impl Workspace {
                             .text_ellipsis()
                             .child(session.label()),
                     );
-                if matches!(session.kind, SessionKind::Ssh(_)) {
+                if session.kind.is_remote() {
                     row = row.child(
                         div()
                             .text_size(t.ui_px(9.5))
@@ -261,114 +324,84 @@ impl Workspace {
                     }),
                 );
             }
-            side = side.child(
-                nav_item(t, "new-session")
-                    .text_color(t.faint)
-                    .child("＋ New session…")
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                            this.open_picker(point(ev.position.x, ev.position.y + px(12.)), window, cx);
-                        }),
-                    ),
-            );
         }
 
         // Agents: recent CLI writes from the vault's activity log, quiet
         // read-only rows. The empty state stays honest when there are none.
-        let collapsed = self.section_collapsed("Agents");
-        side = side.child(
-            sechead(t, "sec-agents", "Agents", None, collapsed).on_click(cx.listener(
-                |this, _, _, cx| this.toggle_section("Agents", cx),
-            )),
-        );
-        if !collapsed {
-            if self.agent_activity.is_empty() {
-                side = side.child(
-                    div()
-                        .px(px(14.))
-                        .pb(px(16.))
-                        .text_size(t.ui_px(11.5))
-                        .text_color(t.faint)
-                        .child("No agent activity yet"),
-                );
-            }
-            for entry in &self.agent_activity {
-                let verb = match entry.action.as_str() {
-                    "add" => "added",
-                    "done" => "completed",
-                    "capture" => "captured",
-                    other => other,
-                };
-                side = side.child(
-                    div()
-                        .flex()
-                        .items_start()
-                        .gap(px(8.))
-                        .px(px(14.))
-                        .py(px(3.))
-                        .text_size(t.ui_px(11.5))
-                        .child(
-                            div()
-                                .flex_none()
-                                .font_family(t.mono_font.clone())
-                                .text_size(t.ui_px(10.5))
-                                .text_color(t.faint)
-                                .child(activity_time(&entry.ts, today)),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .flex()
-                                .gap(px(4.))
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .text_color(t.text)
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                        .child(entry.actor.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_ellipsis()
-                                        .text_color(t.dim)
-                                        .child(format!("{verb} {:?}", entry.detail)),
-                                ),
-                        ),
-                );
-            }
-            if !self.agent_activity.is_empty() {
-                side = side.child(div().pb(px(12.)));
+        // The whole section can be turned off in Settings (working fully
+        // remote leaves it permanently empty).
+        if self.settings.show_agents {
+            let collapsed = self.section_collapsed("Agents");
+            side = side.child(
+                sechead(t, "sec-agents", "Agents", None, collapsed).on_click(cx.listener(
+                    |this, _, _, cx| this.toggle_section("Agents", cx),
+                )),
+            );
+            if !collapsed {
+                if self.agent_activity.is_empty() {
+                    side = side.child(
+                        div()
+                            .px(px(14.))
+                            .pb(px(16.))
+                            .text_size(t.ui_px(11.5))
+                            .text_color(t.faint)
+                            .child("No agent activity yet"),
+                    );
+                }
+                for entry in &self.agent_activity {
+                    let verb = match entry.action.as_str() {
+                        "add" => "added",
+                        "done" => "completed",
+                        "capture" => "captured",
+                        other => other,
+                    };
+                    side = side.child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .gap(px(8.))
+                            .px(px(14.))
+                            .py(px(3.))
+                            .text_size(t.ui_px(11.5))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .font_family(t.mono_font.clone())
+                                    .text_size(t.ui_px(10.5))
+                                    .text_color(t.faint)
+                                    .child(activity_time(&entry.ts, today)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .flex()
+                                    .gap(px(4.))
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_color(t.text)
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .child(entry.actor.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_color(t.dim)
+                                            .child(format!("{verb} {:?}", entry.detail)),
+                                    ),
+                            ),
+                    );
+                }
+                if !self.agent_activity.is_empty() {
+                    side = side.child(div().pb(px(12.)));
+                }
             }
         }
-
-        // Pinned footer: the always-visible way into Settings.
-        let hover_bg = t.hover;
-        let hover_text = t.text;
-        let settings_row = div()
-            .id("sidebar-settings")
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .px(px(14.))
-            .py(px(9.))
-            .border_t_1()
-            .border_color(t.border)
-            .text_color(t.dim)
-            .cursor_pointer()
-            .hover(move |s| s.bg(hover_bg).text_color(hover_text))
-            .child(div().text_size(t.ui_px(13.)).child("⚙"))
-            .child(div().flex_1().child("Settings"))
-            .child(kbd(t, chord(",")))
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.open_settings(window, cx);
-            }));
 
         div()
             .w(px(272.))
@@ -381,10 +414,15 @@ impl Workspace {
             .border_color(t.border)
             .text_size(t.ui_px(12.5))
             .child(side)
-            .child(settings_row)
     }
 
-    fn render_calendar(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_calendar(
+        &self,
+        t: &KairnTheme,
+        drop_day: Option<NaiveDate>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        self.calendar_drop_bounds.borrow_mut().clear();
         let today = Local::now().date_naive();
         let current_first = today.with_day(1).expect("valid first of month");
         let shown_first = if self.cal_offset >= 0 {
@@ -420,6 +458,7 @@ impl Workspace {
                         // open today's daily note.
                         div()
                             .id("cal-today")
+                            .text_size(t.ui_px(15.))
                             .cursor_pointer()
                             .hover(move |s| s.text_color(today_hover))
                             .child(title)
@@ -468,17 +507,34 @@ impl Workspace {
                 let stats = self.day_stats.get(&day).copied().unwrap_or_default();
                 let overdue_open = stats.open > 0 && day < today;
 
+                let is_drop = drop_day == Some(day);
+                let bounds_store = self.calendar_drop_bounds.clone();
                 let cell = div()
                     .id(("cal-cell", (week * 7 + wd) as usize))
+                    .relative()
                     .flex_1()
                     .pt(px(2.))
-                    .pb(px(1.))
+                    .pb(px(3.))
                     .rounded(px(5.))
                     .flex()
                     .flex_col()
                     .items_center()
                     .cursor_pointer()
-                    .child(div().child(day.format("%-d").to_string()));
+                    .child(
+                        gpui::canvas(
+                            move |bounds, _, _| bounds_store.borrow_mut().push((day, bounds)),
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                    // A tight line height keeps the indicator slot snug under
+                    // the digits instead of drifting to the cell's bottom edge.
+                    .child(
+                        div()
+                            .line_height(t.ui_px(13.))
+                            .child(day.format("%-d").to_string()),
+                    );
                 let cell = if is_today {
                     cell.bg(t.amber)
                         .text_color(t.on_amber)
@@ -522,13 +578,22 @@ impl Workspace {
                         is_today,
                     ));
                 let cell = cell.child(slot);
+                // The drop ring is applied last so it wins over the today and
+                // selected treatments while a drag hovers the cell.
+                let cell = if is_drop {
+                    cell.bg(t.sel).text_color(t.accent).border_1().border_color(t.accent)
+                } else {
+                    cell
+                };
 
                 let hover_bg = t.hover;
                 row = row.child(
-                    cell.when(!is_today && !is_selected, |c| c.hover(move |s| s.bg(hover_bg)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.select_day(day, cx);
-                        })),
+                    cell.when(!is_today && !is_selected && !is_drop, |c| {
+                        c.hover(move |s| s.bg(hover_bg))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_day(day, cx);
+                    })),
                 );
             }
             cal = cal.child(row);
@@ -577,6 +642,28 @@ fn sechead(
         head = head.child(div().child(count));
     }
     head
+}
+
+/// The small + at the right edge of a section header. Callers attach the
+/// mouse-down behaviour; it must stop propagation so the header's collapse
+/// toggle doesn't also fire.
+fn sechead_plus(t: &KairnTheme, id: &'static str) -> gpui::Stateful<gpui::Div> {
+    let hover_bg = t.hover;
+    let hover_text = t.text;
+    div()
+        .id(id)
+        .flex_none()
+        .w(px(18.))
+        .h(px(18.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.))
+        .text_size(t.ui_px(14.))
+        .text_color(t.faint)
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover_bg).text_color(hover_text))
+        .child("+")
 }
 
 /// A tiny folder mark for the Notes browser, drawn with quads so no asset

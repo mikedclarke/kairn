@@ -5,7 +5,7 @@ use std::time::Duration;
 use chrono::{Local, NaiveDate};
 use gpui::{
     Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, Render, SharedString, Styled, Task, Window, div,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Task, Window, div,
     prelude::FluentBuilder as _, px,
 };
 use gpui_component::Root;
@@ -13,12 +13,11 @@ use kairn_core as notes;
 
 use crate::overlays::Overlay;
 use crate::session::{Session, SessionKind, spawn};
-use crate::theme::{self, KairnThemeExt, Mode};
+use crate::theme::{self, KairnTheme, KairnThemeExt, Mode};
 
 // The keymap (actions, chord labels) and small UI helpers are re-exported
 // here so the render modules keep one import surface for workspace types.
 pub use crate::keymap::*;
-pub use crate::ui::kbd;
 pub use kairn_core::TaskQuery;
 use kairn_core::settings::Settings;
 
@@ -49,6 +48,50 @@ pub enum PaneView {
     /// A generated list of open tasks from the daily notes.
     Tasks(TaskQuery),
 }
+
+/// The hold-for-heading gesture over a day drop target: dwelling an
+/// in-flight line drag on a day for a moment opens a menu of that day's
+/// headings; sliding onto one and releasing drops at that section's end.
+pub(crate) enum HoldState {
+    Idle,
+    /// The pointer is dwelling on a day; the timer opens the menu unless
+    /// the pointer moves away first (dropping the task cancels it).
+    Arming {
+        day: NaiveDate,
+        anchor: gpui::Point<gpui::Pixels>,
+        _timer: Task<()>,
+    },
+    Open(HoldMenu),
+}
+
+pub(crate) struct HoldMenu {
+    pub day: NaiveDate,
+    pub items: Vec<HoldItem>,
+    /// Anchor for the popup, near the pointer at open time.
+    pub origin: gpui::Point<gpui::Pixels>,
+    /// Rows' painted bounds, keyed by heading line index (`TOP_OF_NOTE` for
+    /// the synthetic first row): the release hit-tests these. The mouse
+    /// button is down throughout, so rows carry no click handlers.
+    pub item_bounds: HoldItemBounds,
+    pub menu_bounds: std::rc::Rc<std::cell::RefCell<Option<gpui::Bounds<gpui::Pixels>>>>,
+}
+
+pub(crate) type HoldItemBounds =
+    std::rc::Rc<std::cell::RefCell<Vec<(usize, gpui::Bounds<gpui::Pixels>)>>>;
+
+pub(crate) struct HoldItem {
+    pub line_idx: usize,
+    /// The raw heading line, for verify-by-content at drop time.
+    pub raw: String,
+    pub display: String,
+    pub level: u8,
+}
+
+/// Sentinel item key for the menu's "Top of note" row.
+pub(crate) const TOP_OF_NOTE: usize = usize::MAX;
+/// Most headings the hold menu lists: it can't scroll mid-drag, so the tail
+/// of a very long note is summarised instead.
+pub(crate) const HOLD_MENU_CAP: usize = 16;
 
 pub struct Workspace {
     pub settings: Settings,
@@ -125,8 +168,19 @@ pub struct Workspace {
     pub(crate) note_cache: notes::TextCache,
     /// Week-strip day cells' window bounds from the last paint, captured so
     /// a task drag can hit-test its drop day without a second layout pass.
-    pub(crate) week_strip_bounds:
-        std::rc::Rc<std::cell::RefCell<Vec<(NaiveDate, gpui::Bounds<gpui::Pixels>)>>>,
+    pub(crate) week_strip_bounds: crate::vault_state::DayBounds,
+    /// Mini-calendar day cells' window bounds, same contract as the strip.
+    pub(crate) calendar_drop_bounds: crate::vault_state::DayBounds,
+    /// Sidebar Daily rows' window bounds, same contract as the strip.
+    pub(crate) daily_drop_bounds: crate::vault_state::DayBounds,
+    /// The sidebar scroll container's window bounds this frame. Cells
+    /// scrolled out of its clip still prepaint their capture canvases, so a
+    /// sidebar drop must also fall inside this to count.
+    pub(crate) sidebar_bounds:
+        std::rc::Rc<std::cell::RefCell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    /// Hold-for-heading state: dwelling a drag on a day target for a moment
+    /// opens a menu of that day's headings to drop under.
+    pub(crate) hold: HoldState,
     _activity_timer: Task<()>,
     /// Watches the notes root so outside edits (agents, Syncthing, NotePlan
     /// elsewhere) appear without a restart. Dropped with the workspace.
@@ -184,11 +238,35 @@ impl Workspace {
 
         // Closing the window must not drop a pending edit.
         let flush = cx.weak_entity();
-        window.on_window_should_close(cx, move |_, cx| {
+        window.on_window_should_close(cx, move |window, cx| {
             flush
                 .update(cx, |ws, cx| ws.flush_note_editor(cx))
                 .ok();
-            true
+            if cfg!(target_os = "macos") {
+                // Minimize instead of destroying the window: the workspace
+                // (and its live terminal sessions) survives, and a Dock
+                // click brings it back. Destroying it leaves a windowless
+                // process the Dock can't reopen. Quit remains the way to
+                // exit. The minimize must run after this handler returns:
+                // AppKit's close-button sequence reverses a miniaturize
+                // issued from inside windowShouldClose.
+                let handle = window.window_handle();
+                cx.spawn(async move |cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                    handle
+                        .update(cx, |_, window, _| window.minimize_window())
+                        .ok();
+                })
+                .detach();
+                false
+            } else {
+                // Linux: a closed window with no Dock to reopen from would
+                // strand a headless process, so close means quit.
+                cx.quit();
+                true
+            }
         });
 
         let mut this = Self {
@@ -228,12 +306,18 @@ impl Workspace {
             daily_cache: notes::TextCache::default(),
             note_cache: notes::TextCache::default(),
             week_strip_bounds: Default::default(),
+            calendar_drop_bounds: Default::default(),
+            daily_drop_bounds: Default::default(),
+            sidebar_bounds: Default::default(),
+            hold: HoldState::Idle,
             _activity_timer: activity_timer,
             _notes_watcher: notes_watcher,
             _notes_watch_task: notes_watch_task,
         };
         this.reload_notes(cx);
-        this.spawn_session(SessionKind::Local, window, cx);
+        // No session on launch: the terminal pane opens on the start page
+        // and the first session is whatever the user picks there.
+        let _ = window;
         this
     }
 
@@ -395,6 +479,42 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Show or hide the sidebar's Agents activity section.
+    pub fn set_show_agents(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.settings.show_agents == on {
+            return;
+        }
+        self.settings.show_agents = on;
+        if let Err(e) = self.settings.save() {
+            eprintln!("kairn: failed to save settings: {e}");
+        }
+        cx.notify();
+    }
+
+    /// Show or hide the sidebar's Daily section.
+    pub fn set_show_daily(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.settings.show_daily == on {
+            return;
+        }
+        self.settings.show_daily = on;
+        if let Err(e) = self.settings.save() {
+            eprintln!("kairn: failed to save settings: {e}");
+        }
+        cx.notify();
+    }
+
+    /// Show or hide the sidebar's Tasks section.
+    pub fn set_show_tasks(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.settings.show_tasks == on {
+            return;
+        }
+        self.settings.show_tasks = on;
+        if let Err(e) = self.settings.save() {
+            eprintln!("kairn: failed to save settings: {e}");
+        }
+        cx.notify();
+    }
+
     /// Point the sidebar Daily section forward (today + next two days) or
     /// back (today + previous two).
     pub fn set_daily_forward(&mut self, forward: bool, cx: &mut Context<Self>) {
@@ -501,11 +621,30 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.kairn().clone();
 
+        // The hold menu lives only as long as its drag: mouse-up and Escape
+        // end the drag in the editor, and this render-side sweep folds the
+        // menu (and any armed timer) the frame after.
+        if !matches!(self.hold, HoldState::Idle) {
+            let drag_live = self
+                .note_editor
+                .as_ref()
+                .is_some_and(|e| e.read(cx).line_drag().is_some());
+            if !drag_live {
+                self.hold = HoldState::Idle;
+            }
+        }
+
         let mut body = div().flex().flex_1().min_h(px(0.));
         // Writing is the focused layout: the note at a comfortable measure,
         // no sidebar.
         if self.sidebar_open && self.layout != LayoutMode::Writing {
             body = body.child(self.render_sidebar(&t, cx));
+        } else {
+            // No sidebar this frame: its drop targets must not linger as
+            // invisible hit zones for an in-flight drag.
+            self.sidebar_bounds.borrow_mut().take();
+            self.calendar_drop_bounds.borrow_mut().clear();
+            self.daily_drop_bounds.borrow_mut().clear();
         }
         body = body.child(self.render_main(&t, window, cx));
 
@@ -544,33 +683,166 @@ impl Render for Workspace {
             .on_key_down(cx.listener(Self::on_key_down))
             .child(self.render_titlebar(&t, cx))
             .child(body)
+            .child(self.render_settings_fab(&t, cx))
             .children(self.render_statusbar(&t, cx))
             .children(self.render_picker(&t, window, cx))
+            .children(self.render_notes_menu(&t, window, cx))
             .children(self.render_switcher(&t, cx))
             .children(self.render_capture(&t, cx))
             .children(self.render_drag_ghost(&t, cx))
+            .children(self.render_hold_menu(&t, window, cx))
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_notification_layer(window, cx))
     }
 }
 
 impl Workspace {
-    /// The floating ghost that follows a task's drag-to-reschedule: a small
-    /// card with the task's text, offset from the pointer so it never sits
-    /// under it (which would block the week strip's hit-testing).
+    /// The way into Settings: a floating gear pinned to the window's
+    /// bottom-left corner, above the pane content but under every overlay.
+    fn render_settings_fab(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {
+        let hover_bg = t.hover;
+        let hover_text = t.text;
+        div()
+            .id("settings-fab")
+            .absolute()
+            .left(px(10.))
+            .bottom(px(10.))
+            .size(px(30.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .bg(t.panel2)
+            .border_1()
+            .border_color(t.border)
+            .shadow_md()
+            .text_size(t.ui_px(14.))
+            .text_color(t.dim)
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover_bg).text_color(hover_text))
+            .child("⚙")
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_settings(window, cx);
+            }))
+    }
+
+    /// The hold-for-heading menu: a floating card of the target day's
+    /// headings while a drag dwells on its day cell. Rows carry no click
+    /// handlers (the mouse button is down for the whole gesture) — their
+    /// painted bounds are captured and the release hit-tests them.
+    fn render_hold_menu(
+        &self,
+        t: &theme::KairnTheme,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let HoldState::Open(menu) = &self.hold else { return None };
+        let (_, _, position) = self.note_editor.as_ref()?.read(cx).line_drag()?;
+        let hovered = menu
+            .item_bounds
+            .borrow()
+            .iter()
+            .find(|(_, b)| b.contains(&position))
+            .map(|(idx, _)| *idx);
+        menu.item_bounds.borrow_mut().clear();
+
+        const MENU_W: f32 = 230.;
+        let row_h = 26.;
+        let shown = menu.items.len().min(HOLD_MENU_CAP);
+        let truncated = menu.items.len() - shown;
+        let approx_h = px(12. + row_h * (shown + 1 + usize::from(truncated > 0)) as f32);
+        let viewport = window.viewport_size();
+        let x = menu.origin.x.min(viewport.width - px(MENU_W + 8.)).max(px(8.));
+        let y = menu.origin.y.min(viewport.height - approx_h - px(8.)).max(px(8.));
+
+        let menu_store = menu.menu_bounds.clone();
+        let mut card = div()
+            .absolute()
+            .left(x)
+            .top(y)
+            .w(px(MENU_W))
+            .py(px(6.))
+            .rounded(px(10.))
+            .bg(t.panel)
+            .border_1()
+            .border_color(t.border)
+            .shadow_lg()
+            .text_size(t.ui_px(12.))
+            .text_color(t.dim)
+            .child(
+                gpui::canvas(
+                    move |bounds, _, _| {
+                        menu_store.borrow_mut().replace(bounds);
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            );
+
+        let row = |key: usize, indent: f32, label: String, faint: bool| {
+            let bounds_store = menu.item_bounds.clone();
+            let is_hover = hovered == Some(key);
+            div()
+                .relative()
+                .h(px(row_h))
+                .flex()
+                .items_center()
+                .mx(px(5.))
+                .pl(px(9. + indent))
+                .pr(px(9.))
+                .rounded(px(6.))
+                .when(is_hover, |d| d.bg(t.sel).text_color(t.accent))
+                .when(faint, |d| d.text_color(t.faint))
+                .child(
+                    gpui::canvas(
+                        move |bounds, _, _| bounds_store.borrow_mut().push((key, bounds)),
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+                .child(label)
+        };
+
+        card = card.child(row(TOP_OF_NOTE, 0., "↑  Top of note".into(), false));
+        let min_level = menu.items.iter().map(|i| i.level).min().unwrap_or(1);
+        for item in menu.items.iter().take(HOLD_MENU_CAP) {
+            let indent = f32::from(item.level.saturating_sub(min_level)) * 10.;
+            card = card.child(row(item.line_idx, indent, item.display.clone(), false));
+        }
+        if truncated > 0 {
+            card = card.child(
+                div()
+                    .h(px(row_h))
+                    .flex()
+                    .items_center()
+                    .pl(px(14.))
+                    .text_color(t.faint)
+                    .child(format!("… {truncated} more")),
+            );
+        }
+        Some(card)
+    }
+
+    /// The floating ghost that follows a line drag: a small card with the
+    /// block's first line, offset from the pointer so it never sits under it
+    /// (which would block the drop targets' hit-testing).
     fn render_drag_ghost(
         &self,
         t: &theme::KairnTheme,
         cx: &Context<Self>,
     ) -> Option<impl IntoElement> {
-        let (line, position) = self.note_editor.as_ref()?.read(cx).task_drag()?;
+        let (line, extra, position) = self.note_editor.as_ref()?.read(cx).line_drag()?;
         let text = line.trim_start();
-        let text = ["* ", "+ ", "- "]
+        let is_task = ["* ", "+ "].iter().any(|m| text.starts_with(m));
+        let text = ["* ", "+ ", "- ", "> "]
             .iter()
             .find_map(|m| text.strip_prefix(m))
             .unwrap_or(text)
             .trim_start();
         let text = text.strip_prefix("[ ]").map(str::trim_start).unwrap_or(text);
+        let text = text.trim_start_matches('#').trim_start();
         let text: String = text.chars().take(48).collect();
         Some(
             div()
@@ -589,16 +861,30 @@ impl Workspace {
                 .shadow_md()
                 .text_size(t.ui_px(12.))
                 .text_color(t.dim)
-                .child(
-                    div()
-                        .w(px(10.))
-                        .h(px(10.))
-                        .flex_none()
-                        .rounded(px(3.))
-                        .border_1()
-                        .border_color(t.faint),
-                )
-                .child(text),
+                .when(is_task, |d| {
+                    d.child(
+                        div()
+                            .w(px(10.))
+                            .h(px(10.))
+                            .flex_none()
+                            .rounded(px(3.))
+                            .border_1()
+                            .border_color(t.faint),
+                    )
+                })
+                .child(text)
+                .when(extra > 0, |d| {
+                    d.child(
+                        div()
+                            .flex_none()
+                            .px(px(5.))
+                            .rounded(px(4.))
+                            .bg(t.sel)
+                            .text_size(t.ui_px(10.))
+                            .text_color(t.faint)
+                            .child(format!("+{extra}")),
+                    )
+                }),
         )
     }
 }

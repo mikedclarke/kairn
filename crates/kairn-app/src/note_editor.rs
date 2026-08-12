@@ -29,9 +29,13 @@ use kairn_core as notes;
 use notes::{Line, NoteBuffer, SpanKind, TaskState};
 
 use crate::keymap::{
-    EditorBackspace, EditorCopy, EditorCut, EditorDelete, EditorDown, EditorEnter, EditorLeft,
-    EditorPaste, EditorRedo, EditorRight, EditorSelectAll, EditorSelectDown, EditorSelectLeft,
-    EditorSelectRight, EditorSelectUp, EditorUndo, EditorUp,
+    EditorBackspace, EditorCopy, EditorCut, EditorDelete, EditorDeleteToLineStart,
+    EditorDeleteWordBack, EditorDocEnd, EditorDocStart, EditorDown, EditorEnter, EditorLeft,
+    EditorLineEnd, EditorLineStart, EditorPaste, EditorRedo, EditorRight, EditorSelectAll,
+    EditorSelectDocEnd, EditorSelectDocStart, EditorSelectDown, EditorSelectLeft,
+    EditorSelectLineEnd, EditorSelectLineStart, EditorSelectRight, EditorSelectUp,
+    EditorSelectWordLeft, EditorSelectWordRight, EditorUndo, EditorUp, EditorWordLeft,
+    EditorWordRight,
 };
 use crate::theme::{self, KairnTheme, KairnThemeExt as _};
 
@@ -41,6 +45,10 @@ const CURSOR_WIDTH: Pixels = px(2.);
 const BLINK_MS: u64 = 550;
 /// Pointer travel before a glyph press becomes a line drag, not a click.
 const DRAG_THRESHOLD: Pixels = px(3.);
+/// The handle gutter left of every line, at the base editor size: the grab
+/// zone for dragging any line. Scales with the editor size like the glyph
+/// indents.
+const HANDLE_GUTTER: f32 = 18.;
 
 pub enum NoteEditorEvent {
     /// The editor wrote its file; the workspace should note the self-write
@@ -52,9 +60,12 @@ pub enum NoteEditorEvent {
     OpenWikiLink(String),
     OpenDate(chrono::NaiveDate),
     OpenUrl(String),
-    /// An open task's glyph drag was released outside the editor; the
-    /// workspace reschedules if the pointer sat on a week-strip day.
-    TaskDropped { line_start: usize, position: Point<Pixels> },
+    /// A line drag was released outside the editor; the workspace moves the
+    /// block if the pointer sat on a day drop target.
+    BlockDropped { range: Range<usize>, position: Point<Pixels> },
+    /// A moved line drag's pointer position, every move: the workspace's
+    /// hold-menu state machine ticks on these.
+    DragMoved { position: Point<Pixels> },
 }
 
 pub struct NoteEditor {
@@ -68,10 +79,13 @@ pub struct NoteEditor {
     selection_anchor: Option<usize>,
     /// A mouse drag-select is in progress (mouse down through mouse up).
     selecting: bool,
-    /// An in-flight drag that started on a line's glyph: released in place
-    /// it toggles open/done tasks; moved past the threshold it reorders the
-    /// line.
-    glyph_drag: Option<GlyphDrag>,
+    /// An in-flight drag that started on a line's handle or glyph: released
+    /// in place a glyph grab toggles open/done tasks; moved past the
+    /// threshold it drags the line's block.
+    line_drag: Option<LineDrag>,
+    /// Line-start offset of the line under the pointer, for the hover-
+    /// revealed drag handle in the gutter.
+    hovered_line: Option<usize>,
     ime_marked: Option<Range<usize>>,
     /// The clickable span under the pointer, underlined so links read as
     /// links: the line's start offset and the span's display-char range.
@@ -99,6 +113,9 @@ pub struct NoteEditor {
 
 pub(crate) struct EditorLayout {
     pub bounds: Bounds<Pixels>,
+    /// Width of the handle gutter at the current editor size; every entry's
+    /// `indent` already includes it.
+    pub gutter: Pixels,
     pub slots: Vec<LineSlot>,
 }
 
@@ -119,19 +136,21 @@ impl LineSlot {
     }
 }
 
-struct GlyphDrag {
-    /// Line-start offset of the dragged line at mouse down.
-    line_start: usize,
+struct LineDrag {
+    /// Byte range of the dragged block at mouse down: the grabbed line plus
+    /// its deeper-indented run (`block_range`), final newline excluded.
+    range: Range<usize>,
     origin: Point<Pixels>,
     /// Where the pointer is now, window coordinates: the workspace reads it
-    /// to place the drag ghost and light up week-strip drop targets.
+    /// to place the drag ghost and light up day drop targets.
     position: Point<Pixels>,
     moved: bool,
-    /// Whether releasing without moving toggles the task.
+    /// Whether releasing without moving toggles the task (glyph grabs on
+    /// open/done tasks).
     toggles: bool,
-    /// The dragged line is an open task: leaving the editor turns the drag
-    /// into a reschedule instead of a reorder.
-    open_task: bool,
+    /// The grab started on the handle gutter, where releasing in place is a
+    /// no-op, rather than on a task/bullet glyph.
+    from_handle: bool,
     /// Drop position for a reorder: a line-start offset (or the text length
     /// for the end); `None` while the pointer is outside the editor.
     target: Option<usize>,
@@ -154,8 +173,13 @@ pub(crate) struct ShapedEntry {
     pub pad_bottom: Pixels,
     pub indent: Pixels,
     pub glyph: Glyph,
-    /// Shaped from raw markdown (the cursor line).
+    /// Shaped with inline markers revealed (the cursor line).
     pub active: bool,
+    /// Raw bytes hidden at the start of an active line (the list marker or
+    /// quote prefix, whose glyph stays painted instead): display index i is
+    /// raw column i + prefix_len. Zero on inactive lines, whose mapping goes
+    /// through the span math.
+    pub prefix_len: usize,
 }
 
 #[derive(Default)]
@@ -180,21 +204,79 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Start of the word (or punctuation run) left of `offset`, skipping any
+/// whitespace first; crosses newlines like the platform text engines do.
+fn prev_word_boundary(text: &str, offset: usize) -> usize {
+    let mut i = offset.min(text.len());
+    let mut chars = text[..i].chars().rev().peekable();
+    while let Some(&c) = chars.peek() {
+        if !c.is_whitespace() {
+            break;
+        }
+        i -= c.len_utf8();
+        chars.next();
+    }
+    let Some(&first) = chars.peek() else { return i };
+    let word = is_word_char(first);
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() || is_word_char(c) != word {
+            break;
+        }
+        i -= c.len_utf8();
+        chars.next();
+    }
+    i
+}
+
+/// End of the word (or punctuation run) right of `offset`, skipping any
+/// whitespace first.
+fn next_word_boundary(text: &str, offset: usize) -> usize {
+    let mut i = offset.min(text.len());
+    let mut chars = text[i..].chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if !c.is_whitespace() {
+            break;
+        }
+        i += c.len_utf8();
+        chars.next();
+    }
+    let Some(&first) = chars.peek() else { return i };
+    let word = is_word_char(first);
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() || is_word_char(c) != word {
+            break;
+        }
+        i += c.len_utf8();
+        chars.next();
+    }
+    i
+}
+
 impl NoteEditor {
-    /// `text` is the document as read from disk (or the rendered template
-    /// for a day with no file yet); `path` is where saves go, which may not
-    /// exist until the first save creates it.
-    pub fn new(path: PathBuf, text: &str, cx: &mut Context<Self>) -> Self {
+    /// `text` is the document as read from disk; `seed` is content rendered
+    /// over a blank day (the daily template), kept out of the disk baseline
+    /// and written only once a real edit lands; `path` is where saves go,
+    /// which may not exist until the first save creates it.
+    pub fn new(path: PathBuf, text: &str, seed: Option<&str>, cx: &mut Context<Self>) -> Self {
         let crlf = text.contains("\r\n");
         let text = if crlf { text.replace("\r\n", "\n") } else { text.to_string() };
+        let buffer = match seed {
+            Some(seed) => NoteBuffer::with_seed(text, seed),
+            None => NoteBuffer::new(text),
+        };
         Self {
             path,
-            buffer: NoteBuffer::new(text),
+            buffer,
             crlf,
             cursor: 0,
             selection_anchor: None,
             selecting: false,
-            glyph_drag: None,
+            line_drag: None,
+            hovered_line: None,
             ime_marked: None,
             hovered_link: None,
             menu_link: None,
@@ -252,11 +334,12 @@ impl NoteEditor {
     }
 
     /// An external change shifted the text under us: any selection or
-    /// in-flight glyph drag holds stale byte offsets, so let go of them.
+    /// in-flight line drag holds stale byte offsets, so let go of them.
     fn drop_stale_offsets(&mut self) {
         self.selection_anchor = None;
         self.selecting = false;
-        self.glyph_drag = None;
+        self.line_drag = None;
+        self.hovered_line = None;
         self.hovered_link = None;
     }
 
@@ -392,6 +475,41 @@ impl NoteEditor {
         text[offset..].chars().next().map_or(text.len(), |c| offset + c.len_utf8())
     }
 
+    /// Content start of the line spanning `line`, when that line hides its
+    /// marker behind a glyph (task, bullet, quote): the region before it is
+    /// invisible, so the cursor must never sit inside it.
+    fn hidden_marker_end(&self, line: &Range<usize>) -> Option<usize> {
+        let raw = &self.text()[line.clone()];
+        matches!(
+            notes::parse_line(raw),
+            Line::Task { .. } | Line::Bullet { .. } | Line::Quote { .. }
+        )
+        .then(|| line.start + notes::content_start_col(raw).min(raw.len()))
+        .filter(|cs| *cs > line.start)
+    }
+
+    /// Clamp an offset out of a hidden marker, forward onto the content.
+    fn snap_to_content(&self, offset: usize) -> usize {
+        let line = self.line_range_at(offset);
+        match self.hidden_marker_end(&line) {
+            Some(cs) if offset < cs => cs,
+            _ => offset,
+        }
+    }
+
+    /// Where a plain left-arrow goes: the previous character, except that a
+    /// hidden marker is atomic — from its content start the cursor hops to
+    /// the previous line's end.
+    fn left_target(&self) -> usize {
+        let line = self.line_range_at(self.cursor);
+        if let Some(cs) = self.hidden_marker_end(&line)
+            && self.cursor <= cs
+        {
+            return if line.start > 0 { line.start - 1 } else { self.cursor };
+        }
+        self.prev_char_start(self.cursor)
+    }
+
     // --- selection ---------------------------------------------------------
 
     fn selection(&self) -> Option<Range<usize>> {
@@ -407,7 +525,7 @@ impl NoteEditor {
         } else {
             self.selection_anchor = None;
         }
-        self.cursor = target.min(self.text().len());
+        self.cursor = self.snap_to_content(target.min(self.text().len()));
         self.after_cursor_move(cx);
     }
 
@@ -477,6 +595,19 @@ impl NoteEditor {
         if self.cursor == 0 {
             return;
         }
+        // At the content start of a glyph line the marker is atomic: one
+        // press removes the whole checkbox/bullet/quote prefix, leaving a
+        // plain line.
+        let line = self.line_range_at(self.cursor);
+        if let Some(cs) = self.hidden_marker_end(&line)
+            && self.cursor <= cs
+        {
+            self.buffer.break_undo_group();
+            self.cursor = self.buffer.edit(line.start..cs, "", self.cursor, now_ms());
+            self.buffer.break_undo_group();
+            self.after_edit(cx);
+            return;
+        }
         let prev = self.prev_char_start(self.cursor);
         self.cursor = self.buffer.edit(prev..self.cursor, "", self.cursor, now_ms());
         self.after_edit(cx);
@@ -498,7 +629,7 @@ impl NoteEditor {
     fn on_left(&mut self, _: &EditorLeft, _: &mut Window, cx: &mut Context<Self>) {
         let target = match self.selection() {
             Some(sel) => sel.start,
-            None => self.prev_char_start(self.cursor),
+            None => self.left_target(),
         };
         self.move_cursor_to(target, false, cx);
     }
@@ -520,7 +651,7 @@ impl NoteEditor {
     }
 
     fn on_select_left(&mut self, _: &EditorSelectLeft, _: &mut Window, cx: &mut Context<Self>) {
-        let target = self.prev_char_start(self.cursor);
+        let target = self.left_target();
         self.move_cursor_to(target, true, cx);
     }
 
@@ -535,6 +666,162 @@ impl NoteEditor {
 
     fn on_select_down(&mut self, _: &EditorSelectDown, _: &mut Window, cx: &mut Context<Self>) {
         self.move_vertical(1, true, cx);
+    }
+
+    /// Word-left, with a hidden marker treated as part of the gap between
+    /// lines: from a glyph line's content start the step continues from the
+    /// line start, so it lands on the previous line's last word.
+    fn word_left_target(&self) -> usize {
+        let mut from = self.cursor;
+        let line = self.line_range_at(from);
+        if let Some(cs) = self.hidden_marker_end(&line)
+            && from <= cs
+        {
+            from = line.start;
+        }
+        prev_word_boundary(self.text(), from)
+    }
+
+    fn on_word_left(&mut self, _: &EditorWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        let target = self.word_left_target();
+        self.move_cursor_to(target, false, cx);
+    }
+
+    fn on_word_right(&mut self, _: &EditorWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        let target = next_word_boundary(self.text(), self.cursor);
+        self.move_cursor_to(target, false, cx);
+    }
+
+    fn on_select_word_left(
+        &mut self,
+        _: &EditorSelectWordLeft,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.word_left_target();
+        self.move_cursor_to(target, true, cx);
+    }
+
+    fn on_select_word_right(
+        &mut self,
+        _: &EditorSelectWordRight,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = next_word_boundary(self.text(), self.cursor);
+        self.move_cursor_to(target, true, cx);
+    }
+
+    /// Line-start for the home motion: the visible start of the line, which
+    /// on a glyph line is its content start.
+    fn line_home_target(&self) -> usize {
+        let line = self.line_range_at(self.cursor);
+        self.hidden_marker_end(&line).unwrap_or(line.start)
+    }
+
+    fn on_line_start(&mut self, _: &EditorLineStart, _: &mut Window, cx: &mut Context<Self>) {
+        let target = self.line_home_target();
+        self.move_cursor_to(target, false, cx);
+    }
+
+    fn on_line_end(&mut self, _: &EditorLineEnd, _: &mut Window, cx: &mut Context<Self>) {
+        let target = self.line_range_at(self.cursor).end;
+        self.move_cursor_to(target, false, cx);
+    }
+
+    fn on_select_line_start(
+        &mut self,
+        _: &EditorSelectLineStart,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.line_home_target();
+        self.move_cursor_to(target, true, cx);
+    }
+
+    fn on_select_line_end(
+        &mut self,
+        _: &EditorSelectLineEnd,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.line_range_at(self.cursor).end;
+        self.move_cursor_to(target, true, cx);
+    }
+
+    fn on_doc_start(&mut self, _: &EditorDocStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_cursor_to(0, false, cx);
+    }
+
+    fn on_doc_end(&mut self, _: &EditorDocEnd, _: &mut Window, cx: &mut Context<Self>) {
+        let target = self.text().len();
+        self.move_cursor_to(target, false, cx);
+    }
+
+    fn on_select_doc_start(
+        &mut self,
+        _: &EditorSelectDocStart,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_cursor_to(0, true, cx);
+    }
+
+    fn on_select_doc_end(
+        &mut self,
+        _: &EditorSelectDocEnd,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.text().len();
+        self.move_cursor_to(target, true, cx);
+    }
+
+    fn on_delete_word_back(
+        &mut self,
+        _: &EditorDeleteWordBack,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.delete_selection() {
+            self.after_edit(cx);
+            return;
+        }
+        let target = self.word_left_target();
+        if target >= self.cursor {
+            return;
+        }
+        self.buffer.break_undo_group();
+        self.cursor = self.buffer.edit(target..self.cursor, "", self.cursor, now_ms());
+        self.buffer.break_undo_group();
+        self.after_edit(cx);
+    }
+
+    fn on_delete_to_line_start(
+        &mut self,
+        _: &EditorDeleteToLineStart,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.delete_selection() {
+            self.after_edit(cx);
+            return;
+        }
+        let line = self.line_range_at(self.cursor);
+        // At a glyph line's content start there is nothing visible left of
+        // the caret but the marker itself, so the press removes it.
+        let target = match self.hidden_marker_end(&line) {
+            Some(cs) if self.cursor <= cs => line.start,
+            Some(cs) => cs,
+            None => line.start,
+        };
+        if target >= self.cursor {
+            return;
+        }
+        self.buffer.break_undo_group();
+        self.cursor = self.buffer.edit(target..self.cursor, "", self.cursor, now_ms());
+        self.buffer.break_undo_group();
+        self.after_edit(cx);
     }
 
     fn on_select_all(&mut self, _: &EditorSelectAll, _: &mut Window, cx: &mut Context<Self>) {
@@ -585,7 +872,7 @@ impl NoteEditor {
         let col = self.text()[line.start..self.cursor].chars().count();
         let target_start = if delta < 0 {
             if line.start == 0 {
-                self.cursor = 0;
+                self.cursor = self.snap_to_content(0);
                 self.after_cursor_move(cx);
                 return;
             }
@@ -603,7 +890,7 @@ impl NoteEditor {
             .char_indices()
             .nth(col)
             .map_or(target.end, |(i, _)| target.start + i);
-        self.cursor = byte;
+        self.cursor = self.snap_to_content(byte);
         self.after_cursor_move(cx);
     }
 
@@ -713,7 +1000,8 @@ impl NoteEditor {
         cx: &mut Context<Self>,
     ) {
         enum Click {
-            Glyph { line_start: usize, toggles: bool, open_task: bool },
+            Handle { line_start: usize },
+            Glyph { line_start: usize, toggles: bool },
             Nav(notes::LinkTarget),
             Cursor(usize),
         }
@@ -728,9 +1016,16 @@ impl NoteEditor {
                     continue;
                 }
                 let raw_line = &self.text()[slot.raw_start..slot.raw_start + slot.raw_len];
+                // The handle gutter: any non-blank line picks up for a drag.
+                if pos.x < layout.bounds.origin.x + layout.gutter {
+                    if !raw_line.trim().is_empty() {
+                        click = Click::Handle { line_start: slot.raw_start };
+                        break;
+                    }
+                }
                 // The glyph column of a task or bullet line: a press-and-
-                // release toggles (open/done tasks); a drag reorders the line.
-                if matches!(slot.entry.glyph, Glyph::Task(_) | Glyph::Bullet)
+                // release toggles (open/done tasks); a drag moves the block.
+                else if matches!(slot.entry.glyph, Glyph::Task(_) | Glyph::Bullet)
                     && pos.x < layout.bounds.origin.x + slot.entry.indent
                 {
                     click = Click::Glyph {
@@ -739,7 +1034,6 @@ impl NoteEditor {
                             slot.entry.glyph,
                             Glyph::Task(TaskState::Open | TaskState::Done)
                         ),
-                        open_task: matches!(slot.entry.glyph, Glyph::Task(TaskState::Open)),
                     };
                     break;
                 }
@@ -764,7 +1058,7 @@ impl NoteEditor {
                         }
                         notes::raw_col_for_display_char(raw_line, display_chars)
                     }
-                    Some(raw_ix) => raw_ix.min(raw_line.len()),
+                    Some(ix) => (slot.entry.prefix_len + ix).min(raw_line.len()),
                     // Past the end of the line's text: cursor to line end.
                     None => raw_line.len(),
                 };
@@ -774,14 +1068,25 @@ impl NoteEditor {
             click
         };
         match click {
-            Click::Glyph { line_start, toggles, open_task } => {
-                self.glyph_drag = Some(GlyphDrag {
-                    line_start,
+            Click::Handle { line_start } => {
+                self.line_drag = Some(LineDrag {
+                    range: notes::block_range(self.text(), line_start),
+                    origin: event.position,
+                    position: event.position,
+                    moved: false,
+                    toggles: false,
+                    from_handle: true,
+                    target: None,
+                });
+            }
+            Click::Glyph { line_start, toggles } => {
+                self.line_drag = Some(LineDrag {
+                    range: notes::block_range(self.text(), line_start),
                     origin: event.position,
                     position: event.position,
                     moved: false,
                     toggles,
-                    open_task,
+                    from_handle: false,
                     target: None,
                 });
             }
@@ -821,12 +1126,12 @@ impl NoteEditor {
     }
 
     /// Window-level mouse move while the primary button is down: extends a
-    /// drag-select or tracks a glyph drag, wherever the pointer goes.
+    /// drag-select or tracks a line drag, wherever the pointer goes.
     fn on_drag_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        if self.glyph_drag.is_none() && !self.selecting {
+        if self.line_drag.is_none() && !self.selecting {
             return;
         }
-        if let Some(mut drag) = self.glyph_drag.take() {
+        if let Some(mut drag) = self.line_drag.take() {
             let delta = event.position - drag.origin;
             if !drag.moved
                 && (delta.x.abs() > DRAG_THRESHOLD || delta.y.abs() > DRAG_THRESHOLD)
@@ -844,9 +1149,10 @@ impl NoteEditor {
                     .as_ref()
                     .is_some_and(|l| l.bounds.contains(&event.position));
                 drag.target = inside.then(|| self.drop_target_for_y(event.position.y));
+                cx.emit(NoteEditorEvent::DragMoved { position: event.position });
                 cx.notify();
             }
-            self.glyph_drag = Some(drag);
+            self.line_drag = Some(drag);
             return;
         }
         if self.selecting
@@ -860,23 +1166,34 @@ impl NoteEditor {
         }
     }
 
-    fn on_mouse_up(&mut self, cx: &mut Context<Self>) {
-        if let Some(drag) = self.glyph_drag.take() {
+    fn on_mouse_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(drag) = self.line_drag.take() {
             if !drag.moved {
-                if drag.toggles {
-                    let line = self.line_range_at(drag.line_start);
+                if drag.from_handle {
+                    // A handle press-and-release does nothing: the handle is
+                    // purely a grab point.
+                } else if drag.toggles {
+                    let line = self.line_range_at(drag.range.start);
                     self.toggle_task_in(line, cx);
+                } else {
+                    // A glyph without a toggle (bullet, scheduled or
+                    // cancelled task): the click still lands the cursor at
+                    // the line's content instead of dying.
+                    let line = self.line_range_at(drag.range.start);
+                    let target = self.hidden_marker_end(&line).unwrap_or(line.start);
+                    window.focus(&self.focus_handle);
+                    self.move_cursor_to(target, false, cx);
                 }
             } else if let Some(target) = drag.target {
                 let new_start =
-                    self.buffer.move_line(drag.line_start, target, self.cursor, now_ms());
+                    self.buffer.move_block(drag.range, target, self.cursor, now_ms());
                 self.cursor = new_start;
                 self.after_edit(cx);
-            } else if drag.open_task {
+            } else {
                 // Released outside the editor: the workspace decides whether
-                // the pointer was over a reschedule target.
-                cx.emit(NoteEditorEvent::TaskDropped {
-                    line_start: drag.line_start,
+                // the pointer was over a day drop target.
+                cx.emit(NoteEditorEvent::BlockDropped {
+                    range: drag.range,
                     position: drag.position,
                 });
             }
@@ -924,7 +1241,7 @@ impl NoteEditor {
                 })
                 .unwrap_or(0);
             let raw_col = if slot.entry.active {
-                ix.min(raw_line.len())
+                (slot.entry.prefix_len + ix).min(raw_line.len())
             } else {
                 let chars = slot.entry.display.get(..ix).map_or(0, |s| s.chars().count());
                 notes::raw_col_for_display_char(raw_line, chars)
@@ -982,12 +1299,26 @@ impl NoteEditor {
         None
     }
 
-    /// Mouse movement with no button down: track the hovered link, repainting
-    /// only when it actually changes.
+    /// Mouse movement with no button down: track the hovered link and the
+    /// hovered line (for its drag handle), repainting only on change.
     fn on_hover_move(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
         let target = self.hover_target(pos);
         if target != self.hovered_link {
             self.hovered_link = target;
+            cx.notify();
+        }
+        let line = {
+            let layout = self.layout.borrow();
+            layout.as_ref().filter(|l| l.bounds.contains(&pos)).and_then(|l| {
+                l.slots.iter().find(|slot| {
+                    let top = l.bounds.origin.y + slot.y;
+                    pos.y >= top && pos.y < top + slot.height
+                })
+            })
+            .map(|slot| slot.raw_start)
+        };
+        if line != self.hovered_line {
+            self.hovered_line = line;
             cx.notify();
         }
     }
@@ -999,32 +1330,82 @@ impl NoteEditor {
         self.after_edit(cx);
     }
 
-    /// The in-flight glyph drag of an open task, once it has actually moved:
-    /// the task's text and the pointer's window position. The workspace
-    /// reads this to draw the drag ghost and light week-strip drop targets.
-    pub fn task_drag(&self) -> Option<(String, Point<Pixels>)> {
-        let drag = self.glyph_drag.as_ref()?;
-        if !drag.moved || !drag.open_task {
+    /// The in-flight line drag, once it has actually moved: the block's
+    /// first line, how many further lines travel with it, and the pointer's
+    /// window position. The workspace reads this to draw the drag ghost and
+    /// light day drop targets.
+    pub fn line_drag(&self) -> Option<(String, usize, Point<Pixels>)> {
+        let drag = self.line_drag.as_ref()?;
+        if !drag.moved {
             return None;
         }
-        let range = self.line_range_at(drag.line_start);
-        Some((self.text()[range].to_string(), drag.position))
+        let block = &self.text()[drag.range.clone()];
+        let mut lines = block.split('\n');
+        let first = lines.next().unwrap_or("").to_string();
+        Some((first, lines.count(), drag.position))
     }
 
-    /// Set the due date of the task line at `line_start`, as an ordinary
-    /// undoable buffer edit that autosaves like typing: the drop half of
-    /// drag-to-reschedule.
-    pub fn reschedule_line_at(
-        &mut self,
-        line_start: usize,
-        due: chrono::NaiveDate,
-        cx: &mut Context<Self>,
-    ) {
-        let range = self.line_range_at(line_start);
-        let line = self.text()[range.clone()].to_string();
-        let Some(updated) = notes::reschedule_task_line(&line, due) else { return };
-        self.buffer.edit(range, &updated, self.cursor, now_ms());
+    /// The text of a block the editor reported dropped, for the workspace's
+    /// cross-note move.
+    pub fn block_text(&self, range: Range<usize>) -> String {
+        let len = self.text().len();
+        self.text()[range.start.min(len)..range.end.min(len)].to_string()
+    }
+
+    /// The buffer's current text: the live document, ahead of whatever the
+    /// autosave has flushed to disk.
+    pub fn doc(&self) -> &str {
+        self.text()
+    }
+
+    /// Remove a dropped block from this note (the source half of a move to
+    /// another day), together with the newline that separated it from its
+    /// neighbours. One undoable step.
+    pub fn remove_block(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
+        let len = self.text().len();
+        let mut start = range.start.min(len);
+        let mut end = range.end.min(len).max(start);
+        if end < len {
+            end += 1;
+        } else {
+            // The block ends the file: take the preceding newline so the
+            // remaining last line keeps the no-trailing-newline convention.
+            start = start.saturating_sub(1);
+        }
+        self.cursor = self.buffer.edit(start..end, "", self.cursor, now_ms());
         self.after_edit(cx);
+    }
+
+    /// Move a block within this note to the line boundary `target` (the
+    /// in-buffer half of a drop on the note's own day). One undoable step.
+    pub fn move_block_to(&mut self, range: Range<usize>, target: usize, cx: &mut Context<Self>) {
+        self.cursor = self.buffer.move_block(range, target, self.cursor, now_ms());
+        self.after_edit(cx);
+    }
+
+    /// Abandon any in-flight line drag (Escape): nothing has been edited
+    /// yet, so letting go of the state is the whole cancel.
+    pub fn cancel_drag(&mut self, cx: &mut Context<Self>) {
+        if self.line_drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The hovered line's slot geometry (content-relative y, height) when
+    /// its drag handle should show: a non-blank line with no drag in flight.
+    fn hover_handle_slot(&self) -> Option<(Pixels, Pixels)> {
+        if self.line_drag.is_some() {
+            return None;
+        }
+        let start = self.hovered_line?;
+        let layout = self.layout.borrow();
+        let layout = layout.as_ref()?;
+        let slot = layout.slots.iter().find(|s| s.raw_start == start)?;
+        let raw = &self.text()[slot.raw_start..slot.raw_start + slot.raw_len];
+        if raw.trim().is_empty() {
+            return None;
+        }
+        Some((slot.y, slot.height))
     }
 
     // --- layout ------------------------------------------------------------
@@ -1062,7 +1443,8 @@ impl NoteEditor {
         }
         let mut layout = self.layout.borrow_mut();
         let bounds = layout.as_ref().map(|l| l.bounds).unwrap_or_default();
-        *layout = Some(EditorLayout { bounds, slots });
+        let gutter = px(HANDLE_GUTTER * (t.editor_size / theme::EDITOR_BASE_SIZE));
+        *layout = Some(EditorLayout { bounds, gutter, slots });
         y
     }
 
@@ -1183,10 +1565,16 @@ impl Focusable for NoteEditor {
 impl Render for NoteEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = cx.entity().downgrade();
+        let t = cx.kairn();
+        // The handle gutter is baked into every line's indent; pulling the
+        // element left by the same width keeps the text where it was, with
+        // the handles hanging in the note frame's padding.
+        let gutter = px(HANDLE_GUTTER * (t.editor_size / theme::EDITOR_BASE_SIZE));
         div()
             .key_context("NoteEditor")
             .track_focus(&self.focus_handle)
             .cursor_text()
+            .ml(-gutter)
             // Room below the last line so clicking the empty space under a
             // short note lands in the editor and appends.
             .pb(px(140.))
@@ -1209,6 +1597,20 @@ impl Render for NoteEditor {
             .on_action(cx.listener(Self::on_select_right))
             .on_action(cx.listener(Self::on_select_up))
             .on_action(cx.listener(Self::on_select_down))
+            .on_action(cx.listener(Self::on_word_left))
+            .on_action(cx.listener(Self::on_word_right))
+            .on_action(cx.listener(Self::on_select_word_left))
+            .on_action(cx.listener(Self::on_select_word_right))
+            .on_action(cx.listener(Self::on_line_start))
+            .on_action(cx.listener(Self::on_line_end))
+            .on_action(cx.listener(Self::on_select_line_start))
+            .on_action(cx.listener(Self::on_select_line_end))
+            .on_action(cx.listener(Self::on_doc_start))
+            .on_action(cx.listener(Self::on_doc_end))
+            .on_action(cx.listener(Self::on_select_doc_start))
+            .on_action(cx.listener(Self::on_select_doc_end))
+            .on_action(cx.listener(Self::on_delete_word_back))
+            .on_action(cx.listener(Self::on_delete_to_line_start))
             .child(NoteEditorElement { editor: cx.entity().clone() })
             .context_menu(move |menu, _, cx| {
                 let Some(strong) = editor.upgrade() else { return menu };
@@ -1360,8 +1762,8 @@ impl gpui::EntityInputHandler for NoteEditor {
             .iter()
             .find(|s| (s.raw_start..=s.raw_start + s.raw_len).contains(&range.start))?;
         let wrapped = slot.entry.wrapped.as_ref()?;
-        let local = wrapped
-            .position_for_index(range.start - slot.raw_start, slot.entry.line_height)?;
+        let ix = (range.start - slot.raw_start).saturating_sub(slot.entry.prefix_len);
+        let local = wrapped.position_for_index(ix, slot.entry.line_height)?;
         let origin = slot.text_origin_in(&element_bounds) + local;
         Some(Bounds::new(origin, size(px(2.), slot.entry.line_height)))
     }
@@ -1389,7 +1791,7 @@ impl gpui::EntityInputHandler for NoteEditor {
             {
                 let raw = &self.text()[slot.raw_start..slot.raw_start + slot.raw_len];
                 let raw_ix = if slot.entry.active {
-                    ix.min(raw.len())
+                    (slot.entry.prefix_len + ix).min(raw.len())
                 } else {
                     let chars =
                         slot.entry.display.get(..ix).map_or(0, |s| s.chars().count());
@@ -1419,15 +1821,18 @@ struct KindStyle {
 
 fn kind_style(line: &Line, t: &KairnTheme) -> (KindStyle, Glyph) {
     // The metrics below are drawn against the default 13px body; a themed
-    // editor size scales text and line heights together, leaving the
-    // paddings and indents (glyph column geometry) alone.
+    // editor size scales text, line heights, and the glyph column (indents)
+    // together, leaving only the vertical paddings alone. Every indent
+    // includes the handle gutter, so text and hit-testing agree without a
+    // separate offset.
     let scale = t.editor_size / crate::theme::EDITOR_BASE_SIZE;
+    let gutter = HANDLE_GUTTER * scale;
     let body = |color| KindStyle {
         size: px(13. * scale),
         line_height: px(20.5 * scale),
         pad_top: px(1.),
         pad_bottom: px(1.),
-        indent: px(0.),
+        indent: px(gutter),
         color,
         weight: FontWeight::NORMAL,
     };
@@ -1464,7 +1869,7 @@ fn kind_style(line: &Line, t: &KairnTheme) -> (KindStyle, Glyph) {
                 KindStyle {
                     pad_top: px(2.5),
                     pad_bottom: px(2.5),
-                    indent: px(22.),
+                    indent: px(gutter + 22. * scale),
                     ..body(color)
                 },
                 Glyph::Task(*state),
@@ -1474,13 +1879,18 @@ fn kind_style(line: &Line, t: &KairnTheme) -> (KindStyle, Glyph) {
             KindStyle {
                 pad_top: px(2.5),
                 pad_bottom: px(2.5),
-                indent: px(18.),
+                indent: px(gutter + 18. * scale),
                 ..body(t.text)
             },
             Glyph::Bullet,
         ),
         Line::Quote { .. } => (
-            KindStyle { pad_top: px(4.), pad_bottom: px(4.), indent: px(14.), ..body(t.dim) },
+            KindStyle {
+                pad_top: px(4.),
+                pad_bottom: px(4.),
+                indent: px(gutter + 14. * scale),
+                ..body(t.dim)
+            },
             Glyph::QuoteBar,
         ),
         Line::Rule => (
@@ -1517,24 +1927,29 @@ fn shape_entry(
 ) -> ShapedEntry {
     let parsed = notes::parse_line(raw);
     let (style, glyph) = kind_style(&parsed, t);
+    let gutter = px(HANDLE_GUTTER * (t.editor_size / crate::theme::EDITOR_BASE_SIZE));
     let strikethrough = matches!(
         parsed,
         Line::Task { state: TaskState::Done | TaskState::Cancelled, .. }
     );
 
-    // Inactive blank lines are an 8px breather, matching the old renderer;
-    // the cursor line always has full text height so the caret has a home.
+    // Blank lines hold a full text row whether or not the cursor is on
+    // them: uniform height keeps the document from shifting as the cursor
+    // passes through, and Enter on an empty line drops a full line like
+    // any editor. (The active blank falls through to shaping so a
+    // whitespace-only line still positions the caret inside its spaces.)
     if !active && matches!(parsed, Line::Blank) {
         return ShapedEntry {
             display: SharedString::default(),
             wrapped: None,
             line_height: style.line_height,
-            text_height: px(8.),
-            pad_top: px(0.),
-            pad_bottom: px(0.),
-            indent: px(0.),
+            text_height: style.line_height,
+            pad_top: px(1.),
+            pad_bottom: px(1.),
+            indent: gutter,
             glyph: Glyph::None,
             active,
+            prefix_len: 0,
         };
     }
     // Inactive rules paint a line, no text.
@@ -1546,9 +1961,10 @@ fn shape_entry(
             text_height: px(1.),
             pad_top: style.pad_top,
             pad_bottom: style.pad_bottom,
-            indent: px(0.),
+            indent: gutter,
             glyph: Glyph::Rule,
             active,
+            prefix_len: 0,
         };
     }
 
@@ -1570,14 +1986,25 @@ fn shape_entry(
         | Line::Text { spans } => spans.as_slice(),
         Line::Rule | Line::Blank => &[],
     };
-    let (display, runs, indent, glyph) = if active {
-        // The cursor line shows its raw markdown, every byte visible so the
-        // mapping between clicks, cursor, and bytes is exact, but keeps the
-        // span styling: markers faint, content styled (what NotePlan does).
-        // While an IME composition is marked, plain runs with the marked
-        // range underlined take over.
+    let (display, runs, indent, glyph, prefix_len) = if active {
+        // The cursor line reveals its raw inline markdown, byte for byte, so
+        // inline markers can be edited in place — but glyph lines (tasks,
+        // bullets, quotes) keep their marker hidden and their glyph painted,
+        // exactly like inactive lines: the checkbox never blinks out from
+        // under the pointer, and the text never shifts when the cursor
+        // arrives. The hidden prefix makes the mapping display index + prefix
+        // = raw column. While an IME composition is marked, plain runs with
+        // the marked range underlined take over.
+        let prefix = match &parsed {
+            Line::Task { .. } | Line::Bullet { .. } | Line::Quote { .. } => {
+                notes::content_start_col(raw).min(raw.len())
+            }
+            _ => 0,
+        };
+        let shown = &raw[prefix..];
         let mut runs = Vec::new();
         if let Some(m) = &marked_local {
+            let m = m.start.saturating_sub(prefix)..m.end.saturating_sub(prefix);
             let mut push = |len: usize, underline: bool| {
                 if len == 0 {
                     return;
@@ -1595,9 +2022,9 @@ fn shape_entry(
                     strikethrough: None,
                 });
             };
-            push(m.start.min(raw.len()), false);
-            push(m.end.min(raw.len()).saturating_sub(m.start.min(raw.len())), true);
-            push(raw.len().saturating_sub(m.end.min(raw.len())), false);
+            push(m.start.min(shown.len()), false);
+            push(m.end.min(shown.len()).saturating_sub(m.start.min(shown.len())), true);
+            push(shown.len().saturating_sub(m.end.min(shown.len())), false);
         } else {
             let mut push = |len: usize, kind: Option<SpanKind>| {
                 if len == 0 {
@@ -1605,8 +2032,8 @@ fn shape_entry(
                 }
                 let (color, bg, weight, font_style) = match kind {
                     Some(k) => span_style(k, style.color, t),
-                    // The line's own prefix (list marker, task bracket)
-                    // and any bytes past the spans.
+                    // The line's own revealed prefix (heading hashes) and
+                    // any bytes past the spans.
                     None => (t.faint, None, FontWeight::NORMAL, FontStyle::Normal),
                 };
                 let mut font = base_font.clone();
@@ -1620,19 +2047,19 @@ fn shape_entry(
                     color,
                     background_color: bg,
                     underline: None,
-                    strikethrough: None,
+                    strikethrough: strike,
                 });
             };
-            let start = notes::spans_start_col(raw).min(raw.len());
+            let start = notes::spans_start_col(raw).min(raw.len()).saturating_sub(prefix);
             push(start, None);
             let mut covered = start;
             for (kind, s) in spans {
-                let len = s.len().min(raw.len().saturating_sub(covered));
+                let len = s.len().min(shown.len().saturating_sub(covered));
                 push(len, Some(*kind));
                 covered += len;
             }
-            if covered < raw.len() {
-                let len = raw.len() - covered;
+            if covered < shown.len() {
+                let len = shown.len() - covered;
                 let mut font = base_font.clone();
                 font.style = FontStyle::Normal;
                 runs.push(TextRun {
@@ -1641,11 +2068,13 @@ fn shape_entry(
                     color: style.color,
                     background_color: None,
                     underline: None,
-                    strikethrough: None,
+                    strikethrough: strike,
                 });
             }
         }
-        (SharedString::from(raw.to_string()), runs, px(0.), Glyph::None)
+        let (indent, glyph) =
+            if prefix > 0 { (style.indent, glyph) } else { (gutter, Glyph::None) };
+        (SharedString::from(shown.to_string()), runs, indent, glyph, prefix)
     } else {
         let mut display = String::new();
         let mut runs = Vec::new();
@@ -1681,7 +2110,7 @@ fn shape_entry(
             display.push_str(text);
             chars_seen += chars;
         }
-        (SharedString::from(display), runs, style.indent, glyph)
+        (SharedString::from(display), runs, style.indent, glyph, 0)
     };
 
     let wrap_width = (width - indent).max(px(50.));
@@ -1708,6 +2137,52 @@ fn shape_entry(
         indent,
         glyph,
         active,
+        prefix_len,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{next_word_boundary, prev_word_boundary};
+
+    #[test]
+    fn word_left_lands_on_word_starts() {
+        let t = "hello brave world";
+        assert_eq!(prev_word_boundary(t, 17), 12); // from end -> "world"
+        assert_eq!(prev_word_boundary(t, 12), 6); // -> "brave"
+        assert_eq!(prev_word_boundary(t, 8), 6); // mid-word -> its start
+        assert_eq!(prev_word_boundary(t, 6), 0);
+        assert_eq!(prev_word_boundary(t, 0), 0);
+    }
+
+    #[test]
+    fn word_right_lands_on_word_ends() {
+        let t = "hello brave world";
+        assert_eq!(next_word_boundary(t, 0), 5);
+        assert_eq!(next_word_boundary(t, 5), 11);
+        assert_eq!(next_word_boundary(t, 8), 11); // mid-word -> its end
+        assert_eq!(next_word_boundary(t, 17), 17);
+    }
+
+    #[test]
+    fn word_motion_crosses_newlines() {
+        let t = "one\ntwo";
+        assert_eq!(next_word_boundary(t, 3), 7);
+        assert_eq!(prev_word_boundary(t, 4), 0);
+    }
+
+    #[test]
+    fn punctuation_runs_are_their_own_stops() {
+        let t = "a -- b";
+        assert_eq!(next_word_boundary(t, 1), 4);
+        assert_eq!(prev_word_boundary(t, 5), 2);
+    }
+
+    #[test]
+    fn word_boundaries_respect_utf8() {
+        let t = "café über";
+        assert_eq!(next_word_boundary(t, 0), 5); // café is 5 bytes
+        assert_eq!(prev_word_boundary(t, t.len()), 6);
     }
 }
 
@@ -1727,7 +2202,9 @@ impl IntoElement for NoteEditorElement {
 
 impl Element for NoteEditorElement {
     type RequestLayoutState = ();
-    type PrepaintState = ();
+    /// The hovered line's handle-gutter hitbox, carried into paint for the
+    /// open-hand cursor (hitboxes can only be inserted during prepaint).
+    type PrepaintState = Option<gpui::Hitbox>;
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -1786,7 +2263,15 @@ impl Element for NoteEditorElement {
             if ed.follow_cursor.take() {
                 ed.follow_cursor_now();
             }
-        });
+            // The hovered line's handle cell gets a hitbox so paint can give
+            // it the open-hand cursor.
+            let handle_cell = ed.hover_handle_slot().map(|(y, height)| {
+                let gutter =
+                    ed.layout.borrow().as_ref().map(|l| l.gutter).unwrap_or_default();
+                Bounds::new(point(bounds.origin.x, bounds.origin.y + y), size(gutter, height))
+            });
+            handle_cell.map(|cell| window.insert_hitbox(cell, gpui::HitboxBehavior::Normal))
+        })
     }
 
     fn paint(
@@ -1795,12 +2280,12 @@ impl Element for NoteEditorElement {
         _inspector: Option<&gpui::InspectorElementId>,
         bounds: Bounds<Pixels>,
         _request: &mut Self::RequestLayoutState,
-        _prepaint: &mut Self::PrepaintState,
+        prepaint: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
         let t = cx.kairn().clone();
-        let (focus_handle, cursor, blink_visible, selection, text, drag_target, drag_lifted) = {
+        let (focus_handle, cursor, blink_visible, selection, text, drag_target, drag_lifted, handle_slot) = {
             let ed = self.editor.read(cx);
             let selection = ed.selection();
             // The document text is only consulted for mapping a selection's
@@ -1813,8 +2298,9 @@ impl Element for NoteEditorElement {
                 ed.blink_visible,
                 selection,
                 text,
-                ed.glyph_drag.as_ref().filter(|d| d.moved).and_then(|d| d.target),
-                ed.glyph_drag.as_ref().filter(|d| d.moved).map(|d| d.line_start),
+                ed.line_drag.as_ref().filter(|d| d.moved).and_then(|d| d.target),
+                ed.line_drag.as_ref().filter(|d| d.moved).map(|d| d.range.clone()),
+                ed.hover_handle_slot(),
             )
         };
         window.handle_input(
@@ -1844,11 +2330,23 @@ impl Element for NoteEditorElement {
         });
         window.on_mouse_event({
             let editor = self.editor.clone();
-            move |event: &MouseUpEvent, phase, _window, cx| {
+            move |event: &MouseUpEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
                     return;
                 }
-                editor.update(cx, |ed, cx| ed.on_mouse_up(cx));
+                editor.update(cx, |ed, cx| ed.on_mouse_up(window, cx));
+            }
+        });
+        // Escape abandons an in-flight drag. Window-level like the mouse
+        // handlers: a handle grab never focuses the editor, so an action
+        // binding wouldn't reach it.
+        window.on_key_event({
+            let editor = self.editor.clone();
+            move |event: &gpui::KeyDownEvent, phase, _window, cx| {
+                if phase != DispatchPhase::Bubble || event.keystroke.key != "escape" {
+                    return;
+                }
+                editor.update(cx, |ed, cx| ed.cancel_drag(cx));
             }
         });
 
@@ -1881,7 +2379,8 @@ impl Element for NoteEditorElement {
                     match &slot.entry.wrapped {
                         Some(wrapped) => {
                             let (s_ix, e_ix) = if slot.entry.active {
-                                (s_raw, e_raw)
+                                let p = slot.entry.prefix_len;
+                                (s_raw.saturating_sub(p), e_raw.saturating_sub(p))
                             } else {
                                 // `text` is always present when a selection is.
                                 let raw_line = text
@@ -1948,19 +2447,23 @@ impl Element for NoteEditorElement {
                 }
             }
 
+            // Glyphs sit in the column between the handle gutter and the
+            // text.
+            let glyph_x = bounds.origin.x + layout.gutter;
             match &slot.entry.glyph {
                 Glyph::Rule => {
                     window.paint_quad(fill(
                         Bounds::new(
-                            point(bounds.origin.x, block_top + slot.entry.pad_top),
-                            size(bounds.size.width, px(1.)),
+                            point(glyph_x, block_top + slot.entry.pad_top),
+                            size(bounds.size.width - layout.gutter, px(1.)),
                         ),
                         t.border,
                     ));
                 }
                 Glyph::Task(state) => {
+                    let scale = t.editor_size / theme::EDITOR_BASE_SIZE;
                     paint_task_box(
-                        point(bounds.origin.x, text_origin.y + px(4.)),
+                        point(glyph_x, text_origin.y + px(4. * scale)),
                         state,
                         &t,
                         window,
@@ -1968,9 +2471,10 @@ impl Element for NoteEditorElement {
                     );
                 }
                 Glyph::Bullet => {
+                    let scale = t.editor_size / theme::EDITOR_BASE_SIZE;
                     let dash = window.text_system().shape_line(
                         SharedString::from("–"),
-                        px(13.),
+                        px(13. * scale),
                         &[TextRun {
                             len: "–".len(),
                             font: window.text_style().font(),
@@ -1982,7 +2486,7 @@ impl Element for NoteEditorElement {
                         None,
                     );
                     let _ = dash.paint(
-                        point(bounds.origin.x, text_origin.y),
+                        point(glyph_x, text_origin.y),
                         slot.entry.line_height,
                         window,
                         cx,
@@ -1991,7 +2495,7 @@ impl Element for NoteEditorElement {
                 Glyph::QuoteBar => {
                     window.paint_quad(fill(
                         Bounds::new(
-                            point(bounds.origin.x, block_top + slot.entry.pad_top),
+                            point(glyph_x, block_top + slot.entry.pad_top),
                             size(px(2.), slot.entry.text_height),
                         ),
                         t.border,
@@ -2033,7 +2537,9 @@ impl Element for NoteEditorElement {
                     .wrapped
                     .as_ref()
                     .and_then(|w| {
-                        w.position_for_index(cursor - slot.raw_start, slot.entry.line_height)
+                        let ix =
+                            (cursor - slot.raw_start).saturating_sub(slot.entry.prefix_len);
+                        w.position_for_index(ix, slot.entry.line_height)
                     })
                     .unwrap_or(point(px(0.), px(0.)));
                 window.paint_quad(fill(
@@ -2046,18 +2552,61 @@ impl Element for NoteEditorElement {
             }
         }
 
-        // The dragged line lifts (dims) while a glyph drag is in flight, so
+        // The dragged block lifts (dims) while a line drag is in flight, so
         // it reads as picked up rather than duplicated by the ghost.
-        if let Some(lifted) = drag_lifted
-            && let Some(slot) = layout.slots.iter().find(|s| s.raw_start == lifted)
-        {
-            window.paint_quad(fill(
-                Bounds::new(
-                    point(bounds.origin.x, bounds.origin.y + slot.y),
-                    size(bounds.size.width, slot.height),
-                ),
-                t.bg.opacity(0.65),
-            ));
+        if let Some(lifted) = &drag_lifted {
+            let mut span: Option<(Pixels, Pixels)> = None;
+            for slot in &layout.slots {
+                if slot.raw_start >= lifted.start && slot.raw_start < lifted.end.max(lifted.start + 1) {
+                    let top = bounds.origin.y + slot.y;
+                    let bottom = top + slot.height;
+                    span = Some(match span {
+                        Some((t0, b0)) => (t0.min(top), b0.max(bottom)),
+                        None => (top, bottom),
+                    });
+                }
+            }
+            if let Some((top, bottom)) = span {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(bounds.origin.x, top),
+                        size(bounds.size.width, bottom - top),
+                    ),
+                    t.bg.opacity(0.65),
+                ));
+            }
+        }
+
+        // The hovered line's drag handle: a quiet grip in the gutter that
+        // invites the pick-up.
+        if let Some((y, _height)) = handle_slot {
+            let scale = t.editor_size / theme::EDITOR_BASE_SIZE;
+            let grip = window.text_system().shape_line(
+                SharedString::from("⠿"),
+                px(11. * scale),
+                &[TextRun {
+                    len: "⠿".len(),
+                    font: window.text_style().font(),
+                    color: t.faint,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }],
+                None,
+            );
+            let slot = layout.slots.iter().find(|s| s.y == y);
+            if let Some(slot) = slot {
+                let x = bounds.origin.x + (layout.gutter - grip.width).max(px(0.)) / 2.;
+                let _ = grip.paint(
+                    point(x, bounds.origin.y + slot.y + slot.entry.pad_top),
+                    slot.entry.line_height,
+                    window,
+                    cx,
+                );
+            }
+        }
+        if let Some(hitbox) = prepaint {
+            window.set_cursor_style(gpui::CursorStyle::OpenHand, hitbox);
         }
 
         // The drop indicator for an in-flight glyph drag: a line across the
@@ -2090,9 +2639,11 @@ fn paint_task_box(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let box_bounds = Bounds::new(origin, size(px(13.), px(13.)));
+    let scale = t.editor_size / theme::EDITOR_BASE_SIZE;
+    let side = px(13. * scale);
+    let box_bounds = Bounds::new(origin, size(side, side));
     let mut quad = fill(box_bounds, gpui::transparent_black());
-    quad.corner_radii = Corners::all(px(4.));
+    quad.corner_radii = Corners::all(px(4. * scale));
     match state {
         TaskState::Done => {
             quad.background = t.accent.into();
@@ -2105,9 +2656,9 @@ fn paint_task_box(
     window.paint_quad(quad);
 
     let (mark, color, size_px) = match state {
-        TaskState::Done => ("✓", t.bg, px(9.)),
-        TaskState::Cancelled => ("✕", t.faint, px(8.)),
-        TaskState::Scheduled => ("›", t.faint, px(8.)),
+        TaskState::Done => ("✓", t.bg, px(9. * scale)),
+        TaskState::Cancelled => ("✕", t.faint, px(8. * scale)),
+        TaskState::Scheduled => ("›", t.faint, px(8. * scale)),
         TaskState::Open => return,
     };
     let mut font = window.text_style().font();
@@ -2126,8 +2677,8 @@ fn paint_task_box(
         None,
     );
     let inset = point(
-        origin.x + (px(13.) - line.width).max(px(0.)) / 2.,
-        origin.y + (px(13.) - size_px * 1.2) / 2.,
+        origin.x + (side - line.width).max(px(0.)) / 2.,
+        origin.y + (side - size_px * 1.2) / 2.,
     );
     let _ = line.paint(inset, size_px * 1.2, window, cx);
 }

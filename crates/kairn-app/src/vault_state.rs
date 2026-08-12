@@ -21,6 +21,32 @@ use crate::workspace::{LayoutMode, PaneView, Workspace};
 /// own atomic-write renames, without going blind to real external edits.
 pub(crate) type SelfWrites = Arc<parking_lot::Mutex<HashMap<PathBuf, (Instant, u64)>>>;
 
+/// Day drop targets' window bounds, captured at paint time by the surface
+/// that rendered them (week strip, mini calendar, Daily rows) and cleared by
+/// that surface when it doesn't render.
+pub(crate) type DayBounds =
+    std::rc::Rc<std::cell::RefCell<Vec<(NaiveDate, gpui::Bounds<gpui::Pixels>)>>>;
+
+/// The line index holding `expected`: `line_idx` when it still matches,
+/// else the unique content match; `None` when it is gone or ambiguous (the
+/// same relocation contract as kairn-core's disk edits).
+fn relocate_line(text: &str, line_idx: usize, expected: &str) -> Option<usize> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.get(line_idx).is_some_and(|l| *l == expected) {
+        return Some(line_idx);
+    }
+    let mut matches =
+        lines.iter().enumerate().filter(|(_, l)| **l == expected).map(|(i, _)| i);
+    let only = matches.next()?;
+    matches.next().is_none().then_some(only)
+}
+
+/// Byte offset where line `line_idx` starts (the text length when past the
+/// end, which `move_block` treats as "the end of the note").
+fn line_start_offset(text: &str, line_idx: usize) -> usize {
+    text.split('\n').take(line_idx).map(|l| l.len() + 1).sum::<usize>().min(text.len())
+}
+
 fn file_hash(path: &Path) -> Option<u64> {
     let bytes = std::fs::read(path).ok()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -70,7 +96,15 @@ impl Workspace {
     }
 
     pub fn open_note(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let was_open = self.view == PaneView::Note(path.clone());
         self.flush_note_editor(cx);
+        // The flush may have just renamed this very note to its typed title
+        // (a click on its not-yet-refreshed tree row): follow the rename
+        // rather than reopening the stale path as a fresh empty note.
+        let path = match (&self.view, was_open) {
+            (PaneView::Note(renamed), true) => renamed.clone(),
+            _ => path,
+        };
         self.view = PaneView::Note(path);
         self.show_note_pane();
         self.reload_notes(cx);
@@ -85,9 +119,20 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Write the single-buffer editor's pending edits now (navigation, save
-    /// shortcut, window close). A no-op when the editor is clean or absent.
+    /// The flush point (navigation, save shortcut, quit, window close):
+    /// write the single-buffer editor's pending edits now, then let a
+    /// freshly created untitled note's filename catch up with its typed
+    /// title. A no-op when the editor is clean or absent.
     pub(crate) fn flush_note_editor(&mut self, cx: &mut Context<Self>) {
+        self.save_note_editor(cx);
+        if let Some(path) = self.note_editor.as_ref().map(|e| e.read(cx).path.clone()) {
+            self.rename_note_to_title(path, cx);
+        }
+    }
+
+    /// The save half of a flush, without the title rename: for callers about
+    /// to trash or rename the file at a path they are holding on to.
+    pub(crate) fn save_note_editor(&mut self, cx: &mut Context<Self>) {
         if let Some(editor) = &self.note_editor {
             editor.update(cx, |ed, cx| ed.save_now(cx));
         }
@@ -96,7 +141,15 @@ impl Workspace {
     /// Keep the single-buffer editor entity in step with the pane's document
     /// after a reload: same file merges the fresh disk state into any
     /// in-flight edits; a different file (or view) swaps the editor out.
-    fn sync_note_editor(&mut self, cx: &mut Context<Self>) {
+    /// `disk_text` is what the file actually holds (the editor's merge
+    /// baseline); `seed` is the daily template rendered over a blank day,
+    /// which must never masquerade as disk state.
+    fn sync_note_editor(
+        &mut self,
+        disk_text: Option<&str>,
+        seed: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
         use crate::note_editor::{NoteEditor, NoteEditorEvent};
 
         if self.doc_error.is_some() || self.root_missing {
@@ -115,20 +168,19 @@ impl Workspace {
             self._note_editor_sub = None;
             return;
         };
-        let text = self.doc_text.clone().unwrap_or_default();
+        let text = disk_text.unwrap_or_default();
         if let Some(editor) = &self.note_editor
             && editor.read(cx).path == path
         {
-            editor.update(cx, |ed, cx| ed.reconcile_from_disk(&text, cx));
+            editor.update(cx, |ed, cx| ed.reconcile_from_disk(text, cx));
             return;
         }
-        let editor = cx.new(|cx| NoteEditor::new(path, &text, cx));
+        let editor = cx.new(|cx| NoteEditor::new(path, text, seed, cx));
         self._note_editor_sub = Some(cx.subscribe(
             &editor,
             |this, _editor, event: &NoteEditorEvent, cx| match event {
                 NoteEditorEvent::Saved(path) => {
                     this.note_self_write(path);
-                    this.rename_note_to_title(path.clone(), cx);
                     this.reload_notes(cx);
                     cx.notify();
                 }
@@ -142,36 +194,277 @@ impl Workspace {
                 }
                 NoteEditorEvent::OpenDate(date) => this.select_day(*date, cx),
                 NoteEditorEvent::OpenUrl(url) => cx.open_url(url),
-                NoteEditorEvent::TaskDropped { line_start, position } => {
-                    this.on_task_dropped(*line_start, *position, cx);
+                NoteEditorEvent::BlockDropped { range, position } => {
+                    this.on_block_dropped(range.clone(), *position, cx);
+                }
+                NoteEditorEvent::DragMoved { position } => {
+                    this.on_drag_moved(*position, cx);
                 }
             },
         ));
         self.note_editor = Some(editor);
     }
 
-    /// The drop half of drag-to-reschedule: an open task's glyph drag was
-    /// released outside the editor. If the pointer sat on a week-strip day,
-    /// rewrite the task's `>date` through the editor buffer (undoable,
-    /// autosaved); anywhere else the drag just ends.
-    pub(crate) fn on_task_dropped(
+    /// The drop half of drag-to-a-day: a line drag was released outside the
+    /// editor. An open hold menu's rows are checked first (a release on a
+    /// heading drops at that section's end; on the menu's body, the day's
+    /// top); otherwise a day drop target under the pointer takes the block
+    /// at its top, and anywhere else the drag just ends.
+    pub(crate) fn on_block_dropped(
         &mut self,
-        line_start: usize,
+        range: std::ops::Range<usize>,
         position: gpui::Point<gpui::Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let day = self
-            .week_strip_bounds
-            .borrow()
-            .iter()
-            .find(|(_, bounds)| bounds.contains(&position))
-            .map(|(day, _)| *day);
-        if let Some(day) = day
-            && let Some(editor) = &self.note_editor
-        {
-            editor.update(cx, |ed, cx| ed.reschedule_line_at(line_start, day, cx));
+        use crate::workspace::{HoldState, TOP_OF_NOTE};
+
+        let menu_choice = if let HoldState::Open(menu) = &self.hold {
+            let item = menu
+                .item_bounds
+                .borrow()
+                .iter()
+                .find(|(_, bounds)| bounds.contains(&position))
+                .map(|(idx, _)| *idx);
+            match item {
+                Some(TOP_OF_NOTE) => Some((menu.day, None)),
+                Some(idx) => Some((
+                    menu.day,
+                    menu.items
+                        .iter()
+                        .find(|it| it.line_idx == idx)
+                        .map(|it| (it.line_idx, it.raw.clone())),
+                )),
+                None if menu
+                    .menu_bounds
+                    .borrow()
+                    .is_some_and(|b| b.contains(&position)) =>
+                {
+                    Some((menu.day, None))
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        self.hold = HoldState::Idle;
+
+        if let Some((day, heading)) = menu_choice {
+            self.move_block_to_day(range, day, heading, cx);
+        } else if let Some(day) = self.resolve_day_drop(position) {
+            self.move_block_to_day(range, day, None, cx);
         }
         cx.notify();
+    }
+
+    /// Tick the hold-for-heading state machine on every drag move: dwell on
+    /// a day arms a timer, drifting re-arms it, leaving folds the menu.
+    pub(crate) fn on_drag_moved(
+        &mut self,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::workspace::HoldState;
+
+        let over = self.resolve_day_drop(position);
+        match &self.hold {
+            HoldState::Idle => {
+                if let Some(day) = over {
+                    self.arm_hold(day, position, cx);
+                }
+            }
+            HoldState::Arming { day, anchor, .. } => {
+                let drifted = (position.x - anchor.x).abs() > gpui::px(4.)
+                    || (position.y - anchor.y).abs() > gpui::px(4.);
+                if over != Some(*day) {
+                    self.hold = HoldState::Idle;
+                    if let Some(day) = over {
+                        self.arm_hold(day, position, cx);
+                    }
+                } else if drifted {
+                    // Still on the day but moving: the dwell restarts from
+                    // here (dropping the old timer cancels it).
+                    let day = *day;
+                    self.arm_hold(day, position, cx);
+                }
+            }
+            HoldState::Open(menu) => {
+                let near_menu = menu.menu_bounds.borrow().is_some_and(|b| {
+                    gpui::Bounds::new(
+                        b.origin - gpui::point(gpui::px(8.), gpui::px(8.)),
+                        b.size + gpui::size(gpui::px(16.), gpui::px(16.)),
+                    )
+                    .contains(&position)
+                });
+                if !near_menu && over != Some(menu.day) {
+                    self.hold = HoldState::Idle;
+                    if let Some(day) = over {
+                        self.arm_hold(day, position, cx);
+                    }
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    fn arm_hold(
+        &mut self,
+        day: NaiveDate,
+        anchor: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::workspace::HoldState;
+        let timer = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1000))
+                .await;
+            let _ = this.update(cx, |ws, cx| ws.open_hold_menu(cx));
+        });
+        self.hold = HoldState::Arming { day, anchor, _timer: timer };
+    }
+
+    /// The dwell timer fired: list the target day's headings and open the
+    /// menu at the pointer. No file or no headings means no menu.
+    fn open_hold_menu(&mut self, cx: &mut Context<Self>) {
+        use crate::workspace::{HoldItem, HoldMenu, HoldState};
+
+        let HoldState::Arming { day, .. } = self.hold else { return };
+        let Some(editor) = &self.note_editor else {
+            self.hold = HoldState::Idle;
+            return;
+        };
+        let Some((_, _, position)) = editor.read(cx).line_drag() else {
+            self.hold = HoldState::Idle;
+            return;
+        };
+        // Headings come from the live buffer when the target day is the
+        // open note (disk may lag the autosave), else from the file.
+        let target = notes::daily_file(&self.notes_root, day)
+            .unwrap_or_else(|| notes::daily_path(&self.notes_root, day));
+        let text = if editor.read(cx).path == target {
+            Some(editor.read(cx).doc().to_string())
+        } else {
+            std::fs::read_to_string(&target).ok()
+        };
+        let Some(text) = text else {
+            self.hold = HoldState::Idle;
+            return;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        let items: Vec<HoldItem> = notes::note_headings(&text)
+            .into_iter()
+            .map(|h| HoldItem {
+                line_idx: h.line_idx,
+                raw: lines.get(h.line_idx).copied().unwrap_or_default().to_string(),
+                display: h.text,
+                level: h.level,
+            })
+            .collect();
+        if items.is_empty() {
+            self.hold = HoldState::Idle;
+            return;
+        }
+        self.hold = HoldState::Open(HoldMenu {
+            day,
+            items,
+            origin: position + gpui::point(gpui::px(12.), gpui::px(-6.)),
+            item_bounds: Default::default(),
+            menu_bounds: Default::default(),
+        });
+        cx.notify();
+    }
+
+    /// The day whose drop target contains `position`, if any: the week strip
+    /// first, then the sidebar surfaces (mini calendar, Daily rows), whose
+    /// hits only count inside the sidebar's own bounds — cells scrolled out
+    /// of its clip still capture bounds but must never catch a drop.
+    pub(crate) fn resolve_day_drop(
+        &self,
+        position: gpui::Point<gpui::Pixels>,
+    ) -> Option<NaiveDate> {
+        let hit = |store: &DayBounds| {
+            store
+                .borrow()
+                .iter()
+                .find(|(_, bounds)| bounds.contains(&position))
+                .map(|(day, _)| *day)
+        };
+        if let Some(day) = hit(&self.week_strip_bounds) {
+            return Some(day);
+        }
+        let inside_sidebar =
+            self.sidebar_bounds.borrow().is_some_and(|b| b.contains(&position));
+        if !inside_sidebar {
+            return None;
+        }
+        hit(&self.calendar_drop_bounds).or_else(|| hit(&self.daily_drop_bounds))
+    }
+
+    /// Move a block out of the open note into `day`'s note: to the top, or
+    /// to the end of the section named by `heading` (a hold-menu choice,
+    /// `(line_idx, raw line)`), falling back to the top when the heading has
+    /// vanished. The target's own day is an in-buffer move (one undo step);
+    /// anything else inserts on disk first and removes from the buffer
+    /// second, so a crash duplicates rather than loses.
+    fn move_block_to_day(
+        &mut self,
+        range: std::ops::Range<usize>,
+        day: NaiveDate,
+        heading: Option<(usize, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.note_editor.clone() else { return };
+        let target = notes::daily_file(&self.notes_root, day)
+            .unwrap_or_else(|| notes::daily_path(&self.notes_root, day));
+
+        if editor.read(cx).path == target {
+            let offset = heading
+                .and_then(|(idx, raw)| {
+                    let text = editor.read(cx).doc();
+                    let idx = relocate_line(text, idx, &raw)?;
+                    let line = notes::section_insert_line(text, idx)?;
+                    Some(line_start_offset(text, line))
+                })
+                .unwrap_or(0);
+            editor.update(cx, |ed, cx| ed.move_block_to(range, offset, cx));
+            return;
+        }
+
+        let block = editor.read(cx).block_text(range.clone());
+        if block.trim().is_empty() {
+            return;
+        }
+        let written = match heading {
+            Some((idx, raw)) => {
+                match notes::insert_block_under_heading(&target, idx, &raw, &block) {
+                    Ok(Some(_)) => Ok(Some(target.clone())),
+                    // The heading (or the whole file) vanished or went
+                    // ambiguous underneath the menu: land at the top rather
+                    // than guessing.
+                    Ok(None) => Ok(None),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(e) => Err(e),
+                }
+            }
+            None => Ok(None),
+        };
+        let written = match written {
+            Ok(Some(path)) => Ok(path),
+            Ok(None) => notes::insert_block_at_top(
+                &self.notes_root,
+                day,
+                &block,
+                &self.settings.daily_template_rule,
+            ),
+            Err(e) => Err(e),
+        };
+        match written {
+            Ok(path) => {
+                self.note_self_write(&path);
+                editor.update(cx, |ed, cx| ed.remove_block(range, cx));
+                self.reload_notes(cx);
+            }
+            Err(e) => eprintln!("kairn: could not move block to {day}: {e}"),
+        }
     }
 
     pub fn notes_expanded_contains(&self, path: &std::path::Path) -> bool {
@@ -233,7 +526,7 @@ impl Workspace {
             PaneView::Note(p) => Some(p.clone()),
             PaneView::Tasks(_) => None,
         };
-        let (text, doc_error) = match path.as_deref() {
+        let (disk_text, doc_error) = match path.as_deref() {
             None => (None, None),
             Some(p) => match std::fs::read_to_string(p) {
                 Ok(t) => (Some(t), None),
@@ -244,16 +537,18 @@ impl Workspace {
             },
         };
         self.doc_error = doc_error;
-        // A day from today onward with no content yet starts from the daily
-        // template (Notes/@Templates/Daily.md): rendered immediately, written
-        // to disk only when the first edit lands. An empty file already on
-        // disk (NotePlan pre-creates these, and a stray visit can too) counts
-        // as no content, so the template still seeds rather than the day
-        // reading blank forever. Past days stay blank — a template there would
-        // dress up history that never happened. The settings rule can narrow
-        // this to weekdays or turn it off.
-        let day_is_blank = text.as_deref().is_none_or(|s| s.trim().is_empty());
-        let text = if day_is_blank
+        // A day from today onward with no content yet renders seeded from the
+        // daily template (Notes/@Templates/Daily.md). The seed is display
+        // plus intent, never disk state: the editor keeps its baseline at
+        // what the file actually holds — an empty file already on disk counts
+        // (NotePlan pre-creates these, and a stray visit can too) — and
+        // writes nothing until a real edit lands, so the first save merges
+        // cleanly instead of reading the template as externally deleted.
+        // Past days stay blank — a template there would dress up history that
+        // never happened. The settings rule can narrow this to weekdays or
+        // turn it off.
+        let day_is_blank = disk_text.as_deref().is_none_or(|s| s.trim().is_empty());
+        let seed = if day_is_blank
             && matches!(self.view, PaneView::Day)
             && self.doc_error.is_none()
             && !self.root_missing
@@ -265,9 +560,12 @@ impl Workspace {
             notes::daily_template(&self.notes_root)
                 .map(|body| notes::strip_daily_title(&body).to_string())
         } else {
-            text
+            None
         };
-        self.doc_text = text;
+        self.doc_text = match &seed {
+            Some(s) => Some(s.clone()),
+            None => disk_text.clone(),
+        };
         self.day_timeline = match (&self.view, &self.doc_text) {
             (PaneView::Day, Some(text)) if self.settings.day_timeline => {
                 notes::time_blocks(text)
@@ -301,7 +599,7 @@ impl Workspace {
             .unwrap_or_default();
         self.doc_path = path;
         self.note_days = scan.days;
-        self.sync_note_editor(cx);
+        self.sync_note_editor(disk_text.as_deref(), seed.as_deref(), cx);
     }
 
     /// Open whatever a wiki link points at: a day, an existing note, or a
@@ -354,7 +652,8 @@ impl Workspace {
     /// with the file. If the trashed note is on screen, the pane drops back
     /// to the day view.
     pub fn trash_note_at(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        self.flush_note_editor(cx);
+        // Save without the title rename: `path` must still name the file.
+        self.save_note_editor(cx);
         match notes::trash_note(&self.notes_root, path) {
             Ok(_) => {
                 if self.view == PaneView::Note(path.to_path_buf()) {
@@ -376,7 +675,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.flush_note_editor(cx);
+        // Save without the title rename: `path` must still name the file.
+        self.save_note_editor(cx);
         match notes::rename_note(path, new_stem) {
             Ok(new_path) => {
                 if self.view == PaneView::Note(path.to_path_buf()) {
@@ -391,8 +691,8 @@ impl Workspace {
 
     /// Create a fresh untitled note in a folder of the Notes tree and open it,
     /// the caret sitting after the seeded `# ` so the user just types the
-    /// title — which then renames the file (see [`Self::rename_note_to_title`]).
-    /// No name prompt: NotePlan-style.
+    /// title — the file takes that name at the next flush (see
+    /// [`Self::rename_note_to_title`]). No name prompt: NotePlan-style.
     pub fn create_new_note(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         match notes::new_untitled_note_in(&dir) {
             Ok(path) => {
@@ -410,15 +710,21 @@ impl Workspace {
         }
     }
 
-    /// After a regular note saves, keep its filename in step with its title:
-    /// derive a stem from the first heading and rename the file to match.
-    /// Daily notes are date-named and never touched; a name collision or an
-    /// unusable title just leaves the file where it is (the title simply
-    /// doesn't match the filename until it's unique and valid).
+    /// At a flush point, let a freshly created note's filename catch up with
+    /// its typed title: derive a stem from the first heading and rename the
+    /// file to match. Only notes still carrying an "Untitled" name are ever
+    /// renamed — retitling an existing note must not silently move its file
+    /// (wiki links to it would dangle, and clicking one would grow a fresh
+    /// empty note at the old name). Daily notes are date-named and never
+    /// touched. A name collision leaves the file where it is and says so.
     fn rename_note_to_title(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         // Only the note actually on screen, and only regular notes — dailies
         // are PaneView::Day and keep their date name.
         if self.view != PaneView::Note(path.clone()) {
+            return;
+        }
+        let current = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+        if !notes::is_untitled_stem(current) {
             return;
         }
         let editor = match &self.note_editor {
@@ -428,16 +734,32 @@ impl Workspace {
         let Some(stem) = editor.read(cx).title_stem() else {
             return;
         };
-        let current = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
         if stem == current {
             return;
         }
-        if let Ok(new_path) = notes::rename_note(&path, &stem)
-            && new_path != path
-        {
-            self.note_self_write(&new_path);
-            editor.update(cx, |ed, _| ed.set_path(new_path.clone()));
-            self.view = PaneView::Note(new_path);
+        match notes::rename_note(&path, &stem) {
+            Ok(new_path) if new_path != path => {
+                self.note_self_write(&new_path);
+                editor.update(cx, |ed, _| ed.set_path(new_path.clone()));
+                self.view = PaneView::Note(new_path);
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Flush points don't carry a Window; reach the active one for
+                // the notice, after the current update settles.
+                let msg = format!(
+                    "Note kept as \"{current}\": a note named \"{stem}\" already exists here."
+                );
+                match cx.active_window() {
+                    Some(win) => cx.defer(move |cx| {
+                        let _ = win.update(cx, |_, window, cx| {
+                            window.push_notification(msg, cx);
+                        });
+                    }),
+                    None => eprintln!("kairn: {msg}"),
+                }
+            }
+            Err(e) => eprintln!("kairn: could not rename {}: {e}", path.display()),
         }
     }
 
@@ -464,6 +786,26 @@ impl Workspace {
     /// intent, not mechanism.
     pub fn prompt_new_note(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.create_new_note(dir, window, cx);
+    }
+
+    /// New-folder prompt: a one-field dialog, then a plain directory under
+    /// `dir`, expanded so the empty folder is visible in the tree.
+    pub fn prompt_new_folder(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        crate::name_dialog::open(
+            "New folder",
+            "Create",
+            None,
+            window,
+            cx,
+            move |ws, name, window, cx| match notes::create_folder_in(&dir, name) {
+                Ok(path) => {
+                    ws.notes_expanded.insert(path);
+                    ws.reload_notes(cx);
+                    cx.notify();
+                }
+                Err(e) => window.push_notification(format!("Could not create folder: {e}"), cx),
+            },
+        );
     }
 
     /// Flush pending editor changes now instead of waiting for the autosave.
@@ -568,6 +910,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.settings.ssh_hosts = patch.hosts;
+        self.settings.local_apps = patch.local_apps;
         self.settings.notes_root = patch.notes_root;
         self.settings.daily_template_rule = patch.daily_template_rule;
         self.settings.theme = patch.theme;
@@ -624,6 +967,7 @@ impl Workspace {
 pub struct SettingsPatch {
     pub notes_root: Option<String>,
     pub hosts: Vec<kairn_core::settings::SshHost>,
+    pub local_apps: Vec<kairn_core::settings::HostApp>,
     pub daily_template_rule: String,
     /// The daily template body, only when the dialog changed it.
     pub template_body: Option<String>,

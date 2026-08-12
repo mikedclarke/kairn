@@ -23,6 +23,9 @@ use crate::workspace::Workspace;
 fn main() {
     let app = Application::new().with_assets(Assets);
 
+    // Dock-icon click when no window is visible: bring the app forward.
+    app.on_reopen(|cx| cx.activate(true));
+
     app.run(move |cx| {
         gpui_component::init(cx);
         workspace::init(cx);

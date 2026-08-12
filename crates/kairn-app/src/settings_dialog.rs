@@ -11,7 +11,8 @@ use gpui_component::{
     v_flex,
 };
 
-use kairn_core::settings::SshHost;
+use gpui::SharedString;
+use kairn_core::settings::{HostApp, SshHost};
 use kairn_core::themes::ThemeEntry;
 use crate::cli_install;
 use crate::keymap::keybind_list;
@@ -91,6 +92,7 @@ pub struct SettingsEditor {
     /// folder picker; lands with Save.
     notes_root_choice: Option<String>,
     rows: Vec<HostRow>,
+    local_apps: Vec<AppRow>,
     /// The daily template body as loaded at open, to skip a rewrite (and a
     /// watcher round-trip) when Save changed nothing.
     template_loaded: String,
@@ -120,6 +122,7 @@ struct HostRow {
     name: Entity<InputState>,
     target: Entity<InputState>,
     port: Entity<InputState>,
+    apps: Vec<AppRow>,
 }
 
 impl HostRow {
@@ -145,8 +148,52 @@ impl HostRow {
                 None => state,
             }
         });
-        Self { name, target, port }
+        let apps = host
+            .map(|h| h.apps.iter().map(|a| AppRow::new(Some(a), window, cx)).collect())
+            .unwrap_or_default();
+        Self { name, target, port, apps }
     }
+}
+
+/// One editable shortcut: a name (optional) and the command it runs.
+struct AppRow {
+    name: Entity<InputState>,
+    command: Entity<InputState>,
+}
+
+impl AppRow {
+    fn new(app: Option<&HostApp>, window: &mut Window, cx: &mut Context<SettingsEditor>) -> Self {
+        let name = cx.new(|cx| {
+            let state = InputState::new(window, cx).placeholder("name (e.g. herdr)");
+            match app {
+                Some(a) => state.default_value(a.name.clone()),
+                None => state,
+            }
+        });
+        let command = cx.new(|cx| {
+            let state = InputState::new(window, cx).placeholder("command (e.g. herdr)");
+            match app {
+                Some(a) => state.default_value(a.command.clone()),
+                None => state,
+            }
+        });
+        Self { name, command }
+    }
+}
+
+/// Collect a list of app rows into settings values, dropping rows whose
+/// command is empty (the same posture as hosts without a target).
+fn collect_apps(rows: &[AppRow], cx: &Context<SettingsEditor>) -> Vec<HostApp> {
+    rows.iter()
+        .filter_map(|row| {
+            let command = row.command.read(cx).value().trim().to_string();
+            if command.is_empty() {
+                return None;
+            }
+            let name = row.name.read(cx).value().trim().to_string();
+            Some(HostApp { name, command })
+        })
+        .collect()
 }
 
 impl SettingsEditor {
@@ -166,6 +213,12 @@ impl SettingsEditor {
         if rows.is_empty() {
             rows.push(HostRow::new(None, window, cx));
         }
+        let local_apps = ws
+            .settings
+            .local_apps
+            .iter()
+            .map(|a| AppRow::new(Some(a), window, cx))
+            .collect();
         let template_loaded = kairn_core::template::daily_template_body(&ws.notes_root);
         let template_body = cx.new(|cx| {
             InputState::new(window, cx)
@@ -237,6 +290,7 @@ impl SettingsEditor {
             tab: Tab::General,
             notes_root_choice,
             rows,
+            local_apps,
             template_loaded,
             template_body,
             template_rule: ws.settings.daily_template_rule.clone(),
@@ -273,7 +327,8 @@ impl SettingsEditor {
                     name
                 };
                 let port = row.port.read(cx).value().trim().parse::<u16>().ok();
-                Some(SshHost { name, target, port })
+                let apps = collect_apps(&row.apps, cx);
+                Some(SshHost { name, target, port, apps })
             })
             .collect()
     }
@@ -307,6 +362,7 @@ impl SettingsEditor {
         let patch = crate::vault_state::SettingsPatch {
             notes_root: self.notes_root_choice.clone(),
             hosts: self.collect_hosts(cx),
+            local_apps: collect_apps(&self.local_apps, cx),
             daily_template_rule: self.template_rule.clone(),
             template_body: (body != self.template_loaded).then_some(body),
             theme: self.theme_choice.clone(),
@@ -347,6 +403,14 @@ impl SettingsEditor {
             .upgrade()
             .map(|ws| ws.read(cx).settings.day_timeline)
             .unwrap_or(true);
+        let (show_agents, show_daily, show_tasks) = self
+            .workspace
+            .upgrade()
+            .map(|ws| {
+                let s = &ws.read(cx).settings;
+                (s.show_agents, s.show_daily, s.show_tasks)
+            })
+            .unwrap_or((true, true, true));
         let resolved = self
             .workspace
             .upgrade()
@@ -382,6 +446,32 @@ impl SettingsEditor {
                 });
                 cx.notify();
             }))
+        };
+        // One Shown/Hidden pair per hideable sidebar section; the setter is
+        // picked by label to keep the three rows one closure.
+        let vis_button = |id: &'static str, section: &'static str, on: bool, current: bool| {
+            let btn = Button::new(id).label(if on { "Shown" } else { "Hidden" });
+            let btn = if on == current { btn.primary() } else { btn.outline() };
+            btn.on_click(cx.listener(move |this, _, _, cx| {
+                let _ = this.workspace.update(cx, |ws, cx| match section {
+                    "daily" => ws.set_show_daily(on, cx),
+                    "tasks" => ws.set_show_tasks(on, cx),
+                    _ => ws.set_show_agents(on, cx),
+                });
+                cx.notify();
+            }))
+        };
+        let vis_row = |label: &'static str,
+                       section: &'static str,
+                       on_id: &'static str,
+                       off_id: &'static str,
+                       current: bool| {
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(div().w(px(90.)).text_size(px(12.5)).child(label))
+                .child(vis_button(on_id, section, true, current))
+                .child(vis_button(off_id, section, false, current))
         };
 
         v_flex()
@@ -473,6 +563,14 @@ impl SettingsEditor {
             )
             .child(div().text_size(px(11.)).opacity(0.55).child(
                 "The pill row of timed lines (09:00 standup) at the top of a daily note.",
+            ))
+            .child(Self::section("Sidebar sections"))
+            .child(vis_row("Daily", "daily", "daily-vis-on", "daily-vis-off", show_daily))
+            .child(vis_row("Tasks", "tasks", "tasks-vis-on", "tasks-vis-off", show_tasks))
+            .child(vis_row("Agents", "agents", "agents-on", "agents-off", show_agents))
+            .child(div().text_size(px(11.)).opacity(0.55).child(
+                "Hidden sections disappear from the sidebar entirely. Agents is the feed \
+                 of agent CLI activity on this machine.",
             ))
             .child(Self::section("Command line tool"))
             .child(self.render_cli(cx))
@@ -650,8 +748,66 @@ impl SettingsEditor {
             ))
     }
 
+    /// A shortcut's editable row: name, command, remove. `host` indexes
+    /// `rows`; None edits the local list.
+    fn app_row_ui(&self, host: Option<usize>, j: usize, cx: &mut Context<Self>) -> gpui::Div {
+        let row = match host {
+            Some(i) => &self.rows[i].apps[j],
+            None => &self.local_apps[j],
+        };
+        let rm_id = SharedString::from(match host {
+            Some(i) => format!("app-remove-{i}-{j}"),
+            None => format!("local-app-remove-{j}"),
+        });
+        h_flex()
+            .gap_2()
+            .items_center()
+            .when(host.is_some(), |d| d.pl(px(18.)))
+            .child(div().w(px(140.)).child(Input::new(&row.name)))
+            .child(div().flex_1().child(Input::new(&row.command)))
+            .child(
+                Button::new(rm_id)
+                    .ghost()
+                    .label("✕")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        match host {
+                            Some(i) => {
+                                this.rows[i].apps.remove(j);
+                            }
+                            None => {
+                                this.local_apps.remove(j);
+                            }
+                        }
+                        cx.notify();
+                    })),
+            )
+    }
+
     fn render_ssh(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let mut root = v_flex().gap_2().w_full().child(Self::section("SSH hosts"));
+        let mut root = v_flex()
+            .gap_2()
+            .w_full()
+            .child(Self::section("Shortcuts on this machine"))
+            .child(div().text_size(px(11.)).opacity(0.55).child(
+                "A shortcut opens a command in its own session, from the Sessions + menu \
+                 and the start page. When the command exits, the session drops to a shell.",
+            ));
+        for j in 0..self.local_apps.len() {
+            root = root.child(self.app_row_ui(None, j, cx));
+        }
+        root = root.child(
+            h_flex().child(
+                Button::new("local-app-add")
+                    .outline()
+                    .label("Add shortcut")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.local_apps.push(AppRow::new(None, window, cx));
+                        cx.notify();
+                    })),
+            ),
+        );
+
+        root = root.child(Self::section("SSH hosts"));
         for (i, row) in self.rows.iter().enumerate() {
             root = root.child(
                 h_flex()
@@ -669,6 +825,21 @@ impl SettingsEditor {
                                 cx.notify();
                             })),
                     ),
+            );
+            for j in 0..self.rows[i].apps.len() {
+                root = root.child(self.app_row_ui(Some(i), j, cx));
+            }
+            root = root.child(
+                h_flex().pl(px(18.)).child(
+                    Button::new(SharedString::from(format!("host-app-add-{i}")))
+                        .ghost()
+                        .label("Add shortcut")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let app = AppRow::new(None, window, cx);
+                            this.rows[i].apps.push(app);
+                            cx.notify();
+                        })),
+                ),
             );
         }
         root.child(

@@ -35,6 +35,20 @@ actions!(
         EditorSelectRight,
         EditorSelectUp,
         EditorSelectDown,
+        EditorWordLeft,
+        EditorWordRight,
+        EditorSelectWordLeft,
+        EditorSelectWordRight,
+        EditorLineStart,
+        EditorLineEnd,
+        EditorSelectLineStart,
+        EditorSelectLineEnd,
+        EditorDocStart,
+        EditorDocEnd,
+        EditorSelectDocStart,
+        EditorSelectDocEnd,
+        EditorDeleteWordBack,
+        EditorDeleteToLineStart,
         Session1,
         Session2,
         Session3,
@@ -110,7 +124,44 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("shift-right", EditorSelectRight, Some("NoteEditor")),
         KeyBinding::new("shift-up", EditorSelectUp, Some("NoteEditor")),
         KeyBinding::new("shift-down", EditorSelectDown, Some("NoteEditor")),
+        // Line start/end on the dedicated keys, both platforms.
+        KeyBinding::new("home", EditorLineStart, Some("NoteEditor")),
+        KeyBinding::new("end", EditorLineEnd, Some("NoteEditor")),
+        KeyBinding::new("shift-home", EditorSelectLineStart, Some("NoteEditor")),
+        KeyBinding::new("shift-end", EditorSelectLineEnd, Some("NoteEditor")),
     ]);
+    // Word, line, and document motions on each platform's native text
+    // chords: Option/Cmd arrows on macOS, Ctrl arrows and Home/End on Linux.
+    if cfg!(target_os = "macos") {
+        cx.bind_keys([
+            KeyBinding::new("alt-left", EditorWordLeft, Some("NoteEditor")),
+            KeyBinding::new("alt-right", EditorWordRight, Some("NoteEditor")),
+            KeyBinding::new("alt-shift-left", EditorSelectWordLeft, Some("NoteEditor")),
+            KeyBinding::new("alt-shift-right", EditorSelectWordRight, Some("NoteEditor")),
+            KeyBinding::new("cmd-left", EditorLineStart, Some("NoteEditor")),
+            KeyBinding::new("cmd-right", EditorLineEnd, Some("NoteEditor")),
+            KeyBinding::new("cmd-shift-left", EditorSelectLineStart, Some("NoteEditor")),
+            KeyBinding::new("cmd-shift-right", EditorSelectLineEnd, Some("NoteEditor")),
+            KeyBinding::new("cmd-up", EditorDocStart, Some("NoteEditor")),
+            KeyBinding::new("cmd-down", EditorDocEnd, Some("NoteEditor")),
+            KeyBinding::new("cmd-shift-up", EditorSelectDocStart, Some("NoteEditor")),
+            KeyBinding::new("cmd-shift-down", EditorSelectDocEnd, Some("NoteEditor")),
+            KeyBinding::new("alt-backspace", EditorDeleteWordBack, Some("NoteEditor")),
+            KeyBinding::new("cmd-backspace", EditorDeleteToLineStart, Some("NoteEditor")),
+        ]);
+    } else {
+        cx.bind_keys([
+            KeyBinding::new("ctrl-left", EditorWordLeft, Some("NoteEditor")),
+            KeyBinding::new("ctrl-right", EditorWordRight, Some("NoteEditor")),
+            KeyBinding::new("ctrl-shift-left", EditorSelectWordLeft, Some("NoteEditor")),
+            KeyBinding::new("ctrl-shift-right", EditorSelectWordRight, Some("NoteEditor")),
+            KeyBinding::new("ctrl-home", EditorDocStart, Some("NoteEditor")),
+            KeyBinding::new("ctrl-end", EditorDocEnd, Some("NoteEditor")),
+            KeyBinding::new("ctrl-shift-home", EditorSelectDocStart, Some("NoteEditor")),
+            KeyBinding::new("ctrl-shift-end", EditorSelectDocEnd, Some("NoteEditor")),
+            KeyBinding::new("ctrl-backspace", EditorDeleteWordBack, Some("NoteEditor")),
+        ]);
+    }
 }
 
 /// Every binding the app answers to, grouped for the settings Keybinds tab:
@@ -153,6 +204,27 @@ pub fn keybind_list() -> Vec<(&'static str, Vec<(String, &'static str)>)> {
                 (chord("V"), "Paste"),
                 (chord("A"), "Select all"),
             ],
+        ),
+        (
+            "Notes: cursor",
+            if cfg!(target_os = "macos") {
+                vec![
+                    ("⌥← ⌥→".to_string(), "Previous or next word"),
+                    ("⌘← ⌘→".to_string(), "Start or end of line"),
+                    ("⌘↑ ⌘↓".to_string(), "Top or bottom of note"),
+                    ("⇧ + any move".to_string(), "Extend the selection"),
+                    ("⌥⌫".to_string(), "Delete the previous word"),
+                    ("⌘⌫".to_string(), "Delete to the start of the line"),
+                ]
+            } else {
+                vec![
+                    ("Ctrl+← Ctrl+→".to_string(), "Previous or next word"),
+                    ("Home End".to_string(), "Start or end of line"),
+                    ("Ctrl+Home Ctrl+End".to_string(), "Top or bottom of note"),
+                    ("Shift + any move".to_string(), "Extend the selection"),
+                    ("Ctrl+⌫".to_string(), "Delete the previous word"),
+                ]
+            },
         ),
     ]
 }

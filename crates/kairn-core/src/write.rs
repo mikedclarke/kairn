@@ -9,36 +9,63 @@ use std::path::{Path, PathBuf};
 
 use chrono::{Local, NaiveDate};
 
+use crate::blocks::section_end_line as section_end_insert_idx;
 use crate::tasks::toggle_task_line;
 use crate::vault::{daily_file, daily_path};
 
 /// Append a captured line to a day's note as an open task, creating the file
 /// if the day has none yet. A day from today onward that is created here
-/// starts from the daily template, matching what the app shows for an empty
-/// day, so a capture never flattens the template layout the user was
-/// looking at. Returns the file written.
-pub fn append_to_day(root: &Path, date: NaiveDate, text: &str) -> io::Result<PathBuf> {
+/// starts from the daily template when `template_rule` (the configured
+/// daily-template rule) applies to that day, matching what the app shows
+/// for an empty day, so a capture never flattens the template layout the
+/// user was looking at. Returns the file written.
+pub fn append_to_day(
+    root: &Path,
+    date: NaiveDate,
+    text: &str,
+    template_rule: &str,
+) -> io::Result<PathBuf> {
+    let path = ensure_day_note(root, date, template_rule)?;
+    append_line(&path, &format!("* {}", text.trim()))?;
+    Ok(path)
+}
+
+/// The day's note file, seeded from the daily template first when the day
+/// has no note yet (today onward, when `template_rule` applies), so a write
+/// that follows lands in the same layout the app would show for that day.
+/// The file itself may still not exist afterwards (a past day, or no
+/// template): appends create it bare.
+pub fn ensure_day_note(
+    root: &Path,
+    date: NaiveDate,
+    template_rule: &str,
+) -> io::Result<PathBuf> {
     let path = daily_file(root, date).unwrap_or_else(|| daily_path(root, date));
     if !path.exists()
         && date >= Local::now().date_naive()
+        && crate::template::template_applies(template_rule, date)
         && let Some(seed) = crate::template::daily_template(root)
     {
         // The day's masthead titles it, so drop a redundant leading `# title`.
         create_note_if_absent(&path, crate::template::strip_daily_title(&seed))?;
     }
-    append_line(&path, &format!("* {}", text.trim()))?;
     Ok(path)
 }
 
 /// Capture a line of input into a day's note: the quick-capture flow the app
 /// and the CLI share. Blank input is a no-op; anything else lands as an open
 /// task. Returns the file written, `None` when there was nothing to write.
-pub fn capture(root: &Path, date: NaiveDate, text: &str) -> io::Result<Option<PathBuf>> {
+pub fn capture(
+    root: &Path,
+    date: NaiveDate,
+    text: &str,
+    template_rule: &str,
+) -> io::Result<Option<PathBuf>> {
     let text = text.trim();
     if text.is_empty() {
         return Ok(None);
     }
-    append_to_day(root, date, text).map(Some)
+    append_to_day(root, date, text, template_rule).map(Some)
 }
 
 /// Append `line` (which may contain newlines) to a note, re-reading the file
@@ -180,6 +207,21 @@ pub fn new_note_in(dir: &Path, name: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Create a subfolder of `dir` named by the user. Never overwrites: an
+/// existing file or folder of that name is an error. Returns the new path.
+pub fn create_folder_in(dir: &Path, name: &str) -> io::Result<PathBuf> {
+    let name = checked_stem(name)?;
+    let path = dir.join(name);
+    if path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("\"{name}\" already exists here"),
+        ));
+    }
+    fs::create_dir(&path)?;
+    Ok(path)
+}
+
 /// Create a fresh, untitled note in `dir`, seeded with an empty `# ` heading
 /// so the caret can land after it and the user just types the title — which
 /// then renames the file (see [`note_title_stem`]), NotePlan-style. Picks the
@@ -193,6 +235,20 @@ pub fn new_untitled_note_in(dir: &Path) -> io::Result<PathBuf> {
     }
     create_note_if_absent(&path, "# \n")?;
     Ok(path)
+}
+
+/// Whether `stem` is a name [`new_untitled_note_in`] hands out ("Untitled",
+/// "Untitled 2", ...). Title-driven renaming applies only to these: a note
+/// that already carries a real name must never be moved on disk just because
+/// its first heading was edited (wiki links to it would silently dangle).
+pub fn is_untitled_stem(stem: &str) -> bool {
+    match stem.strip_prefix("Untitled") {
+        Some("") => true,
+        Some(rest) => rest
+            .strip_prefix(' ')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
+        None => false,
+    }
 }
 
 /// The filename stem a note's title implies: the text of its first heading
@@ -360,6 +416,250 @@ pub fn replace_line_on_disk(
     Ok(Some(idx))
 }
 
+/// Remove the line at `line_idx` from `text` entirely, taking its line
+/// ending with it. The line is verified (or found again, requiring a unique
+/// content match) like [`edit_line_in_text`]; `None` when it is gone or
+/// ambiguous. Returns the new text and the index the line was removed from.
+fn remove_line_in_text(
+    text: &str,
+    line_idx: usize,
+    expected: &str,
+) -> Option<(String, usize)> {
+    fn content(seg: &str) -> &str {
+        let s = seg.strip_suffix('\n').unwrap_or(seg);
+        s.strip_suffix('\r').unwrap_or(s)
+    }
+    let segs: Vec<&str> = text.split_inclusive('\n').collect();
+    let idx = if segs.get(line_idx).is_some_and(|s| content(s) == expected) {
+        line_idx
+    } else {
+        let mut matches = segs
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| content(s) == expected)
+            .map(|(i, _)| i);
+        let only = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        only
+    };
+    let mut out = String::with_capacity(text.len());
+    for (i, seg) in segs.iter().enumerate() {
+        if i != idx {
+            out.push_str(seg);
+        }
+    }
+    // Removing the last line of a file without a trailing newline leaves the
+    // new last line's ending dangling; drop it so the file's no-trailing-
+    // newline convention survives.
+    if !text.ends_with('\n') && idx == segs.len() - 1 {
+        while out.ends_with('\n') || out.ends_with('\r') {
+            out.pop();
+        }
+    }
+    Some((out, idx))
+}
+
+/// Remove one line of a note on disk. Same relocation and staleness contract
+/// as [`replace_line_on_disk`]; atomic write. Returns the index the line was
+/// removed from, `None` when the line is gone or ambiguous and nothing was
+/// written.
+pub fn remove_line_on_disk(
+    path: &Path,
+    line_idx: usize,
+    expected: &str,
+) -> io::Result<Option<usize>> {
+    let text = fs::read_to_string(path)?;
+    let Some((new_text, idx)) = remove_line_in_text(&text, line_idx, expected) else {
+        return Ok(None);
+    };
+    atomic_write(path, &new_text)?;
+    Ok(Some(idx))
+}
+
+/// A heading reduced to what identifies its section: hashes, NotePlan `==`
+/// highlight markers, surrounding whitespace, and case all ignored, so
+/// `### ==Todays Tasks==` matches a request for `todays tasks`.
+fn section_key(heading: &str) -> String {
+    let s = heading.trim().trim_start_matches('#').trim();
+    let s = s
+        .strip_prefix("==")
+        .and_then(|s| s.strip_suffix("=="))
+        .map(str::trim)
+        .unwrap_or(s);
+    s.to_lowercase()
+}
+
+/// Where `addition` should land to sit at the end of `section`: after the
+/// section's last content line, before any trailing blank lines or `---`
+/// rules (those belong to the boundary, not the content). The section is the
+/// first heading whose text matches `section` (see [`section_key`]) and runs
+/// to the next heading of the same or higher level. `None` when no heading
+/// matches.
+fn section_insert_idx(lines: &[&str], section: &str) -> Option<usize> {
+    let key = section_key(section);
+    if key.is_empty() {
+        return None;
+    }
+    let level_of = |line: &str| match crate::parse::parse_line(line) {
+        crate::parse::Line::Heading { level, .. } => Some(level),
+        _ => None,
+    };
+    let (start, level) = lines
+        .iter()
+        .enumerate()
+        .find_map(|(i, l)| level_of(l).filter(|_| section_key(l) == key).map(|lv| (i, lv)))?;
+    Some(section_end_insert_idx(lines, start, level))
+}
+
+
+/// Append `text` (which may span lines) to a note so it lands at the end of
+/// the section headed by `section`: after the section's last non-blank line,
+/// before whatever follows. When no heading matches, the section is created
+/// at the end of the note — `section` verbatim when it brings its own `#`
+/// marks, as a `## ` heading otherwise — and the text follows it. A missing
+/// file is created. Returns the index the text starts at.
+pub fn append_to_section(path: &Path, section: &str, text: &str) -> io::Result<usize> {
+    let existing = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some(idx) = section_insert_idx(&lines, section) else {
+        let heading = if section.trim_start().starts_with('#') {
+            section.trim().to_string()
+        } else {
+            format!("## {}", section.trim())
+        };
+        let block = if existing.trim().is_empty() {
+            format!("{heading}\n{text}")
+        } else {
+            format!("\n{heading}\n{text}")
+        };
+        return append_line(path, &block).map(|idx| idx + block.lines().count() - text.lines().count());
+    };
+    let crlf = existing.contains("\r\n");
+    let ending = if crlf { "\r\n" } else { "\n" };
+    let text = if crlf { text.replace('\n', "\r\n") } else { text.to_string() };
+    let mut out = String::with_capacity(existing.len() + text.len() + 2);
+    for (i, line) in lines.iter().enumerate() {
+        if i == idx {
+            out.push_str(&text);
+            out.push_str(ending);
+        }
+        out.push_str(line);
+        out.push_str(ending);
+    }
+    if idx == lines.len() {
+        out.push_str(&text);
+        out.push_str(ending);
+    }
+    if !existing.ends_with('\n') && !existing.is_empty() {
+        while out.ends_with('\n') || out.ends_with('\r') {
+            out.pop();
+        }
+    }
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    atomic_write(path, &out)?;
+    Ok(idx)
+}
+
+/// Insert `block` (which may span lines) at the very top of `date`'s daily
+/// note, above everything already there. The file is created if the day has
+/// none; a new today-or-future file is seeded from the daily template first
+/// when `template_rule` applies, and the block still lands above the seeded
+/// layout. Line-ending and trailing-newline conventions are preserved.
+/// Returns the file written.
+pub fn insert_block_at_top(
+    root: &Path,
+    date: NaiveDate,
+    block: &str,
+    template_rule: &str,
+) -> io::Result<PathBuf> {
+    let path = ensure_day_note(root, date, template_rule)?;
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let crlf = text.contains("\r\n");
+    let ending = if crlf { "\r\n" } else { "\n" };
+    let block = if crlf { block.replace('\n', "\r\n") } else { block.to_string() };
+    let mut out = String::with_capacity(block.len() + text.len() + 2);
+    out.push_str(&block);
+    out.push_str(ending);
+    out.push_str(&text);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    atomic_write(&path, &out)?;
+    Ok(path)
+}
+
+/// Insert `block` (which may span lines) at the end of the section owned by
+/// the heading at `heading_line_idx`, verified against `expected` and found
+/// again by content when the file changed underneath us — but only when the
+/// match is unambiguous, like every other line edit here. The block lands
+/// after the section's last content line, before trailing blank lines or
+/// rules. Returns the line index the block starts at; `Ok(None)` when the
+/// heading is gone or ambiguous and nothing was written.
+pub fn insert_block_under_heading(
+    path: &Path,
+    heading_line_idx: usize,
+    expected: &str,
+    block: &str,
+) -> io::Result<Option<usize>> {
+    let text = fs::read_to_string(path)?;
+    let lines: Vec<&str> = text.lines().collect();
+    let idx = if lines.get(heading_line_idx).is_some_and(|l| *l == expected) {
+        heading_line_idx
+    } else {
+        let mut matches = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| **l == expected)
+            .map(|(i, _)| i);
+        let Some(only) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Ok(None);
+        }
+        only
+    };
+    let crate::parse::Line::Heading { level, .. } = crate::parse::parse_line(lines[idx]) else {
+        return Ok(None);
+    };
+    let insert = section_end_insert_idx(&lines, idx, level);
+    let crlf = text.contains("\r\n");
+    let ending = if crlf { "\r\n" } else { "\n" };
+    let block = if crlf { block.replace('\n', "\r\n") } else { block.to_string() };
+    let mut out = String::with_capacity(text.len() + block.len() + 2);
+    for (i, line) in lines.iter().enumerate() {
+        if i == insert {
+            out.push_str(&block);
+            out.push_str(ending);
+        }
+        out.push_str(line);
+        out.push_str(ending);
+    }
+    if insert == lines.len() {
+        out.push_str(&block);
+        out.push_str(ending);
+    }
+    if !text.ends_with('\n') && !text.is_empty() {
+        while out.ends_with('\n') || out.ends_with('\r') {
+            out.pop();
+        }
+    }
+    atomic_write(path, &out)?;
+    Ok(Some(insert))
+}
+
 /// Replace two adjacent lines with one `replacement` line. The pair is
 /// verified (or found again, requiring a unique match) by content like
 /// [`edit_line_in_text`]; `None` when the adjacent pair no longer exists or
@@ -511,6 +811,10 @@ mod tests {
     use super::*;
     use crate::ScratchRoot;
 
+    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).expect("valid date")
+    }
+
     #[test]
     fn toggle_in_text_tracks_moved_lines() {
         let text = "# Day\n* one\n* two\n";
@@ -532,6 +836,72 @@ mod tests {
             toggle_task_in_text("* one", 0, "* one").as_deref(),
             Some("* [x] one")
         );
+    }
+
+    #[test]
+    fn remove_line_verifies_relocates_and_keeps_endings() {
+        let root = ScratchRoot::new("remove");
+        let path = root.write("Calendar/20260805.md", "# Day\n* one\n* two\n* three\n");
+        // Straightforward: index matches, line and its ending go together.
+        assert_eq!(remove_line_on_disk(&path, 2, "* two").expect("io"), Some(2));
+        assert_eq!(fs::read_to_string(&path).expect("read"), "# Day\n* one\n* three\n");
+        // The file changed since render: relocated by content.
+        assert_eq!(remove_line_on_disk(&path, 5, "* one").expect("io"), Some(1));
+        assert_eq!(fs::read_to_string(&path).expect("read"), "# Day\n* three\n");
+        // Gone: nothing written.
+        assert_eq!(remove_line_on_disk(&path, 0, "* one").expect("io"), None);
+        // Ambiguous (two identical lines, wrong index): nothing written.
+        let dup = root.write("Calendar/20260806.md", "* same\ntext\n* same\n");
+        assert_eq!(remove_line_on_disk(&dup, 1, "* same").expect("io"), None);
+        assert_eq!(fs::read_to_string(&dup).expect("read"), "* same\ntext\n* same\n");
+        // Removing the last line of a no-trailing-newline file keeps that
+        // convention rather than leaving a dangling ending.
+        let bare = root.write("Notes/Bare.md", "* one\n* two");
+        assert_eq!(remove_line_on_disk(&bare, 1, "* two").expect("io"), Some(1));
+        assert_eq!(fs::read_to_string(&bare).expect("read"), "* one");
+    }
+
+    #[test]
+    fn section_appends_land_at_section_end() {
+        let root = ScratchRoot::new("section");
+        let path = root.write(
+            "Calendar/20260805.md",
+            "### ==Todays Tasks==\n* one\n\n---\n### ==Daily Notes==\nprose\n",
+        );
+        // Highlight markers, hashes, and case are all ignored when matching.
+        assert_eq!(append_to_section(&path, "todays tasks", "* two").expect("io"), 2);
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "### ==Todays Tasks==\n* one\n* two\n\n---\n### ==Daily Notes==\nprose\n"
+        );
+        // The last section runs to the end of the file.
+        append_to_section(&path, "Daily Notes", "more prose").expect("io");
+        assert!(fs::read_to_string(&path).expect("read").ends_with("prose\nmore prose\n"));
+        // No matching heading: the section is created at the end, `#` marks
+        // taken verbatim when given, `## ` otherwise.
+        append_to_section(&path, "## PM", "* [ ] Capture: a thing").expect("io");
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(text.ends_with("more prose\n\n## PM\n* [ ] Capture: a thing\n"));
+        append_to_section(&path, "PM", "* another").expect("io");
+        assert!(fs::read_to_string(&path).expect("read").ends_with("## PM\n* [ ] Capture: a thing\n* another\n"));
+        // A brand-new file starts with the heading, no leading blank.
+        let fresh = root.0.join("Notes/Fresh.md");
+        append_to_section(&fresh, "Log", "first").expect("io");
+        assert_eq!(fs::read_to_string(&fresh).expect("read"), "## Log\nfirst\n");
+    }
+
+    #[test]
+    fn section_scope_respects_heading_levels() {
+        // A deeper heading does not end the section; an equal or higher one does.
+        let lines: Vec<&str> =
+            vec!["## PM", "line", "#### Prep", "ask", "", "## Later", "x"];
+        assert_eq!(section_insert_idx(&lines, "PM"), Some(4));
+        assert_eq!(section_insert_idx(&lines, "Prep"), Some(4));
+        assert_eq!(section_insert_idx(&lines, "Later"), Some(7));
+        assert_eq!(section_insert_idx(&lines, "missing"), None);
+        // An empty section inserts directly after its heading.
+        let empty: Vec<&str> = vec!["## A", "## B", "text"];
+        assert_eq!(section_insert_idx(&empty, "A"), Some(1));
     }
 
     #[test]
@@ -601,6 +971,16 @@ mod tests {
         // A second one steps to a numbered name rather than colliding.
         let second = new_untitled_note_in(&dir).expect("create");
         assert_eq!(second, dir.join("Untitled 2.md"));
+    }
+
+    #[test]
+    fn untitled_stems_are_recognised() {
+        for good in ["Untitled", "Untitled 2", "Untitled 10"] {
+            assert!(is_untitled_stem(good), "{good:?} should count as untitled");
+        }
+        for bad in ["Groceries", "Untitled2", "Untitled x", "untitled", "Untitled ", "Untitled 2b"] {
+            assert!(!is_untitled_stem(bad), "{bad:?} should not count as untitled");
+        }
     }
 
     #[test]
@@ -777,10 +1157,10 @@ mod tests {
         let root = ScratchRoot::new("capture");
         let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 7).expect("valid");
         // Blank input writes nothing at all.
-        assert_eq!(capture(&root.0, date, "   ").expect("io"), None);
+        assert_eq!(capture(&root.0, date, "   ", "always").expect("io"), None);
         assert!(!root.0.join("Calendar/20260807.md").exists());
         // Real input lands as an open task.
-        let path = capture(&root.0, date, "call the bank").expect("io").expect("written");
+        let path = capture(&root.0, date, "call the bank", "always").expect("io").expect("written");
         assert_eq!(fs::read_to_string(&path).expect("read"), "* call the bank\n");
     }
 
@@ -790,15 +1170,143 @@ mod tests {
         root.write("Notes/@Templates/Daily.md", "### Tasks\n\n### Notes\n");
         // A capture into a brand-new future day lands under the template.
         let future = Local::now().date_naive() + chrono::Days::new(1);
-        let path = capture(&root.0, future, "pack bags").expect("io").expect("written");
+        let path = capture(&root.0, future, "pack bags", "always").expect("io").expect("written");
         assert_eq!(
             fs::read_to_string(&path).expect("read"),
             "### Tasks\n\n### Notes\n* pack bags\n"
         );
         // A past day is never dressed up with today's template.
         let past = chrono::NaiveDate::from_ymd_opt(2020, 1, 2).expect("valid");
-        let past_path = capture(&root.0, past, "old note").expect("io").expect("written");
+        let past_path = capture(&root.0, past, "old note", "always").expect("io").expect("written");
         assert_eq!(fs::read_to_string(&past_path).expect("read"), "* old note\n");
+    }
+
+    #[test]
+    fn capture_respects_the_template_rule() {
+        use chrono::Datelike as _;
+        let root = ScratchRoot::new("capture-rule");
+        root.write("Notes/@Templates/Daily.md", "### Tasks\n");
+        let today = Local::now().date_naive();
+        // Under "off" no day is seeded, template file or not.
+        let path = capture(&root.0, today, "plain day", "off").expect("io").expect("written");
+        assert_eq!(fs::read_to_string(&path).expect("read"), "* plain day\n");
+        // Under "weekdays" the next Saturday goes unseeded but the next
+        // Monday is dressed — the same days the app's day view would seed.
+        let mut day = today + chrono::Days::new(1);
+        let (saturday, monday) = loop {
+            if day.weekday() == chrono::Weekday::Sat {
+                break (day, day + chrono::Days::new(2));
+            }
+            day = day + chrono::Days::new(1);
+        };
+        let sat_path =
+            capture(&root.0, saturday, "mow the lawn", "weekdays").expect("io").expect("written");
+        assert_eq!(fs::read_to_string(&sat_path).expect("read"), "* mow the lawn\n");
+        let mon_path =
+            capture(&root.0, monday, "stand-up", "weekdays").expect("io").expect("written");
+        assert_eq!(fs::read_to_string(&mon_path).expect("read"), "### Tasks\n* stand-up\n");
+    }
+
+    #[test]
+    fn block_at_top_lands_above_everything() {
+        let root = ScratchRoot::new("block-top");
+        let path = root.write("Calendar/20260805.md", "# Day\n* existing\n");
+        insert_block_at_top(&root.0, date(2026, 8, 5), "* moved\n\tsub", "off").expect("io");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "* moved\n\tsub\n# Day\n* existing\n"
+        );
+        // No trailing newline stays that way.
+        let bare = root.write("Calendar/20260806.md", "* one");
+        insert_block_at_top(&root.0, date(2026, 8, 6), "* zero", "off").expect("io");
+        assert_eq!(fs::read_to_string(&bare).expect("read"), "* zero\n* one");
+        // CRLF files keep their endings, block converted to match.
+        let crlf = root.write("Calendar/20260807.md", "# Day\r\n* a\r\n");
+        insert_block_at_top(&root.0, date(2026, 8, 7), "* new\n\tsub", "off").expect("io");
+        assert_eq!(
+            fs::read_to_string(&crlf).expect("read"),
+            "* new\r\n\tsub\r\n# Day\r\n* a\r\n"
+        );
+    }
+
+    #[test]
+    fn block_at_top_seeds_new_days_below_the_block() {
+        let root = ScratchRoot::new("block-top-seed");
+        root.write("Notes/@Templates/Daily.md", "### Tasks\n\n### Notes\n");
+        let future = Local::now().date_naive() + chrono::Days::new(1);
+        let path =
+            insert_block_at_top(&root.0, future, "* dropped", "always").expect("io");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "* dropped\n### Tasks\n\n### Notes\n"
+        );
+        // A past day gets the block alone, never today's template.
+        let past = date(2020, 1, 2);
+        let past_path = insert_block_at_top(&root.0, past, "* old", "always").expect("io");
+        assert_eq!(fs::read_to_string(&past_path).expect("read"), "* old\n");
+    }
+
+    #[test]
+    fn block_under_heading_lands_at_section_end() {
+        let root = ScratchRoot::new("block-heading");
+        let path = root.write(
+            "Calendar/20260805.md",
+            "## Alpha\n* one\n#### Deep\n* deep\n\n---\n## Beta\nprose\n",
+        );
+        // Sub-headings don't end the section; trailing blanks and rules do.
+        assert_eq!(
+            insert_block_under_heading(&path, 0, "## Alpha", "* two\n\tsub").expect("io"),
+            Some(4)
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "## Alpha\n* one\n#### Deep\n* deep\n* two\n\tsub\n\n---\n## Beta\nprose\n"
+        );
+        // Last section runs to the end of the file.
+        assert_eq!(
+            insert_block_under_heading(&path, 8, "## Beta", "* tail").expect("io"),
+            Some(10)
+        );
+        assert!(fs::read_to_string(&path).expect("read").ends_with("## Beta\nprose\n* tail\n"));
+    }
+
+    #[test]
+    fn block_under_heading_verifies_and_relocates() {
+        let root = ScratchRoot::new("block-relocate");
+        let path = root.write("Notes/Plan.md", "intro\n## Tasks\n* a\n");
+        // The heading moved since render: found again by content.
+        assert_eq!(
+            insert_block_under_heading(&path, 0, "## Tasks", "* b").expect("io"),
+            Some(3)
+        );
+        assert_eq!(fs::read_to_string(&path).expect("read"), "intro\n## Tasks\n* a\n* b\n");
+        // Gone or not a heading: nothing written.
+        assert_eq!(insert_block_under_heading(&path, 1, "## Missing", "* x").expect("io"), None);
+        assert_eq!(insert_block_under_heading(&path, 0, "intro", "* x").expect("io"), None);
+        // Ambiguous duplicate headings at the wrong index: nothing written.
+        let dup = root.write("Notes/Dup.md", "## Log\n* a\n## Log\n* b\n");
+        assert_eq!(insert_block_under_heading(&dup, 1, "## Log", "* x").expect("io"), None);
+        assert_eq!(fs::read_to_string(&dup).expect("read"), "## Log\n* a\n## Log\n* b\n");
+        // At the right index a duplicate heading is trusted.
+        assert_eq!(insert_block_under_heading(&dup, 2, "## Log", "* x").expect("io"), Some(4));
+        assert_eq!(
+            fs::read_to_string(&dup).expect("read"),
+            "## Log\n* a\n## Log\n* b\n* x\n"
+        );
+        // Empty section: the block lands right under the heading.
+        let empty = root.write("Notes/Empty.md", "## Open\n\n## Next\n* n\n");
+        assert_eq!(insert_block_under_heading(&empty, 0, "## Open", "* first").expect("io"), Some(1));
+        assert_eq!(
+            fs::read_to_string(&empty).expect("read"),
+            "## Open\n* first\n\n## Next\n* n\n"
+        );
+        // CRLF file: endings preserved, block converted.
+        let crlf = root.write("Notes/Crlf.md", "## A\r\n* one\r\n## B\r\n");
+        assert_eq!(insert_block_under_heading(&crlf, 0, "## A", "* two\n\tsub").expect("io"), Some(2));
+        assert_eq!(
+            fs::read_to_string(&crlf).expect("read"),
+            "## A\r\n* one\r\n* two\r\n\tsub\r\n## B\r\n"
+        );
     }
 
     #[cfg(unix)]

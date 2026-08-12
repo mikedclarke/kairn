@@ -24,6 +24,12 @@ OUT_DIR="${OUT_DIR:-$ROOT/dist}"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 [ -n "$VERSION" ] || { echo "could not read version from Cargo.toml"; exit 1; }
 
+# Start clean so an old bundle or a previous version's .dmg can't linger in
+# dist/ and get uploaded by mistake. Only the macOS artifacts are removed, so
+# Linux .deb/.AppImage collected here for a release survive.
+mkdir -p "$OUT_DIR"
+rm -rf "$OUT_DIR"/Kairn.app "$OUT_DIR"/Kairn-*.dmg
+
 echo "==> packaging Kairn $VERSION (universal .app)"
 cargo packager --release -p kairn-app -f app --out-dir "$OUT_DIR" -v
 

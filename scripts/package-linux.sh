@@ -17,6 +17,13 @@ cd "$ROOT"
 # already built without debug bloat. Override with NO_STRIP=false if needed.
 export NO_STRIP="${NO_STRIP:-true}"
 
+# Start clean: a leftover .deb/.AppImage from a previous build would make the
+# rename globs below match more than one file and silently pick the wrong one.
+# Only the two types this script produces are removed, so artifacts collected
+# from the other platform for a release are left alone.
+mkdir -p "$ROOT/dist"
+rm -f "$ROOT"/dist/*.deb "$ROOT"/dist/*.AppImage
+
 cargo packager --release -p kairn-app -f deb,appimage --out-dir "$ROOT/dist" -v
 
 # cargo-packager names both files after the main binary ("kairn-app") and gives
