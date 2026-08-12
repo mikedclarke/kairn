@@ -19,3 +19,5 @@ same fact twice; no em dashes. Rewrite to this standard before releasing.
 ## Fixed
 
 <!-- Bugs that no longer happen. -->
+
+- Hover drag handles now center vertically on their line instead of sitting too high, on both platforms.
