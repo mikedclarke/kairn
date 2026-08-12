@@ -65,10 +65,10 @@ use crate::colors::ColorPalette;
 use crate::event::GpuiEventProxy;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
-use alacritty_terminal::term::Term;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
-use alacritty_terminal::vte::ansi::Color;
+use alacritty_terminal::term::{Term, TermMode};
+use alacritty_terminal::vte::ansi::{Color, CursorShape};
 use gpui::{
     App, Bounds, Edges, Font, FontFeatures, FontStyle, FontWeight, Hsla, Pixels, Point,
     ShapedLine, SharedString, Size, TextRun, UnderlineStyle, Window, px, quad,
@@ -128,9 +128,11 @@ struct FrameLayout {
     font_sig: (String, i32),
     cols: usize,
     default_bg: Hsla,
-    /// Cursor as (visible row, col), if on screen.
+    /// Cursor as (visible row, col), if on screen and not hidden.
     cursor: Option<(usize, usize)>,
     cursor_color: Hsla,
+    /// Shape requested by the application (DECSCUSR), drawn at paint time.
+    cursor_shape: CursorShape,
     rows: Vec<RowLayout>,
 }
 
@@ -667,10 +669,16 @@ impl TerminalRenderer {
             Color::Named(alacritty_terminal::vte::ansi::NamedColor::Cursor),
             colors,
         );
+        // The application picks the cursor shape via DECSCUSR (vim's insert
+        // bar, Claude Code's prompt) and can hide it entirely, either with
+        // the Hidden shape or by turning DECTCEM off.
+        let cursor_shape = term.cursor_style().shape;
+        let cursor_visible =
+            term.mode().contains(TermMode::SHOW_CURSOR) && cursor_shape != CursorShape::Hidden;
         // Cursor shifts down with the content when scrolled into history and
         // disappears once it leaves the visible window.
         let cursor_row = grid.cursor.point.line.0 + display_offset;
-        let cursor = (cursor_row >= 0 && cursor_row < num_lines as i32)
+        let cursor = (cursor_visible && cursor_row >= 0 && cursor_row < num_lines as i32)
             .then_some((cursor_row as usize, grid.cursor.point.column.0));
 
         let mut rows = Vec::with_capacity(num_lines);
@@ -773,6 +781,7 @@ impl TerminalRenderer {
             default_bg,
             cursor,
             cursor_color,
+            cursor_shape,
             rows,
         }
     }
@@ -976,24 +985,75 @@ impl TerminalRenderer {
             }
         }
 
-        // Cursor
+        // Cursor, in the shape the application requested (DECSCUSR). Bar and
+        // underline thickness scale with the cell so they hold up across
+        // font sizes and displays.
         if let Some((cursor_row, cursor_col)) = frame.cursor {
-            let cursor_bounds = Bounds {
-                origin: Point {
-                    x: origin.x + self.cell_width * (cursor_col as f32),
-                    y: origin.y + self.cell_height * (cursor_row as f32),
-                },
-                size: Size {
-                    width: self.cell_width,
-                    height: self.cell_height,
-                },
+            let cell_origin = Point {
+                x: origin.x + self.cell_width * (cursor_col as f32),
+                y: origin.y + self.cell_height * (cursor_row as f32),
             };
+            let cell_size = Size {
+                width: self.cell_width,
+                height: self.cell_height,
+            };
+            let (bounds, border) = match frame.cursor_shape {
+                CursorShape::Beam => {
+                    let width = (self.cell_width * 0.15).max(px(1.0));
+                    let bounds = Bounds {
+                        origin: cell_origin,
+                        size: Size {
+                            width,
+                            height: self.cell_height,
+                        },
+                    };
+                    (bounds, Edges::<Pixels>::default())
+                }
+                CursorShape::Underline => {
+                    let height = (self.cell_height * 0.1).max(px(1.0));
+                    let bounds = Bounds {
+                        origin: Point {
+                            x: cell_origin.x,
+                            y: cell_origin.y + self.cell_height - height,
+                        },
+                        size: Size {
+                            width: self.cell_width,
+                            height,
+                        },
+                    };
+                    (bounds, Edges::<Pixels>::default())
+                }
+                CursorShape::HollowBlock => {
+                    let bounds = Bounds {
+                        origin: cell_origin,
+                        size: cell_size,
+                    };
+                    (bounds, Edges::all(px(1.0)))
+                }
+                // Hidden never reaches paint; layout drops the cursor.
+                CursorShape::Block | CursorShape::Hidden => {
+                    let bounds = Bounds {
+                        origin: cell_origin,
+                        size: cell_size,
+                    };
+                    (bounds, Edges::<Pixels>::default())
+                }
+            };
+            let hollow = border != Edges::<Pixels>::default();
             window.paint_quad(quad(
-                cursor_bounds,
+                bounds,
                 px(0.0),
-                frame.cursor_color,
-                Edges::<Pixels>::default(),
-                transparent_black(),
+                if hollow {
+                    transparent_black()
+                } else {
+                    frame.cursor_color
+                },
+                border,
+                if hollow {
+                    frame.cursor_color
+                } else {
+                    transparent_black()
+                },
                 Default::default(),
             ));
         }

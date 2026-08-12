@@ -458,6 +458,43 @@ mod tests {
     }
 
     #[test]
+    fn test_cursor_shape_and_visibility_sequences() {
+        use alacritty_terminal::vte::ansi::CursorShape;
+
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(80, 24, event_proxy);
+
+        // DECSCUSR: 5 = blinking bar (vim insert mode, Claude Code's prompt).
+        terminal.process_bytes(b"\x1b[5 q");
+        assert_eq!(
+            terminal.with_term(|term| term.cursor_style().shape),
+            CursorShape::Beam
+        );
+
+        // DECSCUSR: 4 = steady underline.
+        terminal.process_bytes(b"\x1b[4 q");
+        assert_eq!(
+            terminal.with_term(|term| term.cursor_style().shape),
+            CursorShape::Underline
+        );
+
+        // DECSCUSR: 0 = reset to default (block).
+        terminal.process_bytes(b"\x1b[0 q");
+        assert_eq!(
+            terminal.with_term(|term| term.cursor_style().shape),
+            CursorShape::Block
+        );
+
+        // DECTCEM: hide and show the cursor.
+        assert!(terminal.mode().contains(TermMode::SHOW_CURSOR));
+        terminal.process_bytes(b"\x1b[?25l");
+        assert!(!terminal.mode().contains(TermMode::SHOW_CURSOR));
+        terminal.process_bytes(b"\x1b[?25h");
+        assert!(terminal.mode().contains(TermMode::SHOW_CURSOR));
+    }
+
+    #[test]
     fn test_with_term() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
