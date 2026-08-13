@@ -656,13 +656,18 @@ impl Workspace {
     /// Rebuild every library root's visible rows. A collapsed root costs
     /// nothing; expanded ones read only their expanded directories.
     pub(crate) fn reload_library_trees(&mut self) {
+        let sort = if self.settings.library_sort == "name" {
+            notes::LibrarySort::Name
+        } else {
+            notes::LibrarySort::Modified
+        };
         self.library_trees = self
             .settings
             .library_roots()
             .into_iter()
             .map(|root| {
                 let rows = if self.library_expanded.contains(&root) {
-                    notes::library_tree(&root, &self.library_expanded)
+                    notes::library_tree(&root, &self.library_expanded, sort)
                 } else {
                     Vec::new()
                 };

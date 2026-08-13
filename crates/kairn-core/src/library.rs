@@ -67,13 +67,28 @@ fn is_real_dir(entry: &fs::DirEntry) -> bool {
     entry.file_type().is_ok_and(|t| t.is_dir())
 }
 
+/// How a library level orders its files. Folders always sort by name:
+/// they are navigation, and reshuffling them as contents change would
+/// churn the tree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LibrarySort {
+    /// Most recently modified first — the freshest agent output on top.
+    #[default]
+    Modified,
+    Name,
+}
+
 /// The visible rows of a library root given the expanded folders: folders
-/// before files, alphabetical. Lazy by construction — only expanded
-/// directories are read, so a 10k-file root costs one `read_dir` until
-/// folders are opened.
-pub fn library_tree(root: &Path, expanded: &HashSet<PathBuf>) -> Vec<LibraryEntry> {
+/// before files, folders by name, files per `sort`. Lazy by construction —
+/// only expanded directories are read, so a 10k-file root costs one
+/// `read_dir` until folders are opened.
+pub fn library_tree(
+    root: &Path,
+    expanded: &HashSet<PathBuf>,
+    sort: LibrarySort,
+) -> Vec<LibraryEntry> {
     let mut rows = Vec::new();
-    push_level(root, 0, expanded, &mut rows);
+    push_level(root, 0, expanded, sort, &mut rows);
     rows
 }
 
@@ -81,13 +96,20 @@ fn push_level(
     dir: &Path,
     depth: usize,
     expanded: &HashSet<PathBuf>,
+    sort: LibrarySort,
     rows: &mut Vec<LibraryEntry>,
 ) {
     if depth > MAX_TREE_DEPTH {
         return;
     }
     let Ok(entries) = fs::read_dir(dir) else { return };
-    let mut items: Vec<(bool, String, PathBuf)> = Vec::new();
+    struct Item {
+        not_dir: bool,
+        lower: String,
+        modified: std::time::SystemTime,
+        path: PathBuf,
+    }
+    let mut items: Vec<Item> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()).map(String::from) else {
@@ -97,12 +119,23 @@ fn push_level(
             continue;
         }
         let is_dir = is_real_dir(&entry);
-        // Sort key: folders before files, then name.
-        items.push((!is_dir, name.to_lowercase(), path));
+        let modified = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        items.push(Item { not_dir: !is_dir, lower: name.to_lowercase(), modified, path });
     }
-    items.sort();
-    for (not_dir, _, path) in items {
-        let is_dir = !not_dir;
+    items.sort_by(|a, b| {
+        a.not_dir.cmp(&b.not_dir).then_with(|| match (a.not_dir, sort) {
+            (true, LibrarySort::Modified) => {
+                b.modified.cmp(&a.modified).then_with(|| a.lower.cmp(&b.lower))
+            }
+            _ => a.lower.cmp(&b.lower),
+        })
+    });
+    for item in items {
+        let path = item.path;
+        let is_dir = !item.not_dir;
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -110,7 +143,7 @@ fn push_level(
             .to_string();
         rows.push(LibraryEntry { path: path.clone(), name, is_dir, depth });
         if is_dir && expanded.contains(&path) {
-            push_level(&path, depth + 1, expanded, rows);
+            push_level(&path, depth + 1, expanded, sort, rows);
         }
     }
 }
@@ -258,7 +291,7 @@ mod tests {
         root.write("projects/old.sync-conflict-20260812-084345-IPHONE.md", "x\n");
 
         // Collapsed: only the top level, junk filtered, folders first.
-        let rows = library_tree(&root.0, &HashSet::new());
+        let rows = library_tree(&root.0, &HashSet::new(), LibrarySort::Name);
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         // ScratchRoot pre-creates Calendar/Notes (unused here but present).
         assert!(names.contains(&"projects"));
@@ -269,10 +302,41 @@ mod tests {
 
         // Expanding a folder reveals its level, depth tracked.
         let expanded: HashSet<PathBuf> = [root.0.join("projects")].into();
-        let rows = library_tree(&root.0, &expanded);
+        let rows = library_tree(&root.0, &expanded, LibrarySort::Name);
         let plan = rows.iter().find(|r| r.name == "plan.md").expect("plan row");
         assert_eq!(plan.depth, 1);
         assert!(!rows.iter().any(|r| r.name == "spec.md"));
+    }
+
+    #[test]
+    fn files_sort_by_mtime_or_name_and_folders_stay_alphabetical() {
+        let root = ScratchRoot::new("librarysort");
+        root.write("zeta/x.md", "x\n");
+        root.write("alpha/x.md", "x\n");
+        root.write("older.md", "first\n");
+        root.write("newer.md", "second\n");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(root.0.join("older.md"))
+            .and_then(|f| f.set_modified(old))
+            .expect("age older.md");
+
+        let names = |sort| -> Vec<String> {
+            library_tree(&root.0, &HashSet::new(), sort)
+                .into_iter()
+                .filter(|r| ["zeta", "alpha", "older.md", "newer.md"].contains(&r.name.as_str()))
+                .map(|r| r.name)
+                .collect()
+        };
+        // Newest file first; folders keep their alphabetical order.
+        assert_eq!(names(LibrarySort::Modified), ["alpha", "zeta", "newer.md", "older.md"]);
+        assert_eq!(names(LibrarySort::Name), ["alpha", "zeta", "newer.md", "older.md"]);
+
+        // Touching the older file bubbles it to the top under Modified only.
+        fs::write(root.0.join("older.md"), "updated\n").expect("touch");
+        assert_eq!(names(LibrarySort::Modified), ["alpha", "zeta", "older.md", "newer.md"]);
+        assert_eq!(names(LibrarySort::Name), ["alpha", "zeta", "newer.md", "older.md"]);
     }
 
     #[test]

@@ -559,6 +559,19 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Order library files by "modified" (newest first) or "name".
+    pub fn set_library_sort(&mut self, mode: &str, cx: &mut Context<Self>) {
+        if self.settings.library_sort == mode {
+            return;
+        }
+        self.settings.library_sort = mode.to_string();
+        if let Err(e) = self.settings.save() {
+            eprintln!("kairn: failed to save settings: {e}");
+        }
+        self.reload_library_trees();
+        cx.notify();
+    }
+
     pub(crate) fn on_toggle_theme(&mut self, _: &ToggleThemeMode, window: &mut Window, cx: &mut Context<Self>) {
         // With a custom theme active, the toggle jumps to the built-in of
         // the opposite mode: a predictable escape hatch, not a cycle.

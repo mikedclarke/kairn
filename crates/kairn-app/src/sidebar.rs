@@ -226,9 +226,9 @@ impl Workspace {
                     row = row
                         .child(
                             div()
-                                .w(px(11.))
+                                .w(px(14.))
                                 .flex_none()
-                                .text_size(t.ui_px(11.))
+                                .text_size(t.ui_px(14.))
                                 .text_color(t.dim)
                                 .child(if open { "▾" } else { "▸" }),
                         )
@@ -255,7 +255,7 @@ impl Workspace {
                     let selected = self.view == PaneView::Note(entry.path.clone());
                     row = row
                         .when(selected, |d| d.bg(t.sel).text_color(t.text))
-                        .child(div().w(px(11.)).flex_none())
+                        .child(div().w(px(14.)).flex_none())
                         .child(note_icon(t))
                         .child(
                             div()
@@ -333,9 +333,9 @@ impl Workspace {
                         .gap(px(6.))
                         .child(
                             div()
-                                .w(px(11.))
+                                .w(px(14.))
                                 .flex_none()
-                                .text_size(t.ui_px(11.))
+                                .text_size(t.ui_px(14.))
                                 .text_color(t.dim)
                                 .child(if open { "▾" } else { "▸" }),
                         )
@@ -354,11 +354,19 @@ impl Workspace {
                         }))
                         .context_menu(move |menu, _, _| {
                             let reveal = menu_root.clone();
+                            let copy = menu_root.clone();
                             let remove = menu_root.clone();
                             let ws = ws.clone();
                             menu.item(PopupMenuItem::new(REVEAL_LABEL).on_click(
                                 move |_, _, cx| {
                                     cx.reveal_path(&reveal);
+                                },
+                            ))
+                            .item(PopupMenuItem::new("Copy path").on_click(
+                                move |_, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        copy.display().to_string(),
+                                    ));
                                 },
                             ))
                             .separator()
@@ -384,9 +392,9 @@ impl Workspace {
                         side = side.child(
                             row.child(
                                 div()
-                                    .w(px(11.))
+                                    .w(px(14.))
                                     .flex_none()
-                                    .text_size(t.ui_px(11.))
+                                    .text_size(t.ui_px(14.))
                                     .text_color(t.dim)
                                     .child(if open { "▾" } else { "▸" }),
                             )
@@ -397,9 +405,17 @@ impl Workspace {
                             }))
                             .context_menu(move |menu, _, _| {
                                 let reveal = menu_path.clone();
+                                let copy = menu_path.clone();
                                 menu.item(PopupMenuItem::new(REVEAL_LABEL).on_click(
                                     move |_, _, cx| {
                                         cx.reveal_path(&reveal);
+                                    },
+                                ))
+                                .item(PopupMenuItem::new("Copy path").on_click(
+                                    move |_, _, cx| {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                            copy.display().to_string(),
+                                        ));
                                     },
                                 ))
                             }),
@@ -408,8 +424,8 @@ impl Workspace {
                         let selected = self.view == PaneView::Library(entry.path.clone());
                         side = side.child(
                             row.when(selected, |d| d.bg(t.sel).text_color(t.text))
-                                .child(div().w(px(11.)).flex_none())
-                                .child(note_icon(t))
+                                .child(div().w(px(14.)).flex_none())
+                                .child(file_icon(t, &entry.path))
                                 .child(
                                     div()
                                         .flex_1()
@@ -425,6 +441,7 @@ impl Workspace {
                                 .context_menu(move |menu, _, _| {
                                     let open_with = menu_path.clone();
                                     let reveal = menu_path.clone();
+                                    let copy = menu_path.clone();
                                     menu.item(
                                         PopupMenuItem::new("Open in default app").on_click(
                                             move |_, _, cx| {
@@ -435,6 +452,13 @@ impl Workspace {
                                     .item(PopupMenuItem::new(REVEAL_LABEL).on_click(
                                         move |_, _, cx| {
                                             cx.reveal_path(&reveal);
+                                        },
+                                    ))
+                                    .item(PopupMenuItem::new("Copy path").on_click(
+                                        move |_, _, cx| {
+                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                                copy.display().to_string(),
+                                            ));
                                         },
                                     ))
                                 }),
@@ -600,6 +624,10 @@ impl Workspace {
                 }
             }
         }
+
+        // The floating settings gear overlays the sidebar's bottom-left
+        // corner; a tail spacer lets the last rows scroll clear of it.
+        side = side.child(div().h(px(48.)).flex_none());
 
         div()
             .w(px(272.))
@@ -828,13 +856,13 @@ fn sechead(
         .px(px(14.))
         .pt(px(16.))
         .pb(px(6.))
-        .text_size(t.ui_px(10.5))
+        .text_size(t.ui_px(12.))
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .text_color(t.faint)
         .cursor_pointer()
         .hover(move |s| s.text_color(hover_text))
         .child(label.to_uppercase())
-        .child(div().text_size(t.ui_px(11.)).child(if collapsed { "▸" } else { "▾" }))
+        .child(div().text_size(t.ui_px(13.)).child(if collapsed { "▸" } else { "▾" }))
         .child(div().flex_1());
     if let Some(count) = count {
         head = head.child(div().child(count));
@@ -851,13 +879,13 @@ fn sechead_plus(t: &KairnTheme, id: &'static str) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .flex_none()
-        .w(px(18.))
-        .h(px(18.))
+        .w(px(20.))
+        .h(px(20.))
         .flex()
         .items_center()
         .justify_center()
         .rounded(px(4.))
-        .text_size(t.ui_px(14.))
+        .text_size(t.ui_px(17.))
         .text_color(t.faint)
         .cursor_pointer()
         .hover(move |s| s.bg(hover_bg).text_color(hover_text))
@@ -894,6 +922,58 @@ fn note_icon(t: &KairnTheme) -> impl IntoElement {
         .gap(px(1.5))
         .child(div().w(px(5.)).h(px(1.)).bg(t.faint))
         .child(div().w(px(5.)).h(px(1.)).bg(t.faint))
+}
+
+/// A per-kind file mark for Library rows, page-shaped like `note_icon` but
+/// tinted so kinds read at a glance even when long names ellipsize before
+/// their extension: markdown keeps the plain page, text/code gets accent
+/// lines, images an amber-dotted frame, PDFs a red-tinted page, and
+/// anything else an empty page.
+fn file_icon(t: &KairnTheme, path: &std::path::Path) -> gpui::AnyElement {
+    use kairn_core::FileKind;
+
+    let is_pdf = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
+    if kairn_core::file_kind(path) == FileKind::Image {
+        return div()
+            .flex_none()
+            .w(px(12.))
+            .h(px(10.))
+            .rounded(px(2.))
+            .border_1()
+            .border_color(t.faint)
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(div().w(px(4.)).h(px(4.)).rounded_full().bg(t.amber))
+            .into_any_element();
+    }
+    let (edge, line) = if is_pdf {
+        (t.red.opacity(0.75), t.red.opacity(0.75))
+    } else {
+        match kairn_core::file_kind(path) {
+            FileKind::Markdown => (t.faint, t.faint),
+            FileKind::Text => (t.faint, t.accent.opacity(0.9)),
+            _ => (t.faint, gpui::transparent_black()),
+        }
+    };
+    div()
+        .flex_none()
+        .w(px(10.))
+        .h(px(12.))
+        .rounded(px(2.))
+        .border_1()
+        .border_color(edge)
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(1.5))
+        .child(div().w(px(5.)).h(px(1.)).bg(line))
+        .child(div().w(px(5.)).h(px(1.)).bg(line))
+        .into_any_element()
 }
 
 fn count_label(t: &KairnTheme, label: &str, hot: bool) -> impl IntoElement {

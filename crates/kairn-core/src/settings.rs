@@ -69,6 +69,10 @@ pub struct Settings {
     /// and the list never syncs between devices. A leading `~` is expanded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub library_roots: Vec<String>,
+    /// Library file ordering: "modified" (newest first) or "name". Folders
+    /// always sort by name. Unknown values read as "modified".
+    #[serde(default = "default_library_sort")]
+    pub library_sort: String,
     #[serde(default)]
     pub ssh_hosts: Vec<SshHost>,
     /// Launch shortcuts that run on this machine, in the user's order.
@@ -148,12 +152,17 @@ fn default_template_rule() -> String {
     "always".to_string()
 }
 
+fn default_library_sort() -> String {
+    "modified".to_string()
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: default_theme(),
             notes_root: None,
             library_roots: Vec::new(),
+            library_sort: default_library_sort(),
             ssh_hosts: Vec::new(),
             local_apps: Vec::new(),
             show_agents: true,
