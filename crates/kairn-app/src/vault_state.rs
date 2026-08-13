@@ -66,6 +66,44 @@ fn is_recent_self_write(self_writes: &SelfWrites, path: &Path) -> bool {
     when.elapsed() < Duration::from_secs(2) && file_hash(path) == Some(*hash)
 }
 
+/// Whether a vault watcher event can change what the UI shows. Access
+/// events (reads) never can — and on Linux, inotify reports the reload's
+/// own file reads and directory walks back as Access events, so reacting
+/// to them makes every reload schedule the next one, a self-sustaining
+/// loop that pegs a core. macOS never surfaces reads, which is why only
+/// Linux showed it.
+fn notes_event_relevant(event: &notify::Event, self_writes: &SelfWrites) -> bool {
+    if matches!(event.kind, notify::EventKind::Access(_)) {
+        return false;
+    }
+    event.paths.is_empty()
+        || event.paths.iter().any(|p| {
+            // The activity log is the one `.kairn/` file the UI
+            // shows live: CLI writes must surface without a restart.
+            let watched_in_kairn = p.file_name().is_some_and(|n| n == "activity.jsonl");
+            (watched_in_kairn || !p.components().any(|c| c.as_os_str() == ".kairn"))
+                && !p
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().contains(".kairn-tmp"))
+                && !is_recent_self_write(self_writes, p)
+        })
+}
+
+/// Library counterpart of `notes_event_relevant`: the same Access guard,
+/// with events under ignored subtrees (VCS, builds, dotfiles) dropped at
+/// the source — a `.git` churn in a big root must not cost reloads.
+fn library_event_relevant(event: &notify::Event, self_writes: &SelfWrites) -> bool {
+    if matches!(event.kind, notify::EventKind::Access(_)) {
+        return false;
+    }
+    event.paths.is_empty()
+        || event.paths.iter().any(|p| {
+            !p.components().any(|c| {
+                c.as_os_str().to_str().is_some_and(notes::library_ignored_name)
+            }) && !is_recent_self_write(self_writes, p)
+        })
+}
+
 impl Workspace {
     /// Record a write this instance just made, so the watcher event it
     /// triggers doesn't cost a second full reload.
@@ -633,6 +671,34 @@ impl Workspace {
             .collect();
     }
 
+    /// Refresh only what a library event can touch: the sidebar trees, the
+    /// open library document, and an image view's sibling strip. Vault
+    /// scans stay out — an agent writing busily under a library root must
+    /// not cost a full notes re-parse per burst.
+    pub(crate) fn reload_library(&mut self, cx: &mut Context<Self>) {
+        self.reload_library_trees();
+        let PaneView::Library(path) = &self.view else { return };
+        let path = path.clone();
+        match notes::file_kind(&path) {
+            notes::FileKind::Markdown => {
+                let (disk_text, doc_error) = match std::fs::read_to_string(&path) {
+                    Ok(t) => (Some(t), None),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
+                    Err(e) => (None, Some(e.to_string())),
+                };
+                self.doc_error = doc_error;
+                self.doc_text = disk_text.clone();
+                self.sync_note_editor(disk_text.as_deref(), None, cx);
+            }
+            notes::FileKind::Image => {
+                self.library_siblings =
+                    path.parent().map(notes::library_images).unwrap_or_default();
+            }
+            notes::FileKind::Text | notes::FileKind::Other => {}
+        }
+        self.sync_library_text(cx);
+    }
+
     /// The sidebar +: pick a directory with the native folder dialog and add
     /// it as a library root.
     pub fn pick_library_root(&mut self, cx: &mut Context<Self>) {
@@ -1127,19 +1193,7 @@ impl Workspace {
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<()>();
         let handler = move |res: notify::Result<notify::Event>| {
             let Ok(event) = res else { return };
-            let relevant = event.paths.is_empty()
-                || event.paths.iter().any(|p| {
-                    // The activity log is the one `.kairn/` file the UI
-                    // shows live: CLI writes must surface without a restart.
-                    let watched_in_kairn = p.file_name().is_some_and(|n| n == "activity.jsonl");
-                    (watched_in_kairn
-                        || !p.components().any(|c| c.as_os_str() == ".kairn"))
-                        && !p
-                            .file_name()
-                            .is_some_and(|n| n.to_string_lossy().contains(".kairn-tmp"))
-                        && !is_recent_self_write(&self_writes, p)
-                });
-            if relevant {
+            if notes_event_relevant(&event, &self_writes) {
                 let _ = tx.unbounded_send(());
             }
         };
@@ -1180,8 +1234,9 @@ impl Workspace {
     }
 
     /// Watch every library root recursively, one watcher per root feeding a
-    /// shared debounced reload: agent writes and Syncthing syncs must appear
-    /// in the tree and any open library file without a restart. Events under
+    /// shared debounced library-scoped reload: agent writes and Syncthing
+    /// syncs must appear in the tree and any open library file without a
+    /// restart, but library churn never re-scans the vault. Events under
     /// ignored subtrees (VCS, builds, dotfiles) are dropped at the source —
     /// a `.git` churn in a big root must not cost reloads.
     pub(crate) fn watch_library(
@@ -1202,15 +1257,7 @@ impl Workspace {
             let self_writes = self_writes.clone();
             let handler = move |res: notify::Result<notify::Event>| {
                 let Ok(event) = res else { return };
-                let relevant = event.paths.is_empty()
-                    || event.paths.iter().any(|p| {
-                        !p.components().any(|c| {
-                            c.as_os_str()
-                                .to_str()
-                                .is_some_and(notes::library_ignored_name)
-                        }) && !is_recent_self_write(&self_writes, p)
-                    });
-                if relevant {
+                if library_event_relevant(&event, &self_writes) {
                     let _ = tx.unbounded_send(());
                 }
             };
@@ -1238,7 +1285,7 @@ impl Workspace {
                     .await;
                 while rx.try_recv().is_ok() {}
                 let ok = this.update(cx, |ws, cx| {
-                    ws.reload_notes(cx);
+                    ws.reload_library(cx);
                     cx.notify();
                 });
                 if ok.is_err() {
@@ -1339,4 +1386,53 @@ pub struct SettingsPatch {
     pub mono_font: Option<String>,
     pub editor_font_size: Option<f32>,
     pub ui_font_size: Option<f32>,
+}
+
+#[cfg(test)]
+mod watcher_event_tests {
+    use super::*;
+    use notify::event::{AccessKind, AccessMode, CreateKind, DataChange, EventKind, ModifyKind};
+
+    fn event(kind: EventKind, path: &str) -> notify::Event {
+        notify::Event::new(kind).add_path(PathBuf::from(path))
+    }
+
+    /// Linux inotify reports the reload's own reads and directory walks
+    /// back as Access events (IN_OPEN and friends). Treating those as
+    /// relevant makes every reload schedule the next one: a self-sustaining
+    /// loop that pegs a core. Reads never change content.
+    #[test]
+    fn reads_never_trigger_reloads() {
+        let writes = SelfWrites::default();
+        let open = EventKind::Access(AccessKind::Open(AccessMode::Any));
+        let close = EventKind::Access(AccessKind::Close(AccessMode::Read));
+        assert!(!notes_event_relevant(&event(open, "/vault/Notes/a.md"), &writes));
+        assert!(!notes_event_relevant(&event(close, "/vault/Calendar"), &writes));
+        assert!(!library_event_relevant(&event(open, "/lib/doc.md"), &writes));
+        assert!(!library_event_relevant(&event(close, "/lib/sub"), &writes));
+    }
+
+    #[test]
+    fn content_changes_still_reload() {
+        let writes = SelfWrites::default();
+        let modify = EventKind::Modify(ModifyKind::Data(DataChange::Any));
+        let create = EventKind::Create(CreateKind::File);
+        assert!(notes_event_relevant(&event(modify, "/vault/Notes/a.md"), &writes));
+        assert!(notes_event_relevant(&event(create, "/vault/Calendar/2026-08-13.md"), &writes));
+        let modify = EventKind::Modify(ModifyKind::Data(DataChange::Any));
+        assert!(library_event_relevant(&event(modify, "/lib/doc.md"), &writes));
+    }
+
+    #[test]
+    fn ignored_subtrees_stay_dropped() {
+        let writes = SelfWrites::default();
+        let modify = EventKind::Modify(ModifyKind::Data(DataChange::Any));
+        assert!(!notes_event_relevant(&event(modify, "/vault/.kairn/state.json"), &writes));
+        let modify = EventKind::Modify(ModifyKind::Data(DataChange::Any));
+        assert!(notes_event_relevant(&event(modify, "/vault/.kairn/activity.jsonl"), &writes));
+        let modify = EventKind::Modify(ModifyKind::Data(DataChange::Any));
+        assert!(!library_event_relevant(&event(modify, "/lib/node_modules/x.js"), &writes));
+        let modify = EventKind::Modify(ModifyKind::Data(DataChange::Any));
+        assert!(!library_event_relevant(&event(modify, "/lib/.git/index"), &writes));
+    }
 }
