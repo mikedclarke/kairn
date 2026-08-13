@@ -10,7 +10,7 @@ use crate::theme::KairnTheme;
 use crate::workspace::{PaneView, TaskQuery, Workspace, chord};
 
 /// The file manager by its platform name, for context-menu labels.
-const REVEAL_LABEL: &str = if cfg!(target_os = "macos") {
+pub(crate) const REVEAL_LABEL: &str = if cfg!(target_os = "macos") {
     "Reveal in Finder"
 } else {
     "Show in file manager"
@@ -290,6 +290,156 @@ impl Workspace {
                             cx.reveal_path(&reveal);
                         }))
                     }));
+                }
+            }
+        }
+
+        // Library: external local folders (per-machine), browsable read/write
+        // but never parsed into tasks or links. The + adds a folder via the
+        // native picker; each root can be removed from its context menu.
+        let collapsed = self.section_collapsed("Library");
+        side = side.child(
+            sechead(t, "sec-library", "Library", None, collapsed)
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_section("Library", cx)))
+                .child(sechead_plus(t, "library-plus").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.pick_library_root(cx);
+                    }),
+                )),
+        );
+        if !collapsed {
+            if self.library_trees.is_empty() {
+                side = side.child(
+                    nav_item(t, "library-empty")
+                        .text_color(t.faint)
+                        .child("No folders yet — add one with +"),
+                );
+            }
+            for (ri, (root, rows)) in self.library_trees.iter().enumerate() {
+                let root_name = root
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let open = self.library_expanded.contains(root);
+                let toggle = root.clone();
+                let menu_root = root.clone();
+                let ws = cx.weak_entity();
+                side = side.child(
+                    nav_item(t, ("lib-root", ri))
+                        .py(px(3.))
+                        .gap(px(6.))
+                        .child(
+                            div()
+                                .w(px(11.))
+                                .flex_none()
+                                .text_size(t.ui_px(11.))
+                                .text_color(t.dim)
+                                .child(if open { "▾" } else { "▸" }),
+                        )
+                        .child(folder_icon(t))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(root_name),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_library_folder(toggle.clone(), cx);
+                        }))
+                        .context_menu(move |menu, _, _| {
+                            let reveal = menu_root.clone();
+                            let remove = menu_root.clone();
+                            let ws = ws.clone();
+                            menu.item(PopupMenuItem::new(REVEAL_LABEL).on_click(
+                                move |_, _, cx| {
+                                    cx.reveal_path(&reveal);
+                                },
+                            ))
+                            .separator()
+                            .item(PopupMenuItem::new("Remove from Library").on_click(
+                                move |_, _, cx| {
+                                    let _ = ws.update(cx, |this, cx| {
+                                        this.remove_library_root(&remove, cx);
+                                    });
+                                },
+                            ))
+                        }),
+                );
+                for (i, entry) in rows.iter().enumerate() {
+                    let path = entry.path.clone();
+                    let indent = px(14. + (entry.depth + 1) as f32 * 12.);
+                    let row = nav_item(t, ("lib-row", ri * 4096 + i))
+                        .pl(indent)
+                        .py(px(3.))
+                        .gap(px(6.));
+                    let menu_path = entry.path.clone();
+                    if entry.is_dir {
+                        let open = self.library_expanded.contains(&entry.path);
+                        side = side.child(
+                            row.child(
+                                div()
+                                    .w(px(11.))
+                                    .flex_none()
+                                    .text_size(t.ui_px(11.))
+                                    .text_color(t.dim)
+                                    .child(if open { "▾" } else { "▸" }),
+                            )
+                            .child(folder_icon(t))
+                            .child(div().flex_1().child(entry.name.clone()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_library_folder(path.clone(), cx);
+                            }))
+                            .context_menu(move |menu, _, _| {
+                                let reveal = menu_path.clone();
+                                menu.item(PopupMenuItem::new(REVEAL_LABEL).on_click(
+                                    move |_, _, cx| {
+                                        cx.reveal_path(&reveal);
+                                    },
+                                ))
+                            }),
+                        );
+                    } else {
+                        let selected = self.view == PaneView::Library(entry.path.clone());
+                        side = side.child(
+                            row.when(selected, |d| d.bg(t.sel).text_color(t.text))
+                                .child(div().w(px(11.)).flex_none())
+                                .child(note_icon(t))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .child(entry.name.clone()),
+                                )
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_library_file(path.clone(), window, cx);
+                                }))
+                                .context_menu(move |menu, _, _| {
+                                    let open_with = menu_path.clone();
+                                    let reveal = menu_path.clone();
+                                    menu.item(
+                                        PopupMenuItem::new("Open in default app").on_click(
+                                            move |_, _, cx| {
+                                                cx.open_with_system(&open_with);
+                                            },
+                                        ),
+                                    )
+                                    .item(PopupMenuItem::new(REVEAL_LABEL).on_click(
+                                        move |_, _, cx| {
+                                            cx.reveal_path(&reveal);
+                                        },
+                                    ))
+                                }),
+                        );
+                    }
                 }
             }
         }

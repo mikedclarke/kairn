@@ -8,7 +8,8 @@ use gpui::{
 use gpui_component::h_flex;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 
-use kairn_core::{Span, SpanKind, task_priority};
+use kairn_core::{FileKind, Span, SpanKind, file_kind, task_priority};
+use crate::sidebar::REVEAL_LABEL;
 use crate::theme::KairnTheme;
 use crate::workspace::{LayoutMode, PaneView, TaskQuery, Workspace, chord};
 
@@ -380,6 +381,14 @@ impl Workspace {
 
         let today = Local::now().date_naive();
         let (masthead, subline, empty_text) = match &self.view {
+            PaneView::Library(path) => {
+                let title = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                (title, self.library_subline(path), "Couldn't read this file.")
+            }
             PaneView::Note(path) => {
                 let title = path
                     .file_stem()
@@ -434,6 +443,16 @@ impl Workspace {
         for banner in self.render_conflict_banners(t, cx) {
             note = note.child(banner);
         }
+        // Non-markdown library files render by kind instead of through the
+        // editor: an inline image, or a metadata card whose open/reveal
+        // actions cover everything Kairn doesn't render itself.
+        if let PaneView::Library(path) = &self.view
+            && file_kind(path) != FileKind::Markdown
+        {
+            return note
+                .child(self.render_library_file(t, path.clone(), cx))
+                .into_any_element();
+        }
         // The document body is the editor entity; masthead, banners, and
         // mentions stay with the pane. No editor means the note can't be
         // edited here: an unreadable file or a missing notes root.
@@ -456,6 +475,178 @@ impl Workspace {
         }
 
         note.child(self.render_mentions(t, cx)).into_any_element()
+    }
+
+    /// Where a library file lives, for the pane subline: the root's name
+    /// plus the folder path inside it, falling back to the parent directory
+    /// when the file's root has just been removed.
+    fn library_subline(&self, path: &std::path::Path) -> String {
+        for (root, _) in &self.library_trees {
+            if let Ok(rel) = path.strip_prefix(root) {
+                let root_name = root
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                let parent = rel
+                    .parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                return if parent.is_empty() {
+                    root_name.to_string()
+                } else {
+                    format!("{root_name} / {parent}")
+                };
+            }
+        }
+        path.parent().map(|p| p.display().to_string()).unwrap_or_default()
+    }
+
+    /// A non-markdown library file's body, by kind: an inline image with a
+    /// sibling gallery strip, a monospace editor for text/code, and a quiet
+    /// metadata card for everything else. All carry open/reveal actions.
+    fn render_library_file(
+        &self,
+        t: &KairnTheme,
+        path: std::path::PathBuf,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use gpui::StyledImage as _;
+        use gpui_component::button::Button;
+
+        let kind = file_kind(&path);
+        let meta = std::fs::metadata(&path).ok();
+        let mut facts: Vec<String> = Vec::new();
+        facts.push(match kind {
+            FileKind::Image => "Image".to_string(),
+            FileKind::Text => "Text file".to_string(),
+            FileKind::Markdown => "Markdown".to_string(),
+            FileKind::Other => match path.extension().and_then(|x| x.to_str()) {
+                Some(ext) => format!("{} file", ext.to_uppercase()),
+                None => "File".to_string(),
+            },
+        });
+        if let Some(meta) = &meta {
+            facts.push(human_size(meta.len()));
+            if let Ok(mtime) = meta.modified() {
+                let dt: chrono::DateTime<Local> = mtime.into();
+                facts.push(format!("modified {}", dt.format("%-d %b %Y, %H:%M")));
+            }
+        }
+
+        let open_with = path.clone();
+        let reveal = path.clone();
+        let mut open_label = "Open in default app";
+        if kind == FileKind::Text
+            && matches!(
+                path.extension().and_then(|x| x.to_str()),
+                Some("html") | Some("htm")
+            )
+        {
+            // The stack has no webview by design; the browser is the preview.
+            open_label = "Open in browser";
+        }
+        let actions = h_flex()
+            .gap(px(8.))
+            .child(
+                Button::new("lib-open-default")
+                    .outline()
+                    .label(open_label)
+                    .on_click(move |_, _, cx| cx.open_with_system(&open_with)),
+            )
+            .child(
+                Button::new("lib-reveal")
+                    .outline()
+                    .label(REVEAL_LABEL)
+                    .on_click(move |_, _, cx| cx.reveal_path(&reveal)),
+            );
+        let facts_line = div()
+            .text_size(t.ui_px(12.5))
+            .text_color(t.dim)
+            .child(facts.join(" · "));
+
+        let mut body = div().mt(px(14.)).flex().flex_col().gap(px(12.));
+
+        match kind {
+            FileKind::Image => {
+                body = body.child(
+                    div()
+                        .max_w_full()
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(t.border)
+                        .overflow_hidden()
+                        .child(
+                            gpui::img(path.clone())
+                                .max_w_full()
+                                .max_h(px(520.))
+                                .object_fit(gpui::ObjectFit::ScaleDown),
+                        ),
+                );
+                // The folder gallery: every sibling image as a thumbnail,
+                // the open one ringed. This is the "pick image 1, 2 or 3"
+                // flow — click through, compare, tell the agent.
+                if self.library_siblings.len() > 1 {
+                    let mut strip = div().flex().flex_wrap().gap(px(8.));
+                    for (i, sib) in self.library_siblings.iter().enumerate() {
+                        let current = *sib == path;
+                        let target = sib.clone();
+                        strip = strip.child(
+                            div()
+                                .id(("lib-thumb", i))
+                                .w(px(104.))
+                                .h(px(78.))
+                                .rounded(px(6.))
+                                .overflow_hidden()
+                                .border_2()
+                                .border_color(if current { t.accent } else { t.border })
+                                .cursor_pointer()
+                                .child(
+                                    gpui::img(sib.clone())
+                                        .size_full()
+                                        .object_fit(gpui::ObjectFit::Cover),
+                                )
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_library_file(target.clone(), window, cx);
+                                })),
+                        );
+                    }
+                    body = body
+                        .child(strip)
+                        .child(
+                            div()
+                                .text_size(t.ui_px(11.))
+                                .text_color(t.faint)
+                                .child(format!(
+                                    "{} images in this folder",
+                                    self.library_siblings.len()
+                                )),
+                        );
+                }
+                body = body.child(facts_line).child(actions);
+            }
+            FileKind::Text
+                if self
+                    .library_text
+                    .as_ref()
+                    .is_some_and(|ed| ed.path == path) =>
+            {
+                let ed = self.library_text.as_ref().expect("guarded above");
+                body = body
+                    .child(
+                        div()
+                            .font_family(t.mono_font.clone())
+                            .text_size(t.ui_px(12.))
+                            .child(gpui_component::input::Input::new(&ed.input).appearance(false)),
+                    )
+                    .child(facts_line)
+                    .child(actions);
+            }
+            _ => {
+                body = body.child(facts_line).child(actions);
+            }
+        }
+
+        body.into_any_element()
     }
 
     /// The day's timeline pill row, per the locked mockup: one pill per
@@ -838,6 +1029,20 @@ fn note_frame(
                 .child(subline),
         )
         .child(div().my(px(8.)).h(px(1.)).bg(t.border))
+}
+
+/// Bytes as a short human figure: whole KB/MB below ten, one decimal above.
+fn human_size(bytes: u64) -> String {
+    const KB: f64 = 1024.;
+    const MB: f64 = 1024. * 1024.;
+    let b = bytes as f64;
+    if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn week_nav(t: &KairnTheme, id: &'static str, glyph: &'static str) -> gpui::Stateful<gpui::Div> {

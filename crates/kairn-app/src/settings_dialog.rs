@@ -925,7 +925,7 @@ impl Render for SettingsEditor {
 }
 
 /// A path for display: home-relative (`~/...`) when it is under $HOME.
-fn home_relative(p: &std::path::Path) -> String {
+pub(crate) fn home_relative(p: &std::path::Path) -> String {
     let s = p.display().to_string();
     match std::env::var("HOME") {
         Ok(h) if !h.is_empty() && s.starts_with(&h) => format!("~{}", &s[h.len()..]),

@@ -45,6 +45,9 @@ pub enum PaneView {
     Day,
     /// A note from the `Notes/` tree.
     Note(PathBuf),
+    /// A file from a sidebar Library root: rendered by kind (markdown
+    /// editor, image, or a metadata card), never fed into tasks or links.
+    Library(PathBuf),
     /// A generated list of open tasks from the daily notes.
     Tasks(TaskQuery),
 }
@@ -152,6 +155,17 @@ pub struct Workspace {
     pub notes_tree: Vec<notes::NoteEntry>,
     /// Folders currently expanded in the Notes browser.
     pub(crate) notes_expanded: HashSet<PathBuf>,
+    /// Each configured library root with its visible tree rows, in the
+    /// settings order. Rebuilt on reload; empty when no roots are set.
+    pub library_trees: Vec<(PathBuf, Vec<notes::LibraryEntry>)>,
+    /// Library roots and folders currently expanded in the sidebar.
+    pub(crate) library_expanded: HashSet<PathBuf>,
+    /// Images sharing the open library image's folder, for the sibling
+    /// strip under the image view. Computed on reload, not per frame.
+    pub(crate) library_siblings: Vec<PathBuf>,
+    /// The plain-text editor over a library code/text file. Present only
+    /// while a Text-kind library file is on screen.
+    pub(crate) library_text: Option<crate::vault_state::LibraryTextEditor>,
     /// Open/done task tallies for Monday..Sunday of the selected day's week,
     /// so the week strip can show the same indicators as the calendar.
     pub week_stats: [notes::DayTaskStats; 7],
@@ -190,6 +204,10 @@ pub struct Workspace {
     /// elsewhere) appear without a restart. Dropped with the workspace.
     pub(crate) _notes_watcher: Option<notify::RecommendedWatcher>,
     pub(crate) _notes_watch_task: Task<()>,
+    /// One watcher per library root (agent writes and Syncthing must appear
+    /// live there too), plus the shared debounce task draining their events.
+    pub(crate) _library_watchers: Vec<notify::RecommendedWatcher>,
+    pub(crate) _library_watch_task: Option<Task<()>>,
 }
 
 impl Workspace {
@@ -239,6 +257,8 @@ impl Workspace {
         let self_writes = crate::vault_state::SelfWrites::default();
         let (notes_watcher, notes_watch_task) =
             Self::watch_notes(notes_root.clone(), self_writes.clone(), cx);
+        let (library_watchers, library_watch_task) =
+            Self::watch_library(settings.library_roots(), self_writes.clone(), cx);
 
         // Closing the window must not drop a pending edit.
         let flush = cx.weak_entity();
@@ -303,6 +323,10 @@ impl Workspace {
             open_tasks: Vec::new(),
             notes_tree: Vec::new(),
             notes_expanded: HashSet::new(),
+            library_trees: Vec::new(),
+            library_expanded: HashSet::new(),
+            library_siblings: Vec::new(),
+            library_text: None,
             week_stats: [notes::DayTaskStats::default(); 7],
             day_timeline: Vec::new(),
             task_counts: [0; 3],
@@ -318,6 +342,8 @@ impl Workspace {
             _activity_timer: activity_timer,
             _notes_watcher: notes_watcher,
             _notes_watch_task: notes_watch_task,
+            _library_watchers: library_watchers,
+            _library_watch_task: library_watch_task,
         };
         this.reload_notes(cx);
         // No session on launch: the terminal pane opens on the start page

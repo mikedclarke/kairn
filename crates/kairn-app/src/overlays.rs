@@ -37,6 +37,10 @@ pub enum Overlay {
         input: gpui::Entity<InputState>,
         _sub: gpui::Subscription,
         hits: Vec<notes::SearchHit>,
+        /// Matches from the library roots, shown as their own group after
+        /// the vault's so notes stay on top. The keyboard selection runs
+        /// across both lists.
+        lib_hits: Vec<notes::SearchHit>,
         selected: usize,
         /// Bumped per keystroke; a finished search only lands if it is
         /// still the latest, so slow results never overwrite fresh ones.
@@ -54,15 +58,17 @@ impl Workspace {
     /// Move the switcher's keyboard selection through the results. With no
     /// results the arrows fall through to the input's cursor movement.
     pub fn switcher_move(&mut self, delta: i64, cx: &mut Context<Self>) {
-        let Some(Overlay::Switcher { hits, selected, .. }) = &mut self.overlay else {
+        let Some(Overlay::Switcher { hits, lib_hits, selected, .. }) = &mut self.overlay
+        else {
             cx.propagate();
             return;
         };
-        if hits.is_empty() {
+        let total = hits.len() + lib_hits.len();
+        if total == 0 {
             cx.propagate();
             return;
         }
-        let last = (hits.len() - 1) as i64;
+        let last = (total - 1) as i64;
         *selected = (*selected as i64 + delta).clamp(0, last) as usize;
         cx.notify();
     }
@@ -237,7 +243,7 @@ impl Workspace {
         } else {
             // A fresh search input each open: empty query, no stale results.
             let input = cx.new(|cx| {
-                InputState::new(window, cx).placeholder("Search notes and days…")
+                InputState::new(window, cx).placeholder("Search notes, days, and library…")
             });
             let sub = cx.subscribe_in(
                 &input,
@@ -247,6 +253,7 @@ impl Workspace {
                         InputEvent::Change => {
                             let query = state.read(cx).value().to_string();
                             let root = this.notes_root.clone();
+                            let lib_roots = this.settings.library_roots();
                             let Some(Overlay::Switcher { generation, _search, .. }) =
                                 &mut this.overlay
                             else {
@@ -255,8 +262,9 @@ impl Workspace {
                             *generation += 1;
                             let generation = *generation;
                             // Debounced and off the UI thread: the search
-                            // reads the vault, which must not run per
-                            // keystroke in the input handler.
+                            // reads the vault and the library roots, which
+                            // must not run per keystroke in the input
+                            // handler.
                             *_search = Some(cx.spawn(async move |this, cx| {
                                 cx.background_executor()
                                     .timer(Duration::from_millis(120))
@@ -264,19 +272,23 @@ impl Workspace {
                                 let results = cx
                                     .background_executor()
                                     .spawn(async move {
-                                        notes::search_notes(&root, &query, 12)
+                                        (
+                                            notes::search_notes(&root, &query, 12),
+                                            notes::search_library(&lib_roots, &query, 8),
+                                        )
                                     })
                                     .await;
                                 let _ = this.update(cx, |ws, cx| {
                                     if let Some(Overlay::Switcher {
                                         hits,
+                                        lib_hits,
                                         selected,
                                         generation: current,
                                         ..
                                     }) = &mut ws.overlay
                                         && *current == generation
                                     {
-                                        *hits = results;
+                                        (*hits, *lib_hits) = results;
                                         *selected = 0;
                                         cx.notify();
                                     }
@@ -285,11 +297,25 @@ impl Workspace {
                         }
                         InputEvent::PressEnter { secondary } => {
                             let query = state.read(cx).value().trim().to_string();
+                            // The selection runs vault hits first, then the
+                            // library group; the hit carries where it came
+                            // from so Enter opens it the right way.
                             let (hit, moved) = match &this.overlay {
-                                Some(Overlay::Switcher { hits, selected, .. }) => (
-                                    hits.get(*selected).or_else(|| hits.first()).cloned(),
-                                    *selected > 0,
-                                ),
+                                Some(Overlay::Switcher { hits, lib_hits, selected, .. }) => {
+                                    let picked = if *selected < hits.len() {
+                                        hits.get(*selected).cloned().map(|h| (h, false))
+                                    } else {
+                                        lib_hits
+                                            .get(*selected - hits.len())
+                                            .cloned()
+                                            .map(|h| (h, true))
+                                    }
+                                    .or_else(|| hits.first().cloned().map(|h| (h, false)))
+                                    .or_else(|| {
+                                        lib_hits.first().cloned().map(|h| (h, true))
+                                    });
+                                    (picked, *selected > 0)
+                                }
                                 _ => (None, false),
                             };
                             // A date-shaped query jumps straight to that day
@@ -307,8 +333,13 @@ impl Workspace {
                                 this.close_overlays(window, cx);
                                 return;
                             }
-                            if let Some(hit) = hit {
-                                this.open_search_hit(&hit, window, cx);
+                            if let Some((hit, from_library)) = hit {
+                                if from_library {
+                                    this.open_library_file(hit.path.clone(), window, cx);
+                                    this.close_overlays(window, cx);
+                                } else {
+                                    this.open_search_hit(&hit, window, cx);
+                                }
                                 // Secondary Enter opens beside the terminal,
                                 // whatever layout we came from.
                                 if *secondary {
@@ -336,6 +367,7 @@ impl Workspace {
                 input,
                 _sub: sub,
                 hits: Vec::new(),
+                lib_hits: Vec::new(),
                 selected: 0,
                 generation: 0,
                 _search: None,
@@ -556,7 +588,8 @@ impl Workspace {
     }
 
     pub(crate) fn render_switcher(&self, t: &KairnTheme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let Some(Overlay::Switcher { input, hits, selected, .. }) = &self.overlay else {
+        let Some(Overlay::Switcher { input, hits, lib_hits, selected, .. }) = &self.overlay
+        else {
             return None;
         };
         let selected = *selected;
@@ -662,7 +695,7 @@ impl Workspace {
                 }
             }
             card = card.child(switcher_section(t, "Notes & days"));
-            if hits.is_empty() {
+            if hits.is_empty() && lib_hits.is_empty() {
                 card = card.child(
                     h_flex()
                         .px(px(16.))
@@ -697,6 +730,41 @@ impl Workspace {
                         )
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.open_search_hit(&hit, window, cx);
+                        })),
+                );
+            }
+            // The library group renders after the vault's so notes stay on
+            // top; the keyboard selection continues into it.
+            if !lib_hits.is_empty() {
+                card = card.child(switcher_section(t, "Library"));
+            }
+            for (i, hit) in lib_hits.iter().enumerate() {
+                let combined = hits.len() + i;
+                let path = hit.path.clone();
+                let snippet: Option<String> = hit.snippet.as_ref().map(|s| {
+                    let mut short: String = s.chars().take(48).collect();
+                    if short.len() < s.len() {
+                        short.push('…');
+                    }
+                    short
+                });
+                card = card.child(
+                    switcher_item(t, ("switcher-lib-hit", i), cx)
+                        .when(combined == selected, |d| d.bg(t.sel))
+                        .child(div().w(px(14.)).text_color(t.faint).child("▤"))
+                        .child(div().flex_none().text_color(t.text).child(hit.name.clone()))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .overflow_hidden()
+                                .text_size(px(11.))
+                                .text_color(t.faint)
+                                .children(snippet),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_library_file(path.clone(), window, cx);
+                            this.close_overlays(window, cx);
                         })),
                 );
             }
