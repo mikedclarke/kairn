@@ -199,6 +199,15 @@ pub struct Workspace {
     /// Hold-for-heading state: dwelling a drag on a day target for a moment
     /// opens a menu of that day's headings to drop under.
     pub(crate) hold: HoldState,
+    /// The sidebar scroll position, tracked so synthesized momentum can
+    /// keep it moving after a touchpad flick (see `sidebar_flick`).
+    pub(crate) sidebar_scroll: gpui::ScrollHandle,
+    /// Timestamped vertical deltas from the last ~100ms of touchpad
+    /// scrolling, the velocity source for synthesized momentum.
+    pub(crate) sidebar_flick_samples: std::collections::VecDeque<(std::time::Instant, f32)>,
+    /// The pending momentum watchdog or animation; replacing it cancels
+    /// the old one, so fresh finger input always wins.
+    pub(crate) _sidebar_kinetic_task: Option<Task<()>>,
     _activity_timer: Task<()>,
     /// Watches the notes root so outside edits (agents, Syncthing, NotePlan
     /// elsewhere) appear without a restart. Dropped with the workspace.
@@ -338,6 +347,9 @@ impl Workspace {
             calendar_drop_bounds: Default::default(),
             daily_drop_bounds: Default::default(),
             sidebar_bounds: Default::default(),
+            sidebar_scroll: gpui::ScrollHandle::new(),
+            sidebar_flick_samples: std::collections::VecDeque::new(),
+            _sidebar_kinetic_task: None,
             hold: HoldState::Idle,
             _activity_timer: activity_timer,
             _notes_watcher: notes_watcher,

@@ -13,15 +13,50 @@ mod ui;
 mod vault_state;
 mod workspace;
 
-use gpui::{AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
+use std::borrow::Cow;
+
+use gpui::{
+    AppContext, Application, AssetSource, Bounds, SharedString, WindowBounds, WindowOptions, px,
+    size,
+};
 use gpui_component::{Root, TitleBar};
 use gpui_component_assets::Assets;
 use kairn_core::settings::Settings;
 
 use crate::workspace::Workspace;
 
+/// The component library's embedded assets plus Kairn's own icons: gpui
+/// takes a single asset source, so the two sets merge here.
+struct KairnAssets;
+
+impl AssetSource for KairnAssets {
+    fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+        let own: Option<&'static [u8]> = match path {
+            "kairn-icons/file.svg" => Some(include_bytes!("../assets/icons/file.svg")),
+            "kairn-icons/file-text.svg" => Some(include_bytes!("../assets/icons/file-text.svg")),
+            "kairn-icons/file-code.svg" => Some(include_bytes!("../assets/icons/file-code.svg")),
+            "kairn-icons/file-image.svg" => {
+                Some(include_bytes!("../assets/icons/file-image.svg"))
+            }
+            "kairn-icons/folder.svg" => Some(include_bytes!("../assets/icons/folder.svg")),
+            "kairn-icons/folder-open.svg" => {
+                Some(include_bytes!("../assets/icons/folder-open.svg"))
+            }
+            _ => None,
+        };
+        match own {
+            Some(bytes) => Ok(Some(Cow::Borrowed(bytes))),
+            None => Assets.load(path),
+        }
+    }
+
+    fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
+        Assets.list(path)
+    }
+}
+
 fn main() {
-    let app = Application::new().with_assets(Assets);
+    let app = Application::new().with_assets(KairnAssets);
 
     // Dock-icon click when no window is visible: bring the app forward.
     app.on_reopen(|cx| cx.activate(true));

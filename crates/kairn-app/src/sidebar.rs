@@ -37,6 +37,15 @@ impl Workspace {
             .flex_1()
             .min_h(px(0.))
             .overflow_y_scroll()
+            .track_scroll(&self.sidebar_scroll)
+            .on_scroll_wheel(cx.listener(|this, ev: &gpui::ScrollWheelEvent, _, cx| {
+                // Touchpad flicks only: wheel notches (Lines) are discrete
+                // by design, and macOS delivers real momentum events, so
+                // synthesizing there would double-scroll.
+                if cfg!(target_os = "linux") && ev.delta.precise() {
+                    this.sidebar_flick(f32::from(ev.delta.pixel_delta(px(20.)).y), cx);
+                }
+            }))
             .child(
                 gpui::canvas(
                     move |bounds, _, _| {
@@ -226,13 +235,13 @@ impl Workspace {
                     row = row
                         .child(
                             div()
-                                .w(px(14.))
+                                .w(t.ui_px(14.))
                                 .flex_none()
                                 .text_size(t.ui_px(14.))
                                 .text_color(t.dim)
                                 .child(if open { "▾" } else { "▸" }),
                         )
-                        .child(folder_icon(t))
+                        .child(folder_icon(t, open))
                         .child(div().flex_1().child(entry.name.clone()))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.toggle_notes_folder(path.clone(), cx);
@@ -255,7 +264,7 @@ impl Workspace {
                     let selected = self.view == PaneView::Note(entry.path.clone());
                     row = row
                         .when(selected, |d| d.bg(t.sel).text_color(t.text))
-                        .child(div().w(px(14.)).flex_none())
+                        .child(div().w(t.ui_px(14.)).flex_none())
                         .child(note_icon(t))
                         .child(
                             div()
@@ -333,13 +342,13 @@ impl Workspace {
                         .gap(px(6.))
                         .child(
                             div()
-                                .w(px(14.))
+                                .w(t.ui_px(14.))
                                 .flex_none()
                                 .text_size(t.ui_px(14.))
                                 .text_color(t.dim)
                                 .child(if open { "▾" } else { "▸" }),
                         )
-                        .child(folder_icon(t))
+                        .child(folder_icon(t, open))
                         .child(
                             div()
                                 .flex_1()
@@ -392,13 +401,13 @@ impl Workspace {
                         side = side.child(
                             row.child(
                                 div()
-                                    .w(px(14.))
+                                    .w(t.ui_px(14.))
                                     .flex_none()
                                     .text_size(t.ui_px(14.))
                                     .text_color(t.dim)
                                     .child(if open { "▾" } else { "▸" }),
                             )
-                            .child(folder_icon(t))
+                            .child(folder_icon(t, open))
                             .child(div().flex_1().child(entry.name.clone()))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.toggle_library_folder(path.clone(), cx);
@@ -424,7 +433,7 @@ impl Workspace {
                         let selected = self.view == PaneView::Library(entry.path.clone());
                         side = side.child(
                             row.when(selected, |d| d.bg(t.sel).text_color(t.text))
-                                .child(div().w(px(14.)).flex_none())
+                                .child(div().w(t.ui_px(14.)).flex_none())
                                 .child(file_icon(t, &entry.path))
                                 .child(
                                     div()
@@ -640,6 +649,69 @@ impl Workspace {
             .border_color(t.border)
             .text_size(t.ui_px(12.5))
             .child(side)
+    }
+
+    /// Synthesized momentum for touchpad flicks in the sidebar. Wayland
+    /// delivers finger scrolls as bare pixel deltas with no lift or
+    /// momentum phase, so the scroll dies the instant the finger leaves
+    /// the pad. Velocity is tracked while events stream in; a short
+    /// watchdog fires once they stop, and if the finger left with speed
+    /// the offset keeps moving with exponential decay until it runs out,
+    /// hits an edge, or fresh input lands (each event re-arms the task,
+    /// and assigning it drops — cancels — the old one).
+    pub(crate) fn sidebar_flick(&mut self, dy: f32, cx: &mut Context<Self>) {
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        self.sidebar_flick_samples.push_back((now, dy));
+        while self
+            .sidebar_flick_samples
+            .front()
+            .is_some_and(|(t, _)| now.duration_since(*t) > Duration::from_millis(100))
+        {
+            self.sidebar_flick_samples.pop_front();
+        }
+        self._sidebar_kinetic_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(60)).await;
+            let Ok(mut velocity) = this.update(cx, |ws, _| {
+                let now = Instant::now();
+                let mut sum = 0.0f32;
+                let mut oldest = now;
+                for (t, dy) in &ws.sidebar_flick_samples {
+                    sum += dy;
+                    if *t < oldest {
+                        oldest = *t;
+                    }
+                }
+                ws.sidebar_flick_samples.clear();
+                // The watchdog delay is part of the span: velocity at lift
+                // is what the finger left behind, in px/s.
+                sum / now.duration_since(oldest).as_secs_f32().max(0.06)
+            }) else {
+                return;
+            };
+            if velocity.abs() < 200. {
+                return;
+            }
+            velocity = velocity.clamp(-8000., 8000.);
+            loop {
+                cx.background_executor().timer(Duration::from_millis(16)).await;
+                velocity *= 0.95;
+                let moved = this.update(cx, |ws, cx| {
+                    let max = ws.sidebar_scroll.max_offset().height;
+                    let before = ws.sidebar_scroll.offset();
+                    let mut offset = before;
+                    offset.y = (offset.y + px(velocity * 0.016)).clamp(-max, px(0.));
+                    ws.sidebar_scroll.set_offset(offset);
+                    cx.notify();
+                    offset.y != before.y
+                });
+                match moved {
+                    Ok(true) if velocity.abs() >= 30. => {}
+                    _ => break,
+                }
+            }
+        }));
     }
 
     fn render_calendar(
@@ -892,43 +964,34 @@ fn sechead_plus(t: &KairnTheme, id: &'static str) -> gpui::Stateful<gpui::Div> {
         .child("+")
 }
 
-/// A tiny folder mark for the Notes browser, drawn with quads so no asset
-/// or glyph font is needed.
-fn folder_icon(t: &KairnTheme) -> impl IntoElement {
-    div()
+/// A sidebar icon from the app's embedded SVG set (see `KairnAssets`),
+/// scaled with the interface size and tinted per call.
+fn svg_icon(t: &KairnTheme, path: &'static str, color: gpui::Hsla) -> gpui::AnyElement {
+    gpui::svg()
+        .path(path)
         .flex_none()
-        .w(px(12.))
-        .h(px(10.))
-        .flex()
-        .flex_col()
-        .child(div().w(px(5.)).h(px(2.)).rounded(px(1.)).bg(t.faint.opacity(0.8)))
-        .child(div().w(px(12.)).h(px(8.)).rounded(px(2.)).bg(t.faint.opacity(0.55)))
+        .w(t.ui_px(13.))
+        .h(t.ui_px(13.))
+        .text_color(color)
+        .into_any_element()
 }
 
-/// A tiny document mark for the Notes browser: a bordered page with two
-/// text lines.
-fn note_icon(t: &KairnTheme) -> impl IntoElement {
-    div()
-        .flex_none()
-        .w(px(10.))
-        .h(px(12.))
-        .rounded(px(2.))
-        .border_1()
-        .border_color(t.faint)
-        .flex()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        .gap(px(1.5))
-        .child(div().w(px(5.)).h(px(1.)).bg(t.faint))
-        .child(div().w(px(5.)).h(px(1.)).bg(t.faint))
+/// The folder mark for the Notes and Library trees; open folders get the
+/// open-flap variant so expansion reads from the icon, not just the chevron.
+fn folder_icon(t: &KairnTheme, open: bool) -> gpui::AnyElement {
+    let path = if open { "kairn-icons/folder-open.svg" } else { "kairn-icons/folder.svg" };
+    svg_icon(t, path, t.faint)
 }
 
-/// A per-kind file mark for Library rows, page-shaped like `note_icon` but
-/// tinted so kinds read at a glance even when long names ellipsize before
-/// their extension: markdown keeps the plain page, text/code gets accent
-/// lines, images an amber-dotted frame, PDFs a red-tinted page, and
-/// anything else an empty page.
+/// The document mark for Notes rows (always markdown).
+fn note_icon(t: &KairnTheme) -> gpui::AnyElement {
+    svg_icon(t, "kairn-icons/file-text.svg", t.faint)
+}
+
+/// A per-kind file mark for Library rows, shaped and tinted so kinds read
+/// at a glance even when long names ellipsize before their extension:
+/// text page for markdown, code page for text/code, photo page for
+/// images, a red page for PDFs, and a blank page for everything else.
 fn file_icon(t: &KairnTheme, path: &std::path::Path) -> gpui::AnyElement {
     use kairn_core::FileKind;
 
@@ -936,44 +999,15 @@ fn file_icon(t: &KairnTheme, path: &std::path::Path) -> gpui::AnyElement {
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
-    if kairn_core::file_kind(path) == FileKind::Image {
-        return div()
-            .flex_none()
-            .w(px(12.))
-            .h(px(10.))
-            .rounded(px(2.))
-            .border_1()
-            .border_color(t.faint)
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(div().w(px(4.)).h(px(4.)).rounded_full().bg(t.amber))
-            .into_any_element();
+    if is_pdf {
+        return svg_icon(t, "kairn-icons/file.svg", t.red.opacity(0.8));
     }
-    let (edge, line) = if is_pdf {
-        (t.red.opacity(0.75), t.red.opacity(0.75))
-    } else {
-        match kairn_core::file_kind(path) {
-            FileKind::Markdown => (t.faint, t.faint),
-            FileKind::Text => (t.faint, t.accent.opacity(0.9)),
-            _ => (t.faint, gpui::transparent_black()),
-        }
-    };
-    div()
-        .flex_none()
-        .w(px(10.))
-        .h(px(12.))
-        .rounded(px(2.))
-        .border_1()
-        .border_color(edge)
-        .flex()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        .gap(px(1.5))
-        .child(div().w(px(5.)).h(px(1.)).bg(line))
-        .child(div().w(px(5.)).h(px(1.)).bg(line))
-        .into_any_element()
+    match kairn_core::file_kind(path) {
+        FileKind::Markdown => svg_icon(t, "kairn-icons/file-text.svg", t.faint),
+        FileKind::Text => svg_icon(t, "kairn-icons/file-code.svg", t.accent.opacity(0.9)),
+        FileKind::Image => svg_icon(t, "kairn-icons/file-image.svg", t.amber.opacity(0.9)),
+        FileKind::Other => svg_icon(t, "kairn-icons/file.svg", t.faint),
+    }
 }
 
 fn count_label(t: &KairnTheme, label: &str, hot: bool) -> impl IntoElement {
