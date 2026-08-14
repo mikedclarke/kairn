@@ -67,29 +67,41 @@ impl Workspace {
                 ("period-weekly", "Weekly", PaneView::Week),
                 ("period-monthly", "Monthly", PaneView::Month),
             ];
+            // Underline tabs, not pills: a hairline divider ties the strip to
+            // the calendar it drives, and the active mode carries a 2px accent
+            // underline. Inactive tabs keep a transparent underline of the same
+            // width so switching never nudges the labels.
             let mut row = div()
                 .flex()
-                .gap(px(4.))
                 .px(px(14.))
-                .pt(px(8.))
-                .pb(px(4.));
+                .mt(px(6.))
+                .border_t(px(1.))
+                .border_color(t.border);
             for (id, label, view) in buttons {
                 let active = self.view == view;
-                let hover_bg = t.hover;
+                let hover_text = t.text;
                 row = row.child(
                     div()
                         .id(id)
                         .flex_1()
-                        .py(px(4.))
-                        .rounded(px(6.))
+                        .pt(px(8.))
+                        .pb(px(7.))
                         .text_center()
                         .text_size(t.ui_px(11.))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .border_b(px(2.))
                         .cursor_pointer()
                         .when_else(
                             active,
-                            |d| d.bg(t.sel).text_color(t.text),
-                            |d| d.text_color(t.dim).hover(move |s| s.bg(hover_bg)),
+                            |d| {
+                                d.text_color(t.text)
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .border_color(t.accent)
+                            },
+                            |d| {
+                                d.text_color(t.dim)
+                                    .border_color(t.accent.opacity(0.))
+                                    .hover(move |s| s.text_color(hover_text))
+                            },
                         )
                         .child(label.to_string())
                         .on_click(cx.listener(move |this, _, _, cx| {

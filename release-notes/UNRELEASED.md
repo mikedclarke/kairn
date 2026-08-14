@@ -16,6 +16,8 @@ same fact twice; no em dashes. Rewrite to this standard before releasing.
 
 <!-- Refinements to existing workflows, reliability, performance, or UX. -->
 
+The Daily, Weekly, and Monthly switcher is now an underline tab strip attached to the calendar instead of separate rounded buttons.
+
 ## Fixed
 
 <!-- Bugs that no longer happen. -->
