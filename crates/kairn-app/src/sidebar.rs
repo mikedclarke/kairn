@@ -58,6 +58,53 @@ impl Workspace {
             )
             .child(self.render_calendar(t, drop_day, cx));
 
+        // Daily / Weekly / Monthly: each jumps to the current period's note;
+        // the mini calendar above swaps to a matching picker for browsing
+        // other periods.
+        if self.settings.show_daily {
+            let buttons: [(&str, &str, PaneView); 3] = [
+                ("period-daily", "Daily", PaneView::Day),
+                ("period-weekly", "Weekly", PaneView::Week),
+                ("period-monthly", "Monthly", PaneView::Month),
+            ];
+            let mut row = div()
+                .flex()
+                .gap(px(4.))
+                .px(px(14.))
+                .pt(px(8.))
+                .pb(px(4.));
+            for (id, label, view) in buttons {
+                let active = self.view == view;
+                let hover_bg = t.hover;
+                row = row.child(
+                    div()
+                        .id(id)
+                        .flex_1()
+                        .py(px(4.))
+                        .rounded(px(6.))
+                        .text_center()
+                        .text_size(t.ui_px(11.))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .cursor_pointer()
+                        .when_else(
+                            active,
+                            |d| d.bg(t.sel).text_color(t.text),
+                            |d| d.text_color(t.dim).hover(move |s| s.bg(hover_bg)),
+                        )
+                        .child(label.to_string())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let today = Local::now().date_naive();
+                            match view {
+                                PaneView::Week => this.select_week(today, cx),
+                                PaneView::Month => this.select_month(today, cx),
+                                _ => this.select_day(today, cx),
+                            }
+                        })),
+                );
+            }
+            side = side.child(row);
+        }
+
         // Sync conflicts anywhere in the vault: without this list, a
         // conflict copy of a note that isn't open stays invisible forever.
         // A rare blocking state, so the section only exists while conflicts
@@ -106,52 +153,9 @@ impl Workspace {
             }
         }
 
-        // Daily: today plus the next (or previous, per settings) two days.
-        // The bounds store clears before the visibility checks so a hidden
-        // or collapsed section always clears its drop targets.
+        // The old three-day list is gone, but its drop bounds must stay
+        // cleared so a stale frame's targets can't catch a drag release.
         self.daily_drop_bounds.borrow_mut().clear();
-        if self.settings.show_daily {
-            let collapsed = self.section_collapsed("Daily");
-            side = side.child(
-                sechead(t, "sec-daily", "Daily", None, collapsed).on_click(cx.listener(
-                    |this, _, _, cx| this.toggle_section("Daily", cx),
-                )),
-            );
-            if !collapsed {
-                let forward = self.settings.daily_forward;
-                for i in 0..3u64 {
-                    let day = if forward { today + Days::new(i) } else { today - Days::new(i) };
-                    let selected = day == self.selected_day;
-                    let has_note = self.note_days.contains_key(&day);
-                    let is_drop = drop_day == Some(day);
-                    let bounds_store = self.daily_drop_bounds.clone();
-                    let mut row = nav_item(t, ("daily", i as usize))
-                        .relative()
-                        .when(selected, |d| d.bg(t.sel).text_color(t.text))
-                        .child(
-                            gpui::canvas(
-                                move |bounds, _, _| bounds_store.borrow_mut().push((day, bounds)),
-                                |_, _, _, _| {},
-                            )
-                            .absolute()
-                            .size_full(),
-                        )
-                        .when(has_note, |d| {
-                            d.child(div().w(px(7.)).h(px(7.)).flex_none().rounded_full().bg(t.amber))
-                        })
-                        .child(div().flex_1().child(day_label(day)));
-                    if day == today {
-                        row = row.child(count_label(t, "today", false));
-                    }
-                    if is_drop {
-                        row = row.bg(t.sel).text_color(t.accent).border_1().border_color(t.accent);
-                    }
-                    side = side.child(row.on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_day(day, cx);
-                    })));
-                }
-            }
-        }
 
         // Tasks: real counts from the daily-note scan; each row opens a view.
         if self.settings.show_tasks {
@@ -719,9 +723,18 @@ impl Workspace {
         t: &KairnTheme,
         drop_day: Option<NaiveDate>,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::AnyElement {
         self.calendar_drop_bounds.borrow_mut().clear();
         let today = Local::now().date_naive();
+        // Over a monthly note the calendar is a month picker; over a weekly
+        // note the day grid selects whole weeks; everywhere else it is the
+        // normal day calendar.
+        if self.view == PaneView::Month {
+            return self.render_month_picker(t, cx).into_any_element();
+        }
+        let week_mode = self.view == PaneView::Week;
+        let sel_monday = self.selected_day
+            - Days::new(self.selected_day.weekday().num_days_from_monday() as u64);
         let current_first = today.with_day(1).expect("valid first of month");
         let shown_first = if self.cal_offset >= 0 {
             current_first
@@ -762,7 +775,11 @@ impl Workspace {
                             .child(title)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.cal_offset = 0;
-                                this.select_day(today, cx);
+                                if week_mode {
+                                    this.select_week(today, cx);
+                                } else {
+                                    this.select_day(today, cx);
+                                }
                             })),
                     )
                     .child(
@@ -795,12 +812,16 @@ impl Workspace {
             );
 
         for week in 0..6u64 {
-            let mut row = div().flex().text_size(t.ui_px(11.5));
+            let row_monday: NaiveDate = grid_start + Days::new(week * 7);
+            let row_selected = week_mode && row_monday == sel_monday;
+            let mut cells: Vec<gpui::AnyElement> = Vec::with_capacity(7);
             for wd in 0..7u64 {
                 let day: NaiveDate = grid_start + Days::new(week * 7 + wd);
                 let in_month = day.month() == shown_first.month();
                 let is_today = day == today;
-                let is_selected = day == self.selected_day;
+                // Week mode selects whole rows; a single lit day would fight
+                // the row highlight.
+                let is_selected = !week_mode && day == self.selected_day;
                 let has_note = self.note_days.contains_key(&day);
                 let stats = self.day_stats.get(&day).copied().unwrap_or_default();
                 let overdue_open = stats.open > 0 && day < today;
@@ -885,14 +906,123 @@ impl Workspace {
                 };
 
                 let hover_bg = t.hover;
-                row = row.child(
-                    cell.when(!is_today && !is_selected && !is_drop, |c| {
+                let cell = cell
+                    .when(!week_mode && !is_today && !is_selected && !is_drop, |c| {
                         c.hover(move |s| s.bg(hover_bg))
                     })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_day(day, cx);
-                    })),
+                    .when(!week_mode, |c| {
+                        c.on_click(cx.listener(move |this, _, _, cx| {
+                            this.select_day(day, cx);
+                        }))
+                    });
+                cells.push(cell.into_any_element());
+            }
+            if week_mode {
+                let hover_bg = t.hover;
+                cal = cal.child(
+                    div()
+                        .id(("cal-week", week as usize))
+                        .flex()
+                        .text_size(t.ui_px(11.5))
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .when_else(
+                            row_selected,
+                            |d| d.bg(t.sel),
+                            |d| d.hover(move |s| s.bg(hover_bg)),
+                        )
+                        .children(cells)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.select_week(row_monday, cx);
+                        })),
                 );
+            } else {
+                cal = cal.child(div().flex().text_size(t.ui_px(11.5)).children(cells));
+            }
+        }
+        cal.into_any_element()
+    }
+
+    /// The mini calendar's month-picker face, shown over a monthly note: a
+    /// year of months, arrows stepping whole years.
+    fn render_month_picker(&self, t: &KairnTheme, cx: &mut Context<Self>) -> gpui::Div {
+        let today = Local::now().date_naive();
+        let shown_year = today.year() + self.cal_offset;
+        let today_hover = t.text;
+        let mut cal = div().px(px(14.)).pt(px(14.)).pb(px(2.)).child(
+            div()
+                .flex()
+                .justify_between()
+                .items_center()
+                .mb(px(8.))
+                .text_size(t.ui_px(12.))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(
+                    // Clicking the year jumps back to the current month's
+                    // note, mirroring the day calendar's title shortcut.
+                    div()
+                        .id("cal-today")
+                        .text_size(t.ui_px(15.))
+                        .cursor_pointer()
+                        .hover(move |s| s.text_color(today_hover))
+                        .child(shown_year.to_string())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.cal_offset = 0;
+                            this.select_month(today, cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(2.))
+                        .text_color(t.dim)
+                        .child(cal_nav(t, "cal-prev", "‹").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.cal_offset -= 1;
+                                cx.notify();
+                            },
+                        )))
+                        .child(cal_nav(t, "cal-next", "›").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.cal_offset += 1;
+                                cx.notify();
+                            },
+                        ))),
+                ),
+        );
+        for row_ix in 0..3u32 {
+            let mut row = div().flex().text_size(t.ui_px(11.5)).mb(px(2.));
+            for col in 0..4u32 {
+                let month = row_ix * 4 + col + 1;
+                let Some(first) = NaiveDate::from_ymd_opt(shown_year, month, 1) else {
+                    continue;
+                };
+                let is_current = shown_year == today.year() && month == today.month();
+                let is_selected = shown_year == self.selected_day.year()
+                    && month == self.selected_day.month();
+                let hover_bg = t.hover;
+                let cell = div()
+                    .id(("cal-month", month as usize))
+                    .flex_1()
+                    .py(px(7.))
+                    .rounded(px(5.))
+                    .text_center()
+                    .cursor_pointer()
+                    .child(first.format("%b").to_string());
+                let cell = if is_current {
+                    cell.bg(t.amber)
+                        .text_color(t.on_amber)
+                        .font_weight(gpui::FontWeight::BOLD)
+                } else if is_selected {
+                    cell.bg(t.sel)
+                        .text_color(t.text)
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                } else {
+                    cell.text_color(t.dim).hover(move |s| s.bg(hover_bg))
+                };
+                row = row.child(cell.on_click(cx.listener(move |this, _, _, cx| {
+                    this.select_month(first, cx);
+                })));
             }
             cal = cal.child(row);
         }

@@ -43,6 +43,10 @@ impl LayoutMode {
 pub enum PaneView {
     /// The selected day's daily note.
     Day,
+    /// The weekly note of the week containing the selected day.
+    Week,
+    /// The monthly note of the month containing the selected day.
+    Month,
     /// A note from the `Notes/` tree.
     Note(PathBuf),
     /// A file from a sidebar Library root: rendered by kind (markdown
@@ -552,19 +556,6 @@ impl Workspace {
             return;
         }
         self.settings.show_tasks = on;
-        if let Err(e) = self.settings.save() {
-            eprintln!("kairn: failed to save settings: {e}");
-        }
-        cx.notify();
-    }
-
-    /// Point the sidebar Daily section forward (today + next two days) or
-    /// back (today + previous two).
-    pub fn set_daily_forward(&mut self, forward: bool, cx: &mut Context<Self>) {
-        if self.settings.daily_forward == forward {
-            return;
-        }
-        self.settings.daily_forward = forward;
         if let Err(e) = self.settings.save() {
             eprintln!("kairn: failed to save settings: {e}");
         }

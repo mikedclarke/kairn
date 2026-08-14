@@ -125,9 +125,29 @@ impl Workspace {
     }
 
     pub fn select_day(&mut self, day: NaiveDate, cx: &mut Context<Self>) {
+        self.select_period(PaneView::Day, day, cx);
+    }
+
+    /// The weekly note of the week containing `day`.
+    pub fn select_week(&mut self, day: NaiveDate, cx: &mut Context<Self>) {
+        self.select_period(PaneView::Week, day, cx);
+    }
+
+    /// The monthly note of the month containing `day`.
+    pub fn select_month(&mut self, day: NaiveDate, cx: &mut Context<Self>) {
+        self.select_period(PaneView::Month, day, cx);
+    }
+
+    fn select_period(&mut self, view: PaneView, day: NaiveDate, cx: &mut Context<Self>) {
         self.flush_note_editor(cx);
+        // The mini calendar reads cal_offset in the shown view's unit
+        // (months over days and weeks, years over months), so a stale
+        // offset from another view kind would land somewhere surprising.
+        if self.view != view {
+            self.cal_offset = 0;
+        }
         self.selected_day = day;
-        self.view = PaneView::Day;
+        self.view = view;
         self.show_note_pane();
         self.reload_notes(cx);
         cx.notify();
@@ -200,6 +220,8 @@ impl Workspace {
         // with no note yet saves to its daily path on first edit.
         let path = self.doc_path.clone().or_else(|| match &self.view {
             PaneView::Day => Some(notes::daily_path(&self.notes_root, self.selected_day)),
+            PaneView::Week => Some(notes::weekly_path(&self.notes_root, self.selected_day)),
+            PaneView::Month => Some(notes::monthly_path(&self.notes_root, self.selected_day)),
             _ => None,
         });
         let Some(path) = path else {
@@ -816,6 +838,12 @@ impl Workspace {
         }
         let path = match &self.view {
             PaneView::Day => scan.days.get(&self.selected_day).cloned(),
+            PaneView::Week => {
+                notes::period_file(&self.notes_root, &notes::weekly_stem(self.selected_day))
+            }
+            PaneView::Month => {
+                notes::period_file(&self.notes_root, &notes::monthly_stem(self.selected_day))
+            }
             PaneView::Note(p) => Some(p.clone()),
             // Only markdown library files are documents here; other kinds
             // (images, binaries) render from the view's path without a text
@@ -875,6 +903,8 @@ impl Workspace {
         // ISO date ([[2026-08-07]] and >2026-08-07 alike), a note by its stem.
         let title = match &self.view {
             PaneView::Day => Some(self.selected_day.format("%Y-%m-%d").to_string()),
+            PaneView::Week => Some(notes::weekly_stem(self.selected_day)),
+            PaneView::Month => Some(notes::monthly_stem(self.selected_day)),
             PaneView::Note(p) => p
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -895,6 +925,12 @@ impl Workspace {
             PaneView::Day => path
                 .clone()
                 .or_else(|| Some(notes::daily_path(&self.notes_root, self.selected_day))),
+            PaneView::Week => path
+                .clone()
+                .or_else(|| Some(notes::weekly_path(&self.notes_root, self.selected_day))),
+            PaneView::Month => path
+                .clone()
+                .or_else(|| Some(notes::monthly_path(&self.notes_root, self.selected_day))),
             _ => path.clone(),
         };
         self.conflicts = conflict_probe

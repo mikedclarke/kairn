@@ -50,8 +50,13 @@ pub fn time_blocks(text: &str) -> Vec<TimeBlock> {
             }
             if i == span_ix {
                 // The token goes, and so does the connective it hung from:
-                // "call simon at 14:00" reads "call simon".
-                label.push_str(strip_connective(text[..token.start].trim_end()));
+                // "call simon at 14:00" reads "call simon". The connective
+                // is trimmed off the label built so far because the token
+                // may open its own span (SpanKind::Time), leaving "at" at
+                // the tail of the span before it.
+                label.push_str(&text[..token.start]);
+                let kept = strip_connective(label.trim_end()).len();
+                label.truncate(kept);
                 label.push_str(&text[token.end..]);
             } else {
                 label.push_str(text);
@@ -64,11 +69,13 @@ pub fn time_blocks(text: &str) -> Vec<TimeBlock> {
     blocks
 }
 
-/// Span kinds whose text can contain the line's time token.
+/// Span kinds whose text can contain the line's time token. Plain text
+/// times arrive pre-split as [`SpanKind::Time`] spans; emphasis spans keep
+/// their times inline, so their text is still searched.
 fn searchable(kind: SpanKind) -> bool {
     matches!(
         kind,
-        SpanKind::Text | SpanKind::Bold | SpanKind::Italic | SpanKind::Highlight
+        SpanKind::Time | SpanKind::Text | SpanKind::Bold | SpanKind::Italic | SpanKind::Highlight
     )
 }
 
@@ -119,98 +126,13 @@ fn find_time(text: &str) -> Option<(Range<usize>, NaiveTime, Option<NaiveTime>)>
             || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b':';
         if boundary
             && bytes[i].is_ascii_digit()
-            && let Some((end_ix, start, end)) = parse_token(text, i)
+            && let Some((end_ix, start, end)) = parse::parse_time_token(text, i)
         {
             return Some((i..end_ix, start, end));
         }
         i += 1;
     }
     None
-}
-
-/// Parse a full time token at `at`: a time, optionally `-`/`–` (spaces
-/// allowed) and a second time. Returns the token's end index and the times.
-fn parse_token(text: &str, at: usize) -> Option<(usize, NaiveTime, Option<NaiveTime>)> {
-    let (mut i, start) = parse_one_time(text, at)?;
-    // An optional range half: `-10:30`, ` - 10:30`, `–10:30`.
-    let rest = &text[i..];
-    let mut j = 0;
-    let bytes = rest.as_bytes();
-    if j < bytes.len() && bytes[j] == b' ' {
-        j += 1;
-    }
-    let dash = if rest[j..].starts_with('-') {
-        Some(1)
-    } else if rest[j..].starts_with('–') {
-        Some('–'.len_utf8())
-    } else {
-        None
-    };
-    if let Some(dash_len) = dash {
-        let mut k = j + dash_len;
-        if k < bytes.len() && bytes[k] == b' ' {
-            k += 1;
-        }
-        if let Some((end_ix, end)) = parse_one_time(text, i + k) {
-            i = end_ix;
-            return Some((i, start, Some(end)));
-        }
-    }
-    Some((i, start, None))
-}
-
-/// Parse a single time at `at`: `H:MM`/`HH:MM`, optional am/pm (attached or
-/// after one space). Returns the index after the time and the time itself.
-/// A bare 24-hour time above 23:59 (or minutes above 59) is not a time.
-fn parse_one_time(text: &str, at: usize) -> Option<(usize, NaiveTime)> {
-    let bytes = text.as_bytes();
-    let mut i = at;
-    let digits_start = i;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    let hour_len = i - digits_start;
-    if !(1..=2).contains(&hour_len) {
-        return None;
-    }
-    if i >= bytes.len() || bytes[i] != b':' {
-        return None;
-    }
-    i += 1;
-    let min_start = i;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i - min_start != 2 {
-        return None;
-    }
-    let hour: u32 = text[digits_start..digits_start + hour_len].parse().ok()?;
-    let minute: u32 = text[min_start..min_start + 2].parse().ok()?;
-    if minute > 59 {
-        return None;
-    }
-    // am/pm, attached or after one space; consumed only when it parses.
-    let mut j = i;
-    if j < bytes.len() && bytes[j] == b' ' {
-        j += 1;
-    }
-    let suffix = text[j..].get(..2).map(str::to_ascii_lowercase);
-    let meridiem = match suffix.as_deref() {
-        Some("am") | Some("pm") if !followed_by_word(bytes, j + 2) => suffix,
-        _ => None,
-    };
-    let (hour, end_ix) = match meridiem.as_deref() {
-        Some("am") if (1..=12).contains(&hour) => (hour % 12, j + 2),
-        Some("pm") if (1..=12).contains(&hour) => (hour % 12 + 12, j + 2),
-        _ if hour <= 23 => (hour, i),
-        _ => return None,
-    };
-    NaiveTime::from_hms_opt(hour, minute, 0).map(|t| (end_ix, t))
-}
-
-/// Whether an alphanumeric continues at `at` (so `9:30amber` isn't `9:30am`).
-fn followed_by_word(bytes: &[u8], at: usize) -> bool {
-    bytes.get(at).is_some_and(|b| b.is_ascii_alphanumeric())
 }
 
 #[cfg(test)]

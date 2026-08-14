@@ -1904,7 +1904,9 @@ fn kind_style(line: &Line, t: &KairnTheme) -> (KindStyle, Glyph) {
 fn span_style(kind: SpanKind, base: Hsla, t: &KairnTheme) -> (Hsla, Option<Hsla>, FontWeight, FontStyle) {
     match kind {
         SpanKind::Text => (base, None, FontWeight::NORMAL, FontStyle::Normal),
-        SpanKind::WikiLink | SpanKind::Link | SpanKind::Url => {
+        // Times take the link colour but stay inert: no click target ever
+        // attaches to them.
+        SpanKind::WikiLink | SpanKind::Link | SpanKind::Url | SpanKind::Time => {
             (t.accent, None, FontWeight::NORMAL, FontStyle::Normal)
         }
         SpanKind::Tag | SpanKind::DateRef => (t.amber, None, FontWeight::NORMAL, FontStyle::Normal),

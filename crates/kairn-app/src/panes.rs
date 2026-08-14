@@ -267,13 +267,16 @@ impl Workspace {
         });
         self.week_strip_bounds.borrow_mut().clear();
 
+        // The strip's content sits inside the note's own side padding (38px,
+        // see `note_frame`), so on wide screens the days start and end where
+        // the note text does instead of stretching wall to wall.
         let mut strip = div()
-            .h(px(62.))
+            .h(px(48.))
             .flex_none()
             .flex()
             .items_center()
-            .gap(px(5.))
-            .px(px(16.))
+            .gap(px(4.))
+            .px(px(38.))
             .bg(t.panel)
             .border_b_1()
             .border_color(t.border)
@@ -314,8 +317,8 @@ impl Workspace {
                     .id(("week-day", i as usize))
                     .relative()
                     .flex_1()
-                    .py(px(5.))
-                    .rounded(px(9.))
+                    .py(px(3.))
+                    .rounded(px(8.))
                     .flex()
                     .flex_col()
                     .items_center()
@@ -350,7 +353,7 @@ impl Workspace {
                     )
                     .child(
                         div()
-                            .text_size(t.ui_px(13.5))
+                            .text_size(t.ui_px(12.5))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .when(is_today && !is_selected, |d| d.text_color(t.amber))
                             .child(day.format("%-d").to_string()),
@@ -403,6 +406,38 @@ impl Workspace {
                     .unwrap_or_else(|| "Notes".to_string());
                 (title, folder, "Couldn't read this note.")
             }
+            PaneView::Week => {
+                let monday = self.selected_day
+                    - Days::new(self.selected_day.weekday().num_days_from_monday() as u64);
+                let sunday = monday + Days::new(6);
+                let iso = self.selected_day.iso_week();
+                let masthead = format!("Week {}, {}", iso.week(), iso.year());
+                // "11 – 17 August 2026", or spelled out across a boundary.
+                let subline = if monday.month() == sunday.month() {
+                    format!(
+                        "{} – {} {} {}",
+                        monday.format("%-d"),
+                        sunday.format("%-d"),
+                        sunday.format("%B"),
+                        sunday.year()
+                    )
+                } else {
+                    format!(
+                        "{} {} – {} {} {}",
+                        monday.format("%-d"),
+                        monday.format("%B"),
+                        sunday.format("%-d"),
+                        sunday.format("%B"),
+                        sunday.year()
+                    )
+                };
+                (masthead, subline, "No note for this week yet.")
+            }
+            PaneView::Month => {
+                let date = self.selected_day;
+                let masthead = format!("{} {}", date.format("%B"), date.year());
+                (masthead, "Monthly note".to_string(), "No note for this month yet.")
+            }
             _ => {
                 let date = self.selected_day;
                 let masthead = format!(
@@ -430,6 +465,11 @@ impl Workspace {
                 -1 => Some("Yesterday"),
                 _ => None,
             },
+            PaneView::Week => (self.selected_day.iso_week() == today.iso_week())
+                .then_some("This week"),
+            PaneView::Month => (self.selected_day.year() == today.year()
+                && self.selected_day.month() == today.month())
+            .then_some("This month"),
             _ => None,
         };
 
@@ -1071,10 +1111,12 @@ fn spans_text(t: &KairnTheme, spans: &[Span]) -> StyledText {
         text.push_str(s);
         let style = match kind {
             SpanKind::Text => None,
-            SpanKind::WikiLink | SpanKind::Link | SpanKind::Url => Some(HighlightStyle {
-                color: Some(t.accent),
-                ..Default::default()
-            }),
+            SpanKind::WikiLink | SpanKind::Link | SpanKind::Url | SpanKind::Time => {
+                Some(HighlightStyle {
+                    color: Some(t.accent),
+                    ..Default::default()
+                })
+            }
             SpanKind::Tag | SpanKind::DateRef => Some(HighlightStyle {
                 color: Some(t.amber),
                 ..Default::default()

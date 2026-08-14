@@ -53,6 +53,9 @@ impl From<SpanKind> for FfiSpanKind {
             SpanKind::Italic => Self::Italic,
             SpanKind::Link => Self::Link,
             SpanKind::Url => Self::Url,
+            // Times style like plain text on mobile until the app there
+            // grows a treatment; a new variant would break its span switch.
+            SpanKind::Time => Self::Text,
             SpanKind::Hidden => Self::Hidden,
         }
     }

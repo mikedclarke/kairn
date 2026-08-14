@@ -388,11 +388,6 @@ impl SettingsEditor {
     }
 
     fn render_general(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let daily_forward = self
-            .workspace
-            .upgrade()
-            .map(|ws| ws.read(cx).settings.daily_forward)
-            .unwrap_or(true);
         let week_strip = self
             .workspace
             .upgrade()
@@ -422,16 +417,6 @@ impl SettingsEditor {
             .map(|ws| home_relative(&ws.read(cx).notes_root))
             .unwrap_or_default();
 
-        let daily_button = |id: &'static str, label: &'static str, forward: bool| {
-            let btn = Button::new(id).label(label);
-            let btn = if forward == daily_forward { btn.primary() } else { btn.outline() };
-            btn.on_click(cx.listener(move |this, _, _, cx| {
-                let _ = this.workspace.update(cx, |ws, cx| {
-                    ws.set_daily_forward(forward, cx);
-                });
-                cx.notify();
-            }))
-        };
         let strip_button = |id: &'static str, label: &'static str, mode: &'static str| {
             let btn = Button::new(id).label(label);
             let btn = if mode == week_strip { btn.primary() } else { btn.outline() };
@@ -554,13 +539,6 @@ impl SettingsEditor {
                 "Currently {resolved}; a change lands on Save. A NotePlan-style folder \
                  works as-is; Calendar/, Notes/ and .kairn/ are created if missing."
             )))
-            .child(Self::section("Sidebar daily list"))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(daily_button("daily-forward", "Today + next 2 days", true))
-                    .child(daily_button("daily-back", "Today + previous 2 days", false)),
-            )
             .child(Self::section("Week strip above notes"))
             .child(
                 h_flex()
@@ -657,10 +635,36 @@ impl SettingsEditor {
     }
 
     fn render_theme(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let mut choices: Vec<(String, String)> = vec![
-            ("dark".to_string(), "Dark".to_string()),
-            ("light".to_string(), "Light".to_string()),
-        ];
+        // The choice stored in settings is one id, but it reads as two
+        // rows: Appearance (the base dark/light look) and Theme (Default,
+        // the coloured presets, and the vault's custom themes). A preset or
+        // custom theme carries its own mode, so while one is active the
+        // Appearance row reflects that mode; clicking there drops back to
+        // the Default theme in the clicked mode.
+        let active_mode = match self.theme_choice.as_str() {
+            "light" => "light",
+            "dark" => "dark",
+            id => self
+                .themes
+                .iter()
+                .find(|t| t.id == id)
+                .map(|t| if t.mode == "light" { "light" } else { "dark" })
+                // The built-in presets are all dark.
+                .unwrap_or("dark"),
+        };
+        let mut mode_row = h_flex().gap_2();
+        for (id, name) in [("dark", "Dark"), ("light", "Light")] {
+            let btn = Button::new(("appearance-choice", (id == "light") as usize)).label(name);
+            let btn = if id == active_mode { btn.primary() } else { btn.outline() };
+            mode_row = mode_row.child(btn.on_click(cx.listener(move |this, _, _, cx| {
+                this.theme_choice = id.to_string();
+                cx.notify();
+            })));
+        }
+
+        let is_default = matches!(self.theme_choice.as_str(), "dark" | "light");
+        let mut choices: Vec<(String, String)> =
+            vec![("default".to_string(), "Default".to_string())];
         choices.extend(
             crate::theme::BUILTIN_PRESETS
                 .iter()
@@ -669,10 +673,15 @@ impl SettingsEditor {
         choices.extend(self.themes.iter().map(|t| (t.id.clone(), t.name.clone())));
         let mut theme_row = h_flex().gap_2().flex_wrap();
         for (i, (id, name)) in choices.into_iter().enumerate() {
+            let selected = if id == "default" { is_default } else { id == self.theme_choice };
             let btn = Button::new(("theme-choice", i)).label(name);
-            let btn = if id == self.theme_choice { btn.primary() } else { btn.outline() };
+            let btn = if selected { btn.primary() } else { btn.outline() };
+            let active_mode = active_mode.to_string();
             theme_row = theme_row.child(btn.on_click(cx.listener(move |this, _, _, cx| {
-                this.theme_choice = id.clone();
+                // "Default" keeps whatever mode is showing; a theme brings
+                // its own.
+                this.theme_choice =
+                    if id == "default" { active_mode.clone() } else { id.clone() };
                 cx.notify();
             })));
         }
@@ -691,13 +700,19 @@ impl SettingsEditor {
         v_flex()
             .gap_2()
             .w_full()
+            .child(Self::section("Appearance"))
+            .child(mode_row)
+            .child(div().text_size(px(11.)).opacity(0.55).child(
+                "The base look. Themes below carry their own mode; picking \
+                 Dark or Light returns to the Default theme.",
+            ))
             .child(Self::section("Theme"))
             .child(theme_row)
             .child(div().text_size(px(11.)).opacity(0.55).child(
-                "Dark, Light, and the coloured presets are built in. For full \
-                 control, custom themes are JSON files in .kairn/themes/ inside \
-                 your notes folder; any colours, fonts, and terminal shades they \
-                 leave out fall back to the built-ins.",
+                "The coloured presets are built in. For full control, custom \
+                 themes are JSON files in .kairn/themes/ inside your notes \
+                 folder; any colours, fonts, and terminal shades they leave \
+                 out fall back to the built-ins.",
             ))
             .child(Self::section("Fonts"))
             .child(font_row("Interface", &self.ui_font))

@@ -83,14 +83,14 @@ pub struct Settings {
     /// stays empty.
     #[serde(default = "default_true")]
     pub show_agents: bool,
-    /// Whether the sidebar shows the Daily section.
+    /// Whether the sidebar shows the Daily / Weekly / Monthly buttons.
     #[serde(default = "default_true")]
     pub show_daily: bool,
     /// Whether the sidebar shows the Tasks section.
     #[serde(default = "default_true")]
     pub show_tasks: bool,
-    /// The sidebar Daily section looks forward (today plus the next two
-    /// days) when true, back (today plus the previous two) when false.
+    /// Direction of the retired three-day sidebar list. Kept so settings
+    /// files that carry it still load; nothing reads it.
     #[serde(default = "default_true")]
     pub daily_forward: bool,
     /// Sidebar sections the user has collapsed, by their header labels.
