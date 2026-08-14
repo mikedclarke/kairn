@@ -1,10 +1,9 @@
 use gpui::{
-    AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
+    AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
     PathPromptOptions, Render, StatefulInteractiveElement, Styled, WeakEntity, Window, div,
     prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    WindowExt,
     button::{Button, ButtonVariants},
     h_flex,
     input::{Input, InputState},
@@ -34,7 +33,7 @@ enum Tab {
 impl Tab {
     const ALL: [(Tab, &'static str); 5] = [
         (Tab::General, "General"),
-        (Tab::Theme, "Theme"),
+        (Tab::Theme, "Appearance"),
         (Tab::Templates, "Templates"),
         (Tab::Ssh, "SSH hosts"),
         (Tab::Keybinds, "Keybinds"),
@@ -117,6 +116,9 @@ pub struct SettingsEditor {
     ui_size_loaded: Option<f32>,
     /// Result line under the "Install kairn command" button, set on click.
     cli_status: Option<String>,
+    /// Focus anchor for the page, so its Overlay key context (Esc closes)
+    /// is active as soon as settings open.
+    focus_handle: FocusHandle,
 }
 
 struct HostRow {
@@ -303,6 +305,7 @@ impl SettingsEditor {
             editor_size,
             ui_size,
             cli_status: None,
+            focus_handle: cx.focus_handle(),
             fonts_loaded: (
                 ws.settings.ui_font.clone(),
                 ws.settings.editor_font.clone(),
@@ -334,7 +337,16 @@ impl SettingsEditor {
             .collect()
     }
 
-    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn focus_handle(&self) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+
+    /// Everything the page edits in batch (notes root, hosts, shortcuts,
+    /// template, theme, fonts), read out of the inputs as a patch for
+    /// [`Workspace::apply_settings`]. Pure read: the caller applies it, so
+    /// both close paths (the page's Back row and the workspace's Esc / gear
+    /// toggle) can run without re-entering the other entity.
+    pub(crate) fn collect_patch(&self, cx: &Context<Self>) -> crate::vault_state::SettingsPatch {
         let body = self.template_body.read(cx).value().to_string();
         let font_of = |sel: &FontSelect, loaded: &Option<String>| match sel
             .read(cx)
@@ -360,7 +372,7 @@ impl SettingsEditor {
         };
         let editor_font_size = parse_size(&self.editor_size, self.fonts_loaded.3);
         let ui_font_size = parse_size(&self.ui_size, self.ui_size_loaded);
-        let patch = crate::vault_state::SettingsPatch {
+        crate::vault_state::SettingsPatch {
             notes_root: self.notes_root_choice.clone(),
             hosts: self.collect_hosts(cx),
             local_apps: collect_apps(&self.local_apps, cx),
@@ -372,11 +384,7 @@ impl SettingsEditor {
             mono_font: font_of(&self.mono_font, &self.fonts_loaded.2),
             editor_font_size,
             ui_font_size,
-        };
-        let _ = self.workspace.update(cx, |ws, cx| {
-            ws.apply_settings(patch, window, cx);
-        });
-        window.close_dialog(cx);
+        }
     }
 
     fn section(label: &'static str) -> gpui::Div {
@@ -554,13 +562,6 @@ impl SettingsEditor {
             ))
             .child(Self::section("Command line tool"))
             .child(self.render_cli(cx))
-            .child(Self::section("About"))
-            .child(
-                div()
-                    .text_size(px(11.))
-                    .opacity(0.55)
-                    .child(concat!("Kairn ", env!("CARGO_PKG_VERSION"))),
-            )
     }
 
     fn render_cli(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -893,16 +894,129 @@ impl SettingsEditor {
 }
 
 impl Render for SettingsEditor {
+    /// The settings page: a rail of sections on the left, one scrollable
+    /// content column on the right, capped at a reading measure. Nothing
+    /// resizes across sections; tall sections scroll. Batch edits land when
+    /// the page closes (Back, Esc, or the settings chord again).
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let tabs = h_flex().gap_1().children(Tab::ALL.map(|(tab, label)| {
-            let btn = Button::new(label).label(label);
-            let btn = if tab == self.tab { btn.primary() } else { btn.ghost() };
-            btn.on_click(cx.listener(move |this, _, _, cx| {
-                this.tab = tab;
-                cx.notify();
-            }))
-        }));
+        let t = cx.kairn().clone();
 
+        let hover_bg = t.hover;
+        let mut rail = v_flex()
+            .w(px(220.))
+            .h_full()
+            .flex_none()
+            .gap(px(2.))
+            .p(px(10.))
+            .bg(t.panel)
+            .border_r_1()
+            .border_color(t.border)
+            .child(
+                div()
+                    .id("settings-back")
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(10.))
+                    .py(px(6.))
+                    .mb(px(8.))
+                    .rounded(px(6.))
+                    .text_size(t.ui_px(12.5))
+                    .text_color(t.dim)
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover_bg))
+                    .child("‹ Back")
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .font_family(t.mono_font.clone())
+                            .text_size(t.ui_px(10.5))
+                            .text_color(t.faint)
+                            .border_1()
+                            .border_color(t.border)
+                            .rounded(px(4.))
+                            .px(px(4.))
+                            .bg(t.bg)
+                            .child("esc"),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        // Apply from this side: collect here, hand the patch
+                        // to the workspace, never re-enter this entity.
+                        let patch = this.collect_patch(cx);
+                        let _ = this.workspace.update(cx, |ws, cx| {
+                            ws.settings_view = None;
+                            ws.apply_settings(patch, window, cx);
+                            cx.notify();
+                        });
+                    })),
+            )
+            .child(
+                div()
+                    .px(px(10.))
+                    .pb(px(4.))
+                    .text_size(t.ui_px(10.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(t.faint)
+                    .child("SETTINGS"),
+            );
+        for (tab, label) in Tab::ALL {
+            let active = tab == self.tab;
+            let sel = t.sel;
+            let accent = t.accent;
+            let dim = t.dim;
+            rail = rail.child(
+                div()
+                    .id(label)
+                    .flex()
+                    .items_center()
+                    .px(px(10.))
+                    .py(px(6.))
+                    .rounded(px(6.))
+                    .text_size(t.ui_px(12.5))
+                    .cursor_pointer()
+                    .when(active, |d| d.bg(sel).text_color(accent))
+                    .when(!active, |d| {
+                        d.text_color(dim).hover(move |s| s.bg(hover_bg))
+                    })
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.tab = tab;
+                        cx.notify();
+                    })),
+            );
+        }
+        rail = rail.child(div().flex_1()).child(
+            div()
+                .px(px(10.))
+                .py(px(8.))
+                .text_size(t.ui_px(11.))
+                .text_color(t.faint)
+                .child(concat!("Kairn ", env!("CARGO_PKG_VERSION"))),
+        );
+
+        let (title, sub, scroll_id) = match self.tab {
+            Tab::General => (
+                "General",
+                "Notes location, what the sidebar shows, and the week strip.",
+                "settings-scroll-general",
+            ),
+            Tab::Theme => ("Appearance", "Theme, fonts, and text sizes.", "settings-scroll-theme"),
+            Tab::Templates => (
+                "Templates",
+                "What new daily notes start with.",
+                "settings-scroll-templates",
+            ),
+            Tab::Ssh => (
+                "SSH hosts",
+                "Saved connections and their launch shortcuts.",
+                "settings-scroll-ssh",
+            ),
+            Tab::Keybinds => (
+                "Keybinds",
+                "Everything the app answers to.",
+                "settings-scroll-keybinds",
+            ),
+        };
         let content = match self.tab {
             Tab::General => self.render_general(cx),
             Tab::Theme => self.render_theme(cx),
@@ -911,42 +1025,42 @@ impl Render for SettingsEditor {
             Tab::Keybinds => self.render_keybinds(cx),
         };
 
-        // Fixed height with the content scrolling inside it: the dialog
-        // keeps one size across tabs, and a tall tab (General, Keybinds)
-        // scrolls instead of running off the screen.
-        v_flex()
-            .gap_2()
-            .w_full()
-            .h(px(520.))
-            .child(tabs)
+        div()
+            .id("settings-page")
+            .key_context("Overlay")
+            .track_focus(&self.focus_handle)
+            .flex()
+            .size_full()
+            .min_h(px(0.))
+            .bg(t.bg)
+            .child(rail)
             .child(
                 div()
-                    .id("settings-scroll")
+                    .id(scroll_id)
                     .flex_1()
-                    .min_h(px(0.))
+                    .h_full()
+                    .min_w(px(0.))
                     .overflow_y_scroll()
-                    .child(content),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .mt_2()
-                    .child(div().flex_1())
                     .child(
-                        Button::new("settings-cancel")
-                            .ghost()
-                            .label("Cancel")
-                            .on_click(cx.listener(|_, _, window, cx| {
-                                window.close_dialog(cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("settings-save")
-                            .primary()
-                            .label("Save")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.save(window, cx);
-                            })),
+                        div()
+                            .max_w(px(620.))
+                            .px(px(40.))
+                            .py(px(26.))
+                            .child(
+                                div()
+                                    .text_size(t.ui_px(17.))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(2.))
+                                    .mb(px(16.))
+                                    .text_size(t.ui_px(12.5))
+                                    .text_color(t.dim)
+                                    .child(sub),
+                            )
+                            .child(content),
                     ),
             )
     }
@@ -970,10 +1084,13 @@ fn fmt_size(s: f32) -> String {
     }
 }
 
-pub fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+/// Build the settings page's editor entity, loaded from the current
+/// settings. The workspace stores it and swaps it in for the main area.
+pub fn open(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Entity<SettingsEditor> {
     let weak = cx.weak_entity();
-    let editor = cx.new(|cx| SettingsEditor::new(weak, workspace, window, cx));
-    window.open_dialog(cx, move |dialog, _, _| {
-        dialog.w(px(600.)).title("Settings").child(editor.clone())
-    });
+    cx.new(|cx| SettingsEditor::new(weak, workspace, window, cx))
 }

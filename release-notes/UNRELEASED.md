@@ -24,6 +24,8 @@ Titlebar controls show a hover tooltip naming the control with its keyboard shor
 
 The Daily, Weekly, and Monthly switcher is now a slim strip drawn as a single line under the calendar, with the active mode outlined as an upside-down tab with 45-degree cut corners.
 
+Settings is a full page instead of a popup: sections in a left rail, one scrolling content column, one stable size, and room to grow; Esc or Back returns to the app and applies your changes.
+
 The timeline clock tab sits first on the calendar switcher, next to Daily, so the two swap with one small pointer move.
 
 The titlebar search and layout switcher are one capsule at a single height, with all four layouts (Writing, Notes, Notes + Terminal, Terminal) as matching drawn icons.

@@ -130,6 +130,9 @@ pub struct Workspace {
     sidebar_open: bool,
     /// The one open overlay (picker, switcher, or capture), if any.
     pub(crate) overlay: Option<Overlay>,
+    /// The settings page, replacing the whole area below the titlebar while
+    /// open. Its batch edits apply when it closes.
+    pub(crate) settings_view: Option<gpui::Entity<crate::settings_dialog::SettingsEditor>>,
     /// The single-buffer editor over the pane's document: the only editing
     /// model. The Writing layout is a focused-width view of the same
     /// editor, not a separate one. Absent when nothing here is editable
@@ -348,6 +351,7 @@ impl Workspace {
             layout: LayoutMode::Split,
             sidebar_open: true,
             overlay: None,
+            settings_view: None,
             note_editor: None,
             _note_editor_sub: None,
             orphaned: None,
@@ -639,9 +643,30 @@ impl Workspace {
         self.open_settings(window, cx);
     }
 
+    /// Open the settings page, or close it (applying its edits) when it is
+    /// already up, so the settings chord toggles.
     pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_view.is_some() {
+            self.close_settings(window, cx);
+            return;
+        }
         self.overlay = None;
-        crate::settings_dialog::open(self, window, cx);
+        let editor = crate::settings_dialog::open(self, window, cx);
+        window.focus(&editor.read(cx).focus_handle());
+        self.settings_view = Some(editor);
+        cx.notify();
+    }
+
+    /// Close the settings page, applying its batch edits. The patch is
+    /// collected in the editor's context and applied here, so neither
+    /// entity re-enters the other.
+    pub(crate) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(editor) = self.settings_view.take() {
+            let patch = editor.update(cx, |editor, cx| editor.collect_patch(cx));
+            self.apply_settings(patch, window, cx);
+            window.focus(&self.focus_handle);
+            cx.notify();
+        }
     }
 
     fn on_new_local_session(
@@ -705,18 +730,27 @@ impl Render for Workspace {
         }
 
         let mut body = div().flex().flex_1().min_h(px(0.));
-        // Writing is the focused layout: the note at a comfortable measure,
-        // no sidebar.
-        if self.sidebar_open && self.layout != LayoutMode::Writing {
-            body = body.child(self.render_sidebar(&t, cx));
-        } else {
-            // No sidebar this frame: its drop targets must not linger as
-            // invisible hit zones for an in-flight drag.
+        if let Some(editor) = &self.settings_view {
+            // Settings take over everything below the titlebar. The hidden
+            // panes' drop stores must not linger as invisible hit zones.
             self.sidebar_bounds.borrow_mut().take();
             self.calendar_drop_bounds.borrow_mut().clear();
             self.daily_drop_bounds.borrow_mut().clear();
+            body = body.child(editor.clone());
+        } else {
+            // Writing is the focused layout: the note at a comfortable
+            // measure, no sidebar.
+            if self.sidebar_open && self.layout != LayoutMode::Writing {
+                body = body.child(self.render_sidebar(&t, cx));
+            } else {
+                // No sidebar this frame: its drop targets must not linger as
+                // invisible hit zones for an in-flight drag.
+                self.sidebar_bounds.borrow_mut().take();
+                self.calendar_drop_bounds.borrow_mut().clear();
+                self.daily_drop_bounds.borrow_mut().clear();
+            }
+            body = body.child(self.render_main(&t, window, cx));
         }
-        body = body.child(self.render_main(&t, window, cx));
 
         div()
             .id("kairn-root")
@@ -765,7 +799,11 @@ impl Render for Workspace {
             .on_key_down(cx.listener(Self::on_key_down))
             .child(self.render_titlebar(&t, cx))
             .child(body)
-            .child(self.render_settings_fab(&t, cx))
+            .children(
+                self.settings_view
+                    .is_none()
+                    .then(|| self.render_settings_fab(&t, cx)),
+            )
             .children(self.render_statusbar(&t, cx))
             .children(self.render_picker(&t, window, cx))
             .children(self.render_notes_menu(&t, window, cx))
