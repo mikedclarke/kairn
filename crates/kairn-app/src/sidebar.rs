@@ -691,11 +691,12 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// Period switcher as browser-style tabs: the active mode is a cupped tab
-    /// standing on the strip's baseline, the other two are plain floating
-    /// labels with no chrome. Every tab reserves the same border and padding
-    /// in every state, so selecting or hovering never nudges a label out of
-    /// line (the earlier bold-active tab changed width and did).
+    /// Period switcher as a mirrored browser-tab strip: the hairline sits
+    /// directly under the calendar and the three tabs hang beneath it, the
+    /// active one a cupped tab (rounded bottom corners) attached to the line,
+    /// the other two plain labels. Every tab reserves the same border and
+    /// padding in every state, so selecting or hovering never nudges a label
+    /// out of line (the earlier bold-active tab changed width and did).
     fn render_period_tabs(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {
         let tabs: [(&str, &str, PaneView); 3] = [
             ("period-daily", "Daily", PaneView::Day),
@@ -705,9 +706,8 @@ impl Workspace {
         let mut row = div()
             .flex()
             .px(px(14.))
-            .pt(px(8.))
             .gap(px(3.))
-            .border_b(px(1.))
+            .border_t(px(1.))
             .border_color(t.border);
         for (id, label, view) in tabs {
             let active = self.view == view;
@@ -716,12 +716,12 @@ impl Workspace {
                 div()
                     .id(id)
                     .flex_1()
-                    .pt(px(6.))
-                    .pb(px(6.))
+                    .pt(px(3.))
+                    .pb(px(4.))
                     .text_center()
-                    .text_size(t.ui_px(11.))
-                    .rounded_t(px(7.))
-                    .border_t(px(1.))
+                    .text_size(t.ui_px(10.5))
+                    .rounded_b(px(6.))
+                    .border_b(px(1.))
                     .border_l(px(1.))
                     .border_r(px(1.))
                     .cursor_pointer()
