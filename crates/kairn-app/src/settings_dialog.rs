@@ -1,6 +1,7 @@
 use gpui::{
-    AppContext, Context, Entity, IntoElement, ParentElement, PathPromptOptions, Render, Styled,
-    WeakEntity, Window, div, prelude::FluentBuilder as _, px,
+    AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
+    PathPromptOptions, Render, StatefulInteractiveElement, Styled, WeakEntity, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     WindowExt,
@@ -533,12 +534,13 @@ impl SettingsEditor {
                     .child(strip_button("strip-off", "Hidden", "off")),
             )
             .child(Self::section("Sidebar sections"))
-            .child(vis_row("Daily", "daily", "daily-vis-on", "daily-vis-off", show_daily))
+            .child(vis_row("Calendar", "daily", "daily-vis-on", "daily-vis-off", show_daily))
             .child(vis_row("Tasks", "tasks", "tasks-vis-on", "tasks-vis-off", show_tasks))
             .child(vis_row("Agents", "agents", "agents-on", "agents-off", show_agents))
             .child(div().text_size(px(11.)).opacity(0.55).child(
-                "Hidden sections disappear from the sidebar entirely. Agents is the feed \
-                 of agent CLI activity on this machine.",
+                "Hidden sections disappear from the sidebar entirely. Calendar is the mini \
+                 month with the timeline and period switcher; Agents is the feed of agent \
+                 CLI activity on this machine.",
             ))
             .child(Self::section("Library file order"))
             .child(
@@ -909,11 +911,22 @@ impl Render for SettingsEditor {
             Tab::Keybinds => self.render_keybinds(cx),
         };
 
+        // Fixed height with the content scrolling inside it: the dialog
+        // keeps one size across tabs, and a tall tab (General, Keybinds)
+        // scrolls instead of running off the screen.
         v_flex()
             .gap_2()
             .w_full()
+            .h(px(520.))
             .child(tabs)
-            .child(content)
+            .child(
+                div()
+                    .id("settings-scroll")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .child(content),
+            )
             .child(
                 h_flex()
                     .gap_2()
