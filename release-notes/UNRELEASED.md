@@ -16,8 +16,10 @@ same fact twice; no em dashes. Rewrite to this standard before releasing.
 
 <!-- Refinements to existing workflows, reliability, performance, or UX. -->
 
-The Daily, Weekly, and Monthly switcher is now a compact mirrored tab strip hanging from a line directly under the calendar, with the active mode cupped as a tab and the others plain.
+The Daily, Weekly, and Monthly switcher is now a slim strip drawn as a single line under the calendar, with the active mode outlined as an upside-down tab with 45-degree cut corners.
 
 ## Fixed
 
 <!-- Bugs that no longer happen. -->
+
+Calendar switcher and month picker labels no longer shift left while hovered.

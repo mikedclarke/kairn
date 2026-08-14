@@ -691,24 +691,55 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// Period switcher as a mirrored browser-tab strip: the hairline sits
-    /// directly under the calendar and the three tabs hang beneath it, the
-    /// active one a cupped tab (rounded bottom corners) attached to the line,
-    /// the other two plain labels. Every tab reserves the same border and
-    /// padding in every state, so selecting or hovering never nudges a label
-    /// out of line (the earlier bold-active tab changed width and did).
+    /// Period switcher as a mirrored browser-tab strip drawn as one hairline:
+    /// the divider runs under the calendar and dips into a chamfered
+    /// (45-degree cut) outline around the active mode, an upside-down browser
+    /// tab with no fill. Labels are centred with flex, not text alignment:
+    /// gpui drops a div's text alignment while a hover text style applies,
+    /// which made centred labels jump left on hover in every earlier version
+    /// of this strip.
     fn render_period_tabs(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {
+        const PAD: f32 = 14.;
+        const GAP: f32 = 3.;
+        const HEIGHT: f32 = 21.;
+        const CHAMFER: f32 = 6.;
         let tabs: [(&str, &str, PaneView); 3] = [
             ("period-daily", "Daily", PaneView::Day),
             ("period-weekly", "Weekly", PaneView::Week),
             ("period-monthly", "Monthly", PaneView::Month),
         ];
-        let mut row = div()
-            .flex()
-            .px(px(14.))
-            .gap(px(3.))
-            .border_t(px(1.))
-            .border_color(t.border);
+        let active_idx = tabs.iter().position(|(_, _, view)| self.view == *view);
+        let line = t.border;
+        let outline = gpui::canvas(
+            |_, _, _| {},
+            move |bounds: gpui::Bounds<gpui::Pixels>, _, window, _| {
+                let l = f32::from(bounds.left());
+                let r = f32::from(bounds.right());
+                let top = f32::from(bounds.top()) + 0.5;
+                let bottom = f32::from(bounds.bottom()) - 0.5;
+                let mut path = gpui::PathBuilder::stroke(px(1.));
+                path.move_to(point(px(l), px(top)));
+                if let Some(i) = active_idx {
+                    let w = (r - l - 2. * PAD - 2. * GAP) / 3.;
+                    let x0 = l + PAD + i as f32 * (w + GAP);
+                    let x1 = x0 + w;
+                    path.line_to(point(px(x0), px(top)));
+                    path.line_to(point(px(x0), px(bottom - CHAMFER)));
+                    path.line_to(point(px(x0 + CHAMFER), px(bottom)));
+                    path.line_to(point(px(x1 - CHAMFER), px(bottom)));
+                    path.line_to(point(px(x1), px(bottom - CHAMFER)));
+                    path.line_to(point(px(x1), px(top)));
+                }
+                path.line_to(point(px(r), px(top)));
+                if let Ok(path) = path.build() {
+                    window.paint_path(path, line);
+                }
+            },
+        )
+        .absolute()
+        .size_full();
+
+        let mut row = div().flex().size_full().px(px(PAD)).gap(px(GAP));
         for (id, label, view) in tabs {
             let active = self.view == view;
             let hover_text = t.text;
@@ -716,23 +747,16 @@ impl Workspace {
                 div()
                     .id(id)
                     .flex_1()
-                    .pt(px(3.))
-                    .pb(px(4.))
-                    .text_center()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .text_size(t.ui_px(10.5))
-                    .rounded_b(px(6.))
-                    .border_b(px(1.))
-                    .border_l(px(1.))
-                    .border_r(px(1.))
                     .cursor_pointer()
                     .when_else(
                         active,
-                        |d| d.bg(t.sel).border_color(t.border).text_color(t.text),
-                        |d| {
-                            d.border_color(t.border.opacity(0.))
-                                .text_color(t.dim)
-                                .hover(move |s| s.text_color(hover_text))
-                        },
+                        |d| d.text_color(t.text),
+                        |d| d.text_color(t.dim).hover(move |s| s.text_color(hover_text)),
                     )
                     .child(label.to_string())
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -745,7 +769,7 @@ impl Workspace {
                     })),
             );
         }
-        row
+        div().relative().h(px(HEIGHT)).child(outline).child(row)
     }
 
     fn render_calendar(
@@ -1031,12 +1055,17 @@ impl Workspace {
                 let is_selected = shown_year == self.selected_day.year()
                     && month == self.selected_day.month();
                 let hover_bg = t.hover;
+                // Flex centring, not text_center: a hover restyle drops the
+                // div's text alignment in gpui, so centred text jumps left
+                // under the pointer.
                 let cell = div()
                     .id(("cal-month", month as usize))
                     .flex_1()
                     .py(px(7.))
                     .rounded(px(5.))
-                    .text_center()
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .cursor_pointer()
                     .child(first.format("%b").to_string());
                 let cell = if is_current {
