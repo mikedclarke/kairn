@@ -107,10 +107,10 @@ pub fn init(cx: &mut App) {
         // Direct layout chords, numbered in the titlebar switcher's
         // left-to-right order. Alt+digit so they can't collide with the
         // plain-digit session chords on either platform.
-        KeyBinding::new(&pa("1"), LayoutNotes, None),
-        KeyBinding::new(&pa("2"), LayoutSplit, None),
-        KeyBinding::new(&pa("3"), LayoutTerminal, None),
-        KeyBinding::new(&pa("4"), LayoutWriting, None),
+        KeyBinding::new(&pa("1"), LayoutWriting, None),
+        KeyBinding::new(&pa("2"), LayoutNotes, None),
+        KeyBinding::new(&pa("3"), LayoutSplit, None),
+        KeyBinding::new(&pa("4"), LayoutTerminal, None),
         KeyBinding::new(&p("j"), ToggleSwitcher, None),
         KeyBinding::new(&p(","), OpenSettings, None),
         KeyBinding::new(&p("shift-k"), Capture, None),
@@ -210,10 +210,10 @@ pub fn keybind_list() -> Vec<(&'static str, Vec<(String, &'static str)>)> {
         (
             "Layout",
             vec![
-                (chord_alt("1"), "Notes layout"),
-                (chord_alt("2"), "Notes + terminal layout"),
-                (chord_alt("3"), "Terminal layout"),
-                (chord_alt("4"), "Writing layout"),
+                (chord_alt("1"), "Writing layout"),
+                (chord_alt("2"), "Notes layout"),
+                (chord_alt("3"), "Notes + terminal layout"),
+                (chord_alt("4"), "Terminal layout"),
                 (chord_shift("⏎"), "Full-screen terminal on/off"),
                 (chord_alt("⏎"), "Writing mode on/off"),
             ],

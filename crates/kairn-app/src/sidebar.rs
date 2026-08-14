@@ -770,11 +770,15 @@ impl Workspace {
             ("period-monthly", "Monthly", PaneView::Month),
         ];
         // While the timeline hangs open, the outline cups its clock tab; the
-        // period tabs read as plain labels even though a day is showing.
+        // period tabs read as plain labels even though a day is showing. The
+        // clock sits first (index 0), next to Daily, so timeline and daily
+        // swap with one small pointer move; the labels follow at 1..3.
         let active_idx = if self.timeline_open {
-            Some(3)
+            Some(0)
         } else {
-            tabs.iter().position(|(_, _, view)| self.view == *view)
+            tabs.iter()
+                .position(|(_, _, view)| self.view == *view)
+                .map(|i| i + 1)
         };
         let line = t.border;
         let outline = gpui::canvas(
@@ -788,8 +792,12 @@ impl Workspace {
                 path.move_to(point(px(l), px(top)));
                 if let Some(i) = active_idx {
                     let w = (r - l - 2. * PAD - 3. * GAP - CLOCK_W) / 3.;
-                    let x0 = l + PAD + (i as f32).min(3.) * (w + GAP);
-                    let x1 = x0 + if i == 3 { CLOCK_W } else { w };
+                    let x0 = if i == 0 {
+                        l + PAD
+                    } else {
+                        l + PAD + CLOCK_W + GAP + ((i - 1) as f32) * (w + GAP)
+                    };
+                    let x1 = x0 + if i == 0 { CLOCK_W } else { w };
                     path.line_to(point(px(x0), px(top)));
                     path.line_to(point(px(x0), px(bottom - CHAMFER)));
                     path.line_to(point(px(x0 + CHAMFER), px(bottom)));
@@ -807,6 +815,32 @@ impl Workspace {
         .size_full();
 
         let mut row = div().flex().size_full().px(px(PAD)).gap(px(GAP));
+        let hover_text = t.text;
+        row = row.child(
+            div()
+                .id("period-timeline")
+                .w(px(CLOCK_W))
+                .flex_none()
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .when_else(
+                    self.timeline_open,
+                    |d| d.text_color(t.text),
+                    |d| d.text_color(t.dim).hover(move |s| s.text_color(hover_text)),
+                )
+                .child(
+                    gpui::svg()
+                        .path("kairn-icons/clock.svg")
+                        .flex_none()
+                        .w(t.ui_px(12.))
+                        .h(t.ui_px(12.))
+                        .text_color(if self.timeline_open { t.text } else { t.dim }),
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_timeline(cx))),
+        );
         for (id, label, view) in tabs {
             let active = !self.timeline_open && self.view == view;
             let hover_text = t.text;
@@ -837,32 +871,6 @@ impl Workspace {
                     })),
             );
         }
-        let hover_text = t.text;
-        row = row.child(
-            div()
-                .id("period-timeline")
-                .w(px(CLOCK_W))
-                .flex_none()
-                .h_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .when_else(
-                    self.timeline_open,
-                    |d| d.text_color(t.text),
-                    |d| d.text_color(t.dim).hover(move |s| s.text_color(hover_text)),
-                )
-                .child(
-                    gpui::svg()
-                        .path("kairn-icons/clock.svg")
-                        .flex_none()
-                        .w(t.ui_px(12.))
-                        .h(t.ui_px(12.))
-                        .text_color(if self.timeline_open { t.text } else { t.dim }),
-                )
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_timeline(cx))),
-        );
         div().relative().h(px(HEIGHT)).child(outline).child(row)
     }
 

@@ -73,10 +73,10 @@ impl Workspace {
                     .items_center()
                     .gap(px(2.))
                     .px(px(3.))
+                    .child(self.layout_mode_button(t, "mode-writing", LayoutMode::Writing, cx))
                     .child(self.layout_mode_button(t, "mode-notes", LayoutMode::NotesFull, cx))
                     .child(self.layout_mode_button(t, "mode-split", LayoutMode::Split, cx))
-                    .child(self.layout_mode_button(t, "mode-term", LayoutMode::TerminalFull, cx))
-                    .child(self.layout_mode_button(t, "mode-writing", LayoutMode::Writing, cx)),
+                    .child(self.layout_mode_button(t, "mode-term", LayoutMode::TerminalFull, cx)),
             );
 
         TitleBar::new()
@@ -99,10 +99,10 @@ impl Workspace {
         let sel = t.sel;
         let color = if active { t.accent } else { t.dim };
         let (name, key) = match mode {
-            LayoutMode::NotesFull => ("Notes", chord_alt("1")),
-            LayoutMode::Split => ("Notes + Terminal", chord_alt("2")),
-            LayoutMode::TerminalFull => ("Terminal", chord_alt("3")),
-            LayoutMode::Writing => ("Writing", chord_alt("4")),
+            LayoutMode::Writing => ("Writing", chord_alt("1")),
+            LayoutMode::NotesFull => ("Notes", chord_alt("2")),
+            LayoutMode::Split => ("Notes + Terminal", chord_alt("3")),
+            LayoutMode::TerminalFull => ("Terminal", chord_alt("4")),
         };
         let glyph = match mode {
             LayoutMode::NotesFull => seg_icon_notes(color).into_any_element(),
