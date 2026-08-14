@@ -71,6 +71,28 @@ pub(crate) enum HoldState {
     Open(HoldMenu),
 }
 
+/// A drag on a sidebar timeline block. Times are recomputed from the
+/// pointer each frame (the block renders at the provisional slot) and the
+/// note line is rewritten only on release.
+pub(crate) struct TimelineDrag {
+    pub line_idx: usize,
+    /// The raw line at grab time, the write-back verification token.
+    pub expected: String,
+    pub start: chrono::NaiveTime,
+    pub end: Option<chrono::NaiveTime>,
+    /// Dragging the bottom edge (retime the end) rather than the body
+    /// (move the whole block).
+    pub resize: bool,
+    /// Pointer minutes-from-midnight minus block-start minutes at grab
+    /// time, so the block doesn't snap its top edge to the pointer.
+    pub grab_offset_min: i32,
+    pub origin: gpui::Point<gpui::Pixels>,
+    pub position: gpui::Point<gpui::Pixels>,
+    /// True once the pointer has travelled past the drag threshold;
+    /// releases before that are clicks, not edits.
+    pub moved: bool,
+}
+
 pub(crate) struct HoldMenu {
     pub day: NaiveDate,
     pub items: Vec<HoldItem>,
@@ -173,9 +195,22 @@ pub struct Workspace {
     /// Open/done task tallies for Monday..Sunday of the selected day's week,
     /// so the week strip can show the same indicators as the calendar.
     pub week_stats: [notes::DayTaskStats; 7],
-    /// Time-blocked lines of the selected day's note, for the timeline pill
-    /// row; empty for other views. Recomputed on reload, not per frame.
+    /// Time-blocked lines of the selected day's note, for the sidebar's
+    /// timeline view; empty for other views. Recomputed on reload, not per
+    /// frame.
     pub day_timeline: Vec<notes::TimeBlock>,
+    /// Whether the sidebar's day timeline hangs open under the calendar
+    /// (the clock tab); while open the other sidebar sections make way and
+    /// the sidebar scroll scrolls the timeline. Session state, not a
+    /// setting.
+    pub(crate) timeline_open: bool,
+    /// An in-flight drag of a timeline block: moving it to another time,
+    /// resizing its end, or carrying it onto a calendar day.
+    pub(crate) timeline_drag: Option<TimelineDrag>,
+    /// The timeline's 24-hour canvas bounds from the last paint, the ruler
+    /// that converts drag positions to clock times.
+    pub(crate) timeline_bounds:
+        std::rc::Rc<std::cell::RefCell<Option<gpui::Bounds<gpui::Pixels>>>>,
     /// Open-task counts for the Today/Open/Overdue views, from the last
     /// reload; renders read these instead of re-scanning per frame.
     pub(crate) task_counts: [usize; 3],
@@ -351,6 +386,9 @@ impl Workspace {
             calendar_drop_bounds: Default::default(),
             daily_drop_bounds: Default::default(),
             sidebar_bounds: Default::default(),
+            timeline_open: false,
+            timeline_drag: None,
+            timeline_bounds: Default::default(),
             sidebar_scroll: gpui::ScrollHandle::new(),
             sidebar_flick_samples: std::collections::VecDeque::new(),
             _sidebar_kinetic_task: None,
@@ -508,21 +546,6 @@ impl Workspace {
         if let Err(e) = self.settings.save() {
             eprintln!("kairn: failed to save settings: {e}");
         }
-        cx.notify();
-    }
-
-    /// Show or hide the daily note's timeline pill row.
-    pub fn set_day_timeline(&mut self, on: bool, cx: &mut Context<Self>) {
-        if self.settings.day_timeline == on {
-            return;
-        }
-        self.settings.day_timeline = on;
-        if let Err(e) = self.settings.save() {
-            eprintln!("kairn: failed to save settings: {e}");
-        }
-        // Turning it on must fill the row for the note already on screen;
-        // off clears it (reload skips the parse entirely while disabled).
-        self.reload_notes(cx);
         cx.notify();
     }
 

@@ -1,4 +1,5 @@
-use chrono::{Datelike, Days, Local, Months, NaiveDate};
+use chrono::{Datelike, Days, Local, Months, NaiveDate, Timelike};
+use gpui::AnimationExt as _;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     Context, ElementId, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
@@ -23,13 +24,70 @@ impl Workspace {
 
         // While a line drag is in flight, the day row or cell under the
         // pointer rings as the drop target (hit-tested against last-painted
-        // bounds, like the week strip).
+        // bounds, like the week strip). A carried timeline block rings the
+        // same way.
         let drop_day = self
             .note_editor
             .as_ref()
             .and_then(|e| e.read(cx).line_drag())
-            .and_then(|(_, _, position)| self.resolve_day_drop(position));
+            .and_then(|(_, _, position)| self.resolve_day_drop(position))
+            .or_else(|| {
+                self.timeline_drag
+                    .as_ref()
+                    .filter(|d| d.moved && !d.resize)
+                    .and_then(|d| self.resolve_day_drop(d.position))
+            });
         self.sidebar_bounds.borrow_mut().take();
+
+        // Timeline mode: the calendar and its tab strip stay pinned while
+        // the scroll container holds only the day timeline, so the sidebar
+        // scroll walks the day. The hidden sections' drop stores still
+        // clear, or stale bounds would keep catching drops.
+        if self.timeline_open && self.settings.show_daily {
+            self.daily_drop_bounds.borrow_mut().clear();
+            let sidebar_store = self.sidebar_bounds.clone();
+            return div()
+                .w(px(272.))
+                .flex_none()
+                .h_full()
+                .flex()
+                .flex_col()
+                .relative()
+                .bg(t.panel)
+                .border_r_1()
+                .border_color(t.border)
+                .text_size(t.ui_px(12.5))
+                .child(
+                    gpui::canvas(
+                        move |bounds, _, _| {
+                            sidebar_store.borrow_mut().replace(bounds);
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+                .child(self.render_calendar_component(t, drop_day, cx))
+                .child(
+                    div()
+                        .id("sidebar-scroll")
+                        .flex_1()
+                        .min_h(px(0.))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.sidebar_scroll)
+                        .on_scroll_wheel(cx.listener(
+                            |this, ev: &gpui::ScrollWheelEvent, _, cx| {
+                                if cfg!(target_os = "linux") && ev.delta.precise() {
+                                    this.sidebar_flick(
+                                        f32::from(ev.delta.pixel_delta(px(20.)).y),
+                                        cx,
+                                    );
+                                }
+                            },
+                        ))
+                        .child(self.render_timeline_view(t, cx)),
+                );
+        }
 
         let sidebar_store = self.sidebar_bounds.clone();
         let mut side = div()
@@ -703,12 +761,21 @@ impl Workspace {
         const GAP: f32 = 3.;
         const HEIGHT: f32 = 21.;
         const CHAMFER: f32 = 6.;
+        /// The clock tab's width: an icon-sized stub so the three period
+        /// tabs keep most of the strip.
+        const CLOCK_W: f32 = 26.;
         let tabs: [(&str, &str, PaneView); 3] = [
             ("period-daily", "Daily", PaneView::Day),
             ("period-weekly", "Weekly", PaneView::Week),
             ("period-monthly", "Monthly", PaneView::Month),
         ];
-        let active_idx = tabs.iter().position(|(_, _, view)| self.view == *view);
+        // While the timeline hangs open, the outline cups its clock tab; the
+        // period tabs read as plain labels even though a day is showing.
+        let active_idx = if self.timeline_open {
+            Some(3)
+        } else {
+            tabs.iter().position(|(_, _, view)| self.view == *view)
+        };
         let line = t.border;
         let outline = gpui::canvas(
             |_, _, _| {},
@@ -720,9 +787,9 @@ impl Workspace {
                 let mut path = gpui::PathBuilder::stroke(px(1.));
                 path.move_to(point(px(l), px(top)));
                 if let Some(i) = active_idx {
-                    let w = (r - l - 2. * PAD - 2. * GAP) / 3.;
-                    let x0 = l + PAD + i as f32 * (w + GAP);
-                    let x1 = x0 + w;
+                    let w = (r - l - 2. * PAD - 3. * GAP - CLOCK_W) / 3.;
+                    let x0 = l + PAD + (i as f32).min(3.) * (w + GAP);
+                    let x1 = x0 + if i == 3 { CLOCK_W } else { w };
                     path.line_to(point(px(x0), px(top)));
                     path.line_to(point(px(x0), px(bottom - CHAMFER)));
                     path.line_to(point(px(x0 + CHAMFER), px(bottom)));
@@ -741,7 +808,7 @@ impl Workspace {
 
         let mut row = div().flex().size_full().px(px(PAD)).gap(px(GAP));
         for (id, label, view) in tabs {
-            let active = self.view == view;
+            let active = !self.timeline_open && self.view == view;
             let hover_text = t.text;
             row = row.child(
                 div()
@@ -760,6 +827,7 @@ impl Workspace {
                     )
                     .child(label.to_string())
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_timeline(cx);
                         let today = Local::now().date_naive();
                         match view {
                             PaneView::Week => this.select_week(today, cx),
@@ -769,7 +837,273 @@ impl Workspace {
                     })),
             );
         }
+        let hover_text = t.text;
+        row = row.child(
+            div()
+                .id("period-timeline")
+                .w(px(CLOCK_W))
+                .flex_none()
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .when_else(
+                    self.timeline_open,
+                    |d| d.text_color(t.text),
+                    |d| d.text_color(t.dim).hover(move |s| s.text_color(hover_text)),
+                )
+                .child(
+                    gpui::svg()
+                        .path("kairn-icons/clock.svg")
+                        .flex_none()
+                        .w(t.ui_px(12.))
+                        .h(t.ui_px(12.))
+                        .text_color(if self.timeline_open { t.text } else { t.dim }),
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_timeline(cx))),
+        );
         div().relative().h(px(HEIGHT)).child(outline).child(row)
+    }
+
+    /// The day timeline hanging under the calendar: 24 hour rows, the day's
+    /// time-blocked lines laid over them at their clock positions, and a
+    /// now line on today. Blocks drag to move, drag by the bottom edge to
+    /// resize, and carry onto a calendar day like any other task drag.
+    fn render_timeline_view(&self, t: &KairnTheme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        const GUTTER: f32 = 46.;
+        let min_of = |time: chrono::NaiveTime| (time.hour() * 60 + time.minute()) as i32;
+        let hour_h = px(self.timeline_hour_px());
+        let today = Local::now().date_naive() == self.selected_day;
+
+        let mut rows = div().relative().h(hour_h * 24.);
+
+        // The 24-hour canvas publishes its bounds (the y-to-time ruler) and,
+        // while a drag is live, window-level listeners keep tracking the
+        // pointer wherever it goes, the note editor's drag recipe.
+        let bounds_store = self.timeline_bounds.clone();
+        let dragging = self.timeline_drag.is_some();
+        let workspace = cx.entity();
+        rows = rows.child(
+            gpui::canvas(
+                move |bounds, _, _| {
+                    bounds_store.borrow_mut().replace(bounds);
+                },
+                move |_, _, window, _| {
+                    if !dragging {
+                        return;
+                    }
+                    window.on_mouse_event({
+                        let workspace = workspace.clone();
+                        move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                            if phase != gpui::DispatchPhase::Bubble {
+                                return;
+                            }
+                            if event.pressed_button == Some(MouseButton::Left) {
+                                workspace.update(cx, |ws, cx| {
+                                    ws.on_timeline_drag_move(event.position, cx);
+                                });
+                            }
+                        }
+                    });
+                    window.on_mouse_event({
+                        let workspace = workspace.clone();
+                        move |event: &gpui::MouseUpEvent, phase, _, cx| {
+                            if phase != gpui::DispatchPhase::Bubble
+                                || event.button != MouseButton::Left
+                            {
+                                return;
+                            }
+                            workspace.update(cx, |ws, cx| {
+                                ws.on_timeline_drag_release(event.position, cx);
+                            });
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .size_full(),
+        );
+
+        for hour in 0..24 {
+            rows = rows.child(
+                div()
+                    .absolute()
+                    .top(hour_h * hour as f32)
+                    .left(px(0.))
+                    .right(px(0.))
+                    .h(hour_h)
+                    .border_t_1()
+                    .border_color(t.border.opacity(if hour == 0 { 0. } else { 0.5 }))
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(-7.))
+                            .left(px(10.))
+                            .text_size(t.ui_px(9.))
+                            .text_color(t.faint)
+                            .font_family(t.mono_font.clone())
+                            .child(format!("{hour:02}:00")),
+                    ),
+            );
+        }
+
+        if today {
+            let now_min = min_of(Local::now().time());
+            rows = rows.child(
+                div()
+                    .absolute()
+                    .top(hour_h * (now_min as f32 / 60.) - px(0.75))
+                    .left(px(GUTTER - 5.))
+                    .right(px(0.))
+                    .h(px(1.5))
+                    .bg(t.amber)
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(-2.))
+                            .left(px(0.))
+                            .w(px(5.))
+                            .h(px(5.))
+                            .rounded_full()
+                            .bg(t.amber),
+                    ),
+            );
+        }
+
+        if self.day_timeline.is_empty() {
+            rows = rows.child(
+                div()
+                    .absolute()
+                    .top(hour_h * 9.15)
+                    .left(px(GUTTER))
+                    .right(px(10.))
+                    .text_size(t.ui_px(10.))
+                    .text_color(t.faint)
+                    .child("No timed lines yet. Give a task a time like 09:30 - 10:15 and it lands here."),
+            );
+        }
+
+        // Greedy two-lane layout so overlapping blocks sit side by side
+        // instead of covering each other.
+        let spans: Vec<(i32, i32)> = self
+            .day_timeline
+            .iter()
+            .map(|b| {
+                let s = min_of(b.start);
+                (s, b.end.map(&min_of).unwrap_or(s + 30).max(s + 15))
+            })
+            .collect();
+        let mut lane_busy_until = [i32::MIN, i32::MIN];
+        for (ix, block) in self.day_timeline.iter().enumerate() {
+            let (mut s_min, mut e_min) = spans[ix];
+            let live = match &self.timeline_drag {
+                Some(d) if d.line_idx == block.line_idx && d.moved => {
+                    let (s, e) = self.timeline_drag_times(d);
+                    s_min = min_of(s);
+                    e_min = e.map(&min_of).unwrap_or(s_min + 30).max(s_min + 15);
+                    true
+                }
+                _ => false,
+            };
+            let shared = spans
+                .iter()
+                .enumerate()
+                .any(|(j, &(s, e))| j != ix && s < spans[ix].1 && spans[ix].0 < e);
+            let lane = usize::from(spans[ix].0 < lane_busy_until[0]);
+            lane_busy_until[lane] = lane_busy_until[lane].max(spans[ix].1);
+
+            let y = hour_h * (s_min as f32 / 60.);
+            let h = (hour_h * ((e_min - s_min) as f32 / 60.)).max(px(17.));
+            let time_text = match block.end.is_some() || live {
+                true => format!(
+                    "{:02}:{:02} - {:02}:{:02}",
+                    s_min / 60,
+                    s_min % 60,
+                    e_min / 60,
+                    e_min % 60
+                ),
+                false => format!("{:02}:{:02}", s_min / 60, s_min % 60),
+            };
+            let tall = h >= px(31.);
+
+            let mut card = div()
+                .id(("timeline-block", ix))
+                .absolute()
+                .top(y)
+                .h(h)
+                .rounded(px(6.))
+                .bg(t.sel)
+                .border_1()
+                .border_color(if live { t.accent } else { t.border })
+                .px(px(7.))
+                .py(px(2.))
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .justify_center()
+                .cursor_grab()
+                .text_size(t.ui_px(10.5))
+                .text_color(t.text)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        this.timeline_grab(ix, false, ev.position, cx);
+                    }),
+                );
+            card = match (shared, lane) {
+                (false, _) => card.left(px(GUTTER)).right(px(10.)),
+                (true, 0) => card.left(px(GUTTER)).right(gpui::relative(0.52)),
+                (true, _) => card.left(gpui::relative(0.52)).right(px(10.)),
+            };
+            let label: String = if block.label.is_empty() {
+                "(untitled)".to_string()
+            } else {
+                block.label.clone()
+            };
+            card = card.child(div().whitespace_nowrap().child(label));
+            if tall {
+                card = card.child(
+                    div()
+                        .text_size(t.ui_px(9.))
+                        .text_color(if live { t.accent } else { t.dim })
+                        .font_family(t.mono_font.clone())
+                        .child(time_text),
+                );
+            }
+            // The bottom edge retimes the end instead of moving the block.
+            card = card.child(
+                div()
+                    .id(("timeline-resize", ix))
+                    .absolute()
+                    .bottom(px(0.))
+                    .left(px(0.))
+                    .right(px(0.))
+                    .h(px(7.))
+                    .cursor_row_resize()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.timeline_grab(ix, true, ev.position, cx);
+                        }),
+                    ),
+            );
+            rows = rows.child(card);
+        }
+
+        // The strip slides open from under the calendar rather than popping.
+        div()
+            .pt(px(8.))
+            .pb(px(28.))
+            .child(rows)
+            .with_animation(
+                "timeline-slide",
+                gpui::Animation::new(std::time::Duration::from_millis(170))
+                    .with_easing(gpui::ease_out_quint()),
+                |this, delta| this.mt(px((delta - 1.) * 14.)).opacity(delta),
+            )
+            .into_any_element()
     }
 
     fn render_calendar(
@@ -859,6 +1193,10 @@ impl Workspace {
                 div()
                     .flex()
                     .text_size(t.ui_px(10.5))
+                    // Explicit line height so the grid's total height is
+                    // deterministic; the month picker matches it exactly to
+                    // keep the sidebar from jumping between views.
+                    .line_height(t.ui_px(15.))
                     .text_color(t.faint)
                     .children(["M", "T", "W", "T", "F", "S", "S"].map(|d| {
                         div().flex_1().py(px(2.)).text_center().child(d)
@@ -1003,7 +1341,7 @@ impl Workspace {
         let today = Local::now().date_naive();
         let shown_year = today.year() + self.cal_offset;
         let today_hover = t.text;
-        let mut cal = div().px(px(14.)).pt(px(14.)).pb(px(2.)).child(
+        let cal = div().px(px(14.)).pt(px(14.)).pb(px(2.)).child(
             div()
                 .flex()
                 .justify_between()
@@ -1044,8 +1382,16 @@ impl Workspace {
                         ))),
                 ),
         );
+        // The month grid fills exactly the height of the day calendar's
+        // weekday header plus six week rows (px terms and ui-scaled terms
+        // summed separately), so switching between Daily/Weekly and Monthly
+        // never moves the period strip or the sections below it.
+        let mut grid = div()
+            .h(px(88.) + t.ui_px(93.))
+            .flex()
+            .flex_col();
         for row_ix in 0..3u32 {
-            let mut row = div().flex().text_size(t.ui_px(11.5)).mb(px(2.));
+            let mut row = div().flex().flex_1().items_center().text_size(t.ui_px(11.5));
             for col in 0..4u32 {
                 let month = row_ix * 4 + col + 1;
                 let Some(first) = NaiveDate::from_ymd_opt(shown_year, month, 1) else {
@@ -1061,7 +1407,8 @@ impl Workspace {
                 let cell = div()
                     .id(("cal-month", month as usize))
                     .flex_1()
-                    .py(px(7.))
+                    .h(t.ui_px(30.))
+                    .mx(px(2.))
                     .rounded(px(5.))
                     .flex()
                     .items_center()
@@ -1083,9 +1430,9 @@ impl Workspace {
                     this.select_month(first, cx);
                 })));
             }
-            cal = cal.child(row);
+            grid = grid.child(row);
         }
-        cal
+        cal.child(grid)
     }
 }
 

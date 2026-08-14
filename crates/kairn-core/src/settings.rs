@@ -100,9 +100,6 @@ pub struct Settings {
     /// daily notes), or "off". Unknown values read as "always".
     #[serde(default = "default_week_strip")]
     pub week_strip: String,
-    /// The timeline pill row of time-blocked lines on the daily note.
-    #[serde(default = "default_day_timeline")]
-    pub day_timeline: bool,
     /// When the daily template seeds new days: "always", "weekdays", or
     /// "off". Unknown values read as "always".
     #[serde(default = "default_template_rule")]
@@ -140,10 +137,6 @@ fn default_true() -> bool {
     true
 }
 
-fn default_day_timeline() -> bool {
-    false
-}
-
 fn default_week_strip() -> String {
     "off".to_string()
 }
@@ -171,7 +164,6 @@ impl Default for Settings {
             daily_forward: true,
             sidebar_collapsed: Vec::new(),
             week_strip: default_week_strip(),
-            day_timeline: default_day_timeline(),
             daily_template_rule: default_template_rule(),
             // Fresh-install look: Ocean theme, Noto Sans for chrome and notes
             // (terminal keeps the auto-resolved mono), everything at 14px.

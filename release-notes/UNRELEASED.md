@@ -12,14 +12,22 @@ same fact twice; no em dashes. Rewrite to this standard before releasing.
 
 <!-- New user-visible capabilities. -->
 
+A clock tab on the calendar switcher opens a day timeline in the sidebar: the day's timed tasks appear as blocks that drag to a new time, resize from the bottom edge to change length, and drop onto a calendar day to move there.
+
 ## Improved
 
 <!-- Refinements to existing workflows, reliability, performance, or UX. -->
 
 The Daily, Weekly, and Monthly switcher is now a slim strip drawn as a single line under the calendar, with the active mode outlined as an upside-down tab with 45-degree cut corners.
 
+The month picker fills the same height as the day calendar, so switching views no longer shifts the sidebar.
+
+The timeline pill row above daily notes and its setting are retired in favour of the sidebar timeline.
+
 ## Fixed
 
 <!-- Bugs that no longer happen. -->
 
 Calendar switcher and month picker labels no longer shift left while hovered.
+
+Week strip day cards no longer overflow the strip at larger interface sizes.

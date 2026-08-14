@@ -8,12 +8,15 @@ use chrono::NaiveTime;
 use crate::parse::{self, Line, SpanKind, TaskState};
 
 /// One time-blocked line: when it starts, when it ends if the line says,
-/// and the line's text with the time token and bookkeeping stripped.
+/// the line's text with the time token and bookkeeping stripped, and where
+/// the line lives in its note so edits can write back to it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TimeBlock {
     pub start: NaiveTime,
     pub end: Option<NaiveTime>,
     pub label: String,
+    pub line_idx: usize,
+    pub line: String,
 }
 
 /// The time-blocked lines of a note, in start order. A block is any task,
@@ -25,7 +28,7 @@ pub struct TimeBlock {
 /// not an appointment).
 pub fn time_blocks(text: &str) -> Vec<TimeBlock> {
     let mut blocks: Vec<TimeBlock> = Vec::new();
-    for line in text.lines() {
+    for (line_idx, line) in text.lines().enumerate() {
         let parsed = parse::parse_line(line);
         let spans = match &parsed {
             Line::Task { state, spans } if *state != TaskState::Cancelled => spans,
@@ -63,10 +66,78 @@ pub fn time_blocks(text: &str) -> Vec<TimeBlock> {
             }
         }
         let label = clean_label(&label);
-        blocks.push(TimeBlock { start, end, label });
+        blocks.push(TimeBlock { start, end, label, line_idx, line: line.to_string() });
     }
     blocks.sort_by_key(|b| b.start);
     blocks
+}
+
+/// `line` with its time token rewritten to say `start` (and `end`, when
+/// given). The token keeps its written style: am/pm stays am/pm, a padded
+/// 24-hour hour stays padded, and an existing range keeps its separator.
+/// `None` when the line has no time token to rewrite.
+pub fn retime_line(line: &str, start: NaiveTime, end: Option<NaiveTime>) -> Option<String> {
+    match parse::parse_line(line) {
+        Line::Task { state, .. } if state != TaskState::Cancelled => {}
+        Line::Bullet { .. } | Line::Text { .. } => {}
+        _ => return None,
+    }
+    // Spans carry owned text, so the token is located in the raw line with
+    // the same scan `find_time` uses; the parse above only decides that
+    // this line kind is retimeable at all.
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let boundary =
+            i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b':';
+        if boundary
+            && bytes[i].is_ascii_digit()
+            && let Some((end_ix, ..)) = parse::parse_time_token(line, i)
+        {
+            // A time-shaped path segment inside a URL is not a schedule.
+            let word_start = line[..i].rfind(char::is_whitespace).map_or(0, |w| w + 1);
+            let word_end = line[i..]
+                .find(char::is_whitespace)
+                .map_or(line.len(), |w| i + w);
+            if line[word_start..word_end].contains("://") {
+                i = word_end;
+                continue;
+            }
+            let token = &line[i..end_ix];
+            let lower = token.to_ascii_lowercase();
+            let meridiem = lower.contains("am") || lower.contains("pm");
+            let padded = token.starts_with('0');
+            let sep = [" – ", " - ", "–", "-"]
+                .into_iter()
+                .find(|s| token.contains(s))
+                .unwrap_or(" - ");
+            let mut new_token = fmt_time(start, meridiem, padded);
+            if let Some(end) = end {
+                new_token.push_str(sep);
+                new_token.push_str(&fmt_time(end, meridiem, padded));
+            }
+            return Some(format!("{}{}{}", &line[..i], new_token, &line[end_ix..]));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// A clock time in the written style of the token it replaces.
+fn fmt_time(t: NaiveTime, meridiem: bool, padded: bool) -> String {
+    use chrono::Timelike;
+    if meridiem {
+        let h = match t.hour() % 12 {
+            0 => 12,
+            h => h,
+        };
+        let suffix = if t.hour() < 12 { "am" } else { "pm" };
+        format!("{}:{:02}{}", h, t.minute(), suffix)
+    } else if padded {
+        format!("{:02}:{:02}", t.hour(), t.minute())
+    } else {
+        format!("{}:{:02}", t.hour(), t.minute())
+    }
 }
 
 /// Span kinds whose text can contain the line's time token. Plain text
@@ -213,4 +284,45 @@ mod tests {
         assert_eq!(blocks[0].end, Some(t(10, 30)));
         assert_eq!(blocks[0].label, "deep work");
     }
+
+    #[test]
+    fn carries_line_locations() {
+        let blocks = time_blocks("# Thursday\n* 14:00 call simon\n\n* 09:00 standup\n");
+        assert_eq!(blocks[0].line_idx, 3);
+        assert_eq!(blocks[0].line, "* 09:00 standup");
+        assert_eq!(blocks[1].line_idx, 1);
+    }
+
+    #[test]
+    fn retime_preserves_written_style() {
+        assert_eq!(
+            retime_line("* [ ] 09:00-10:30 deep work", t(9, 30), Some(t(11, 0))),
+            Some("* [ ] 09:30-11:00 deep work".into())
+        );
+        assert_eq!(
+            retime_line("* 9:00 - 10:30 deep work", t(13, 5), Some(t(14, 0))),
+            Some("* 13:05 - 14:00 deep work".into())
+        );
+        assert_eq!(
+            retime_line("* 2:30pm review >2026-08-07", t(15, 0), Some(t(15, 45))),
+            Some("* 3:00pm - 3:45pm review >2026-08-07".into())
+        );
+        assert_eq!(
+            retime_line("* call simon at 14:00", t(9, 0), None),
+            Some("* call simon at 9:00".into())
+        );
+        // Gaining an end time where the line had none.
+        assert_eq!(
+            retime_line("* 14:00 call simon", t(14, 0), Some(t(14, 30))),
+            Some("* 14:00 - 14:30 call simon".into())
+        );
+        assert_eq!(retime_line("* no time here", t(9, 0), None), None);
+        assert_eq!(retime_line("## 09:00 heading", t(10, 0), None), None);
+        // A URL's time-shaped segment is left alone; the real token moves.
+        assert_eq!(
+            retime_line("* see https://example.com/10:30/x at 11:00", t(9, 0), None),
+            Some("* see https://example.com/10:30/x at 9:00".into())
+        );
+    }
 }
+

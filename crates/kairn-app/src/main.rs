@@ -42,6 +42,7 @@ impl AssetSource for KairnAssets {
             "kairn-icons/folder-open.svg" => {
                 Some(include_bytes!("../assets/icons/folder-open.svg"))
             }
+            "kairn-icons/clock.svg" => Some(include_bytes!("../assets/icons/clock.svg")),
             _ => None,
         };
         match own {

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{Datelike, Days, Local, NaiveDate};
+use chrono::{Datelike, Days, Local, NaiveDate, Timelike};
 use gpui::{AppContext as _, Context, Task, Window};
 use gpui_component::WindowExt;
 use kairn_core as notes;
@@ -45,6 +45,21 @@ fn relocate_line(text: &str, line_idx: usize, expected: &str) -> Option<usize> {
 /// end, which `move_block` treats as "the end of the note").
 fn line_start_offset(text: &str, line_idx: usize) -> usize {
     text.split('\n').take(line_idx).map(|l| l.len() + 1).sum::<usize>().min(text.len())
+}
+
+fn minutes_of(t: chrono::NaiveTime) -> i32 {
+    (t.hour() * 60 + t.minute()) as i32
+}
+
+/// The clock time `min` minutes into the day, clamped to the day.
+fn time_of(min: i32) -> chrono::NaiveTime {
+    let min = min.clamp(0, 23 * 60 + 59) as u32;
+    chrono::NaiveTime::from_hms_opt(min / 60, min % 60, 0).expect("clamped to a valid time")
+}
+
+/// `min` rounded to the nearest 5-minute mark.
+fn snap5(min: i32) -> i32 {
+    (min + 2).div_euclid(5) * 5
 }
 
 fn file_hash(path: &Path) -> Option<u64> {
@@ -458,6 +473,172 @@ impl Workspace {
             return None;
         }
         hit(&self.calendar_drop_bounds).or_else(|| hit(&self.daily_drop_bounds))
+    }
+
+    // --- Sidebar day timeline ---
+
+    /// One timeline hour in pixels, scaled with the UI font size the way
+    /// `KairnTheme::ui_px` scales chrome.
+    pub(crate) fn timeline_hour_px(&self) -> f32 {
+        const HOUR: f32 = 52.;
+        let base = crate::theme::UI_BASE_SIZE;
+        HOUR * self.settings.ui_font_size.unwrap_or(base) / base
+    }
+
+    /// Open or close the sidebar timeline (the period strip's clock tab).
+    pub(crate) fn toggle_timeline(&mut self, cx: &mut Context<Self>) {
+        if self.timeline_open {
+            self.close_timeline(cx);
+            return;
+        }
+        self.timeline_open = true;
+        // The timeline reads the selected day's daily note, so it forces the
+        // day view; the reload fills `day_timeline` now that the gate is on.
+        if !matches!(self.view, PaneView::Day) {
+            self.select_period(PaneView::Day, self.selected_day, cx);
+        } else {
+            self.reload_notes(cx);
+        }
+        // Land the useful part on screen: an hour before now on today, an
+        // hour before the first block otherwise, else the working morning.
+        let start_min = if self.selected_day == Local::now().date_naive() {
+            (Local::now().time().hour() as i32 * 60 - 60).max(0)
+        } else if let Some(first) = self.day_timeline.first() {
+            (minutes_of(first.start) - 60).max(0)
+        } else {
+            7 * 60
+        };
+        let y = -(start_min as f32 / 60. * self.timeline_hour_px());
+        self.sidebar_scroll.set_offset(gpui::point(gpui::px(0.), gpui::px(y)));
+        cx.notify();
+    }
+
+    pub(crate) fn close_timeline(&mut self, cx: &mut Context<Self>) {
+        if !self.timeline_open {
+            return;
+        }
+        self.timeline_open = false;
+        self.timeline_drag = None;
+        self.sidebar_scroll.set_offset(gpui::point(gpui::px(0.), gpui::px(0.)));
+        cx.notify();
+    }
+
+    /// Pointer height as minutes from midnight on the timeline's 24-hour
+    /// canvas; `None` before the first paint.
+    fn timeline_pointer_minutes(&self, y: gpui::Pixels) -> Option<i32> {
+        let bounds = (*self.timeline_bounds.borrow())?;
+        Some((f32::from(y - bounds.top()) / self.timeline_hour_px() * 60.) as i32)
+    }
+
+    /// Start dragging a timeline block: its body to move it, its bottom
+    /// edge (`resize`) to change how long it runs.
+    pub(crate) fn timeline_grab(
+        &mut self,
+        block_ix: usize,
+        resize: bool,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(block) = self.day_timeline.get(block_ix) else { return };
+        let Some(pointer_min) = self.timeline_pointer_minutes(position.y) else { return };
+        self.timeline_drag = Some(crate::workspace::TimelineDrag {
+            line_idx: block.line_idx,
+            expected: block.line.clone(),
+            start: block.start,
+            end: block.end,
+            resize,
+            grab_offset_min: pointer_min - minutes_of(block.start),
+            origin: position,
+            position,
+            moved: false,
+        });
+        cx.notify();
+    }
+
+    /// The drag's provisional times at its current pointer position,
+    /// snapped to 5 minutes. A move keeps the block's length (and an
+    /// endless block stays endless); a resize keeps the start and drags
+    /// the end, never shorter than 15 minutes.
+    pub(crate) fn timeline_drag_times(
+        &self,
+        drag: &crate::workspace::TimelineDrag,
+    ) -> (chrono::NaiveTime, Option<chrono::NaiveTime>) {
+        const LAST: i32 = 23 * 60 + 55;
+        let Some(pointer_min) = self.timeline_pointer_minutes(drag.position.y) else {
+            return (drag.start, drag.end);
+        };
+        let start_min = minutes_of(drag.start);
+        if drag.resize {
+            let end = snap5(pointer_min).clamp(start_min + 15, LAST);
+            (drag.start, Some(time_of(end)))
+        } else {
+            let dur = drag.end.map(|e| (minutes_of(e) - start_min).max(5));
+            let start = snap5(pointer_min - drag.grab_offset_min)
+                .clamp(0, LAST - dur.unwrap_or(0));
+            (time_of(start), dur.map(|d| time_of(start + d)))
+        }
+    }
+
+    pub(crate) fn on_timeline_drag_move(
+        &mut self,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = &mut self.timeline_drag else { return };
+        drag.position = position;
+        if !drag.moved {
+            let delta = position - drag.origin;
+            if f32::from(delta.x).abs() > 4. || f32::from(delta.y).abs() > 4. {
+                drag.moved = true;
+            }
+        }
+        if drag.moved {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn on_timeline_drag_release(
+        &mut self,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut drag) = self.timeline_drag.take() else { return };
+        cx.notify();
+        if !drag.moved {
+            return;
+        }
+        drag.position = position;
+        // Carried onto a calendar day: the whole block moves to that day's
+        // note, same as dragging a line out of the editor.
+        if !drag.resize
+            && let Some(day) = self.resolve_day_drop(position)
+            && day != self.selected_day
+        {
+            let Some(text) = self.doc_text.clone() else { return };
+            let matches_grab =
+                text.lines().nth(drag.line_idx).is_some_and(|l| l == drag.expected);
+            if matches_grab {
+                let offset = line_start_offset(&text, drag.line_idx);
+                let range = notes::block_range(&text, offset);
+                self.move_block_to_day(range, day, None, cx);
+            }
+            return;
+        }
+        let (start, end) = self.timeline_drag_times(&drag);
+        if (start, end) == (drag.start, drag.end) {
+            return;
+        }
+        let Some(new_line) = notes::retime_line(&drag.expected, start, end) else { return };
+        let Some(path) = self.doc_path.clone() else { return };
+        // Pending editor keystrokes reach the file first so the rewrite
+        // lands on what's actually on screen.
+        self.flush_note_editor(cx);
+        match notes::replace_line_on_disk(&path, drag.line_idx, &drag.expected, &new_line) {
+            Ok(Some(_)) => self.note_self_write(&path),
+            Ok(None) => {}
+            Err(e) => eprintln!("kairn: could not update {}: {e}", path.display()),
+        }
+        self.reload_notes(cx);
     }
 
     /// Move a block out of the open note into `day`'s note: to the top, or
@@ -894,9 +1075,7 @@ impl Workspace {
             None => disk_text.clone(),
         };
         self.day_timeline = match (&self.view, &self.doc_text) {
-            (PaneView::Day, Some(text)) if self.settings.day_timeline => {
-                notes::time_blocks(text)
-            }
+            (PaneView::Day, Some(text)) if self.timeline_open => notes::time_blocks(text),
             _ => Vec::new(),
         };
         // Linked mentions for the pane's document: a day is referenced by its

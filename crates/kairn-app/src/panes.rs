@@ -270,8 +270,12 @@ impl Workspace {
         // The strip's content sits inside the note's own side padding (38px,
         // see `note_frame`), so on wide screens the days start and end where
         // the note text does instead of stretching wall to wall.
+        // The day cards' height scales with the UI font, so the strip must
+        // too: a fixed 48px let the amber selected pill poke past the strip
+        // at larger UI sizes. Fixed padding terms plus ui-scaled text terms,
+        // with the cards' line heights pinned below.
         let mut strip = div()
-            .h(px(48.))
+            .h(px(16.) + t.ui_px(34.))
             .flex_none()
             .flex()
             .items_center()
@@ -342,6 +346,7 @@ impl Workspace {
                     .child(
                         div()
                             .text_size(t.ui_px(9.))
+                            .line_height(t.ui_px(11.))
                             .text_color(if is_drop {
                                 t.accent
                             } else if is_selected {
@@ -354,6 +359,7 @@ impl Workspace {
                     .child(
                         div()
                             .text_size(t.ui_px(12.5))
+                            .line_height(t.ui_px(14.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .when(is_today && !is_selected, |d| d.text_color(t.amber))
                             .child(day.format("%-d").to_string()),
@@ -474,9 +480,6 @@ impl Workspace {
         };
 
         let mut note = note_frame(t, writing, masthead, badge, subline);
-        if matches!(self.view, PaneView::Day) && !self.day_timeline.is_empty() {
-            note = note.child(self.render_timeline(t));
-        }
         if let Some(banner) = self.render_orphan_banner(t, cx) {
             note = note.child(banner);
         }
@@ -687,56 +690,6 @@ impl Workspace {
         }
 
         body.into_any_element()
-    }
-
-    /// The day's timeline pill row, per the locked mockup: one pill per
-    /// time-blocked line, chronological, the current block (today only)
-    /// ringed in accent. Rendering reads the reload-computed list; nothing
-    /// is parsed per frame.
-    fn render_timeline(&self, t: &KairnTheme) -> impl IntoElement {
-        let now_ix = (self.selected_day == Local::now().date_naive()).then(|| {
-            let now = Local::now().time();
-            self.day_timeline
-                .iter()
-                .rposition(|b| b.start <= now)
-                // A block whose stated end has passed is over, not current.
-                .filter(|&i| self.day_timeline[i].end.is_none_or(|end| now < end))
-        }).flatten();
-
-        let mut row = div().flex().flex_wrap().gap(px(5.)).mt(px(4.)).mb(px(2.));
-        for (i, block) in self.day_timeline.iter().enumerate() {
-            let current = now_ix == Some(i);
-            // One rambling line must not flood the row.
-            let label: String = if block.label.chars().count() > 40 {
-                block.label.chars().take(39).chain(std::iter::once('…')).collect()
-            } else {
-                block.label.clone()
-            };
-            let mut pill = div()
-                .flex()
-                .items_center()
-                .px(px(10.))
-                .py(px(2.))
-                .rounded_full()
-                .border_1()
-                .border_color(if current { t.accent } else { t.border })
-                .bg(t.panel)
-                .font_family(t.mono_font.clone())
-                .text_size(t.ui_px(10.5))
-                .text_color(if current { t.text } else { t.dim })
-                .child(
-                    div()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(t.accent)
-                        .mr(px(5.))
-                        .child(block.start.format("%H:%M").to_string()),
-                );
-            if !label.is_empty() {
-                pill = pill.child(label);
-            }
-            row = row.child(pill);
-        }
-        row
     }
 
     /// A line edit whose target line vanished from the file before saving:
