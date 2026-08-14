@@ -1141,7 +1141,7 @@ impl Workspace {
 
         let mut cal = div()
             .px(px(14.))
-            .pt(px(14.))
+            .pt(px(10.))
             .pb(px(2.))
             .child(
                 div()
@@ -1341,7 +1341,7 @@ impl Workspace {
         let today = Local::now().date_naive();
         let shown_year = today.year() + self.cal_offset;
         let today_hover = t.text;
-        let cal = div().px(px(14.)).pt(px(14.)).pb(px(2.)).child(
+        let cal = div().px(px(14.)).pt(px(10.)).pb(px(2.)).child(
             div()
                 .flex()
                 .justify_between()
