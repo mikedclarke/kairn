@@ -1,12 +1,13 @@
 //! Small shared UI pieces used across the chrome, overlays, and panes.
 
 use gpui::{
-    Context, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString,
-    Styled, div, px,
+    AnyView, App, AppContext as _, Context, Hsla, InteractiveElement, IntoElement,
+    ParentElement, Render, SharedString, Styled, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 use kairn_core::tasks::DayTaskStats;
 
-use crate::theme::KairnTheme;
+use crate::theme::{KairnTheme, KairnThemeExt as _};
 
 /// The NotePlan-style day indicator shared by the calendar grid and the week
 /// strip so the two can't drift: a hollow ring while any of the day's tasks
@@ -40,22 +41,60 @@ pub(crate) fn day_task_indicator(
     }
 }
 
-pub fn kbd(t: &KairnTheme, label: impl Into<SharedString>) -> gpui::Div {
-    div()
-        .font_family(t.mono_font.clone())
-        .text_size(px(10.5))
-        .text_color(t.faint)
-        .border_1()
-        .border_color(t.border)
-        .rounded(px(4.))
-        .px(px(4.))
-        .bg(t.bg)
-        .child(label.into())
+/// The hover hint on chrome controls: the control's name with its keyboard
+/// chord beneath in smaller faint type, so the shortcuts are learnable by
+/// exploring the UI with the mouse.
+struct HoverHint {
+    name: SharedString,
+    key: Option<SharedString>,
+}
+
+impl Render for HoverHint {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = cx.kairn().clone();
+        div()
+            .m(px(8.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .px(px(11.))
+            .py(px(5.))
+            .rounded(px(7.))
+            .bg(t.panel2)
+            .border_1()
+            .border_color(t.border)
+            .shadow_md()
+            .text_size(t.ui_px(12.))
+            .text_color(t.text)
+            .child(self.name.clone())
+            .when_some(self.key.clone(), |d, key| {
+                d.child(
+                    div()
+                        .font_family(t.mono_font.clone())
+                        .text_size(t.ui_px(10.5))
+                        .text_color(t.faint)
+                        .child(key),
+                )
+            })
+    }
+}
+
+/// Tooltip builder for [`gpui::StatefulInteractiveElement::tooltip`]: a
+/// [`HoverHint`] with the given name and optional chord label.
+pub(crate) fn hover_hint(
+    name: impl Into<SharedString>,
+    key: Option<String>,
+) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    let name = name.into();
+    let key: Option<SharedString> = key.map(SharedString::from);
+    move |_, cx| {
+        cx.new(|_| HoverHint { name: name.clone(), key: key.clone() })
+            .into()
+    }
 }
 
 /// A larger, full-contrast key chip for the settings keybinds list, where the
-/// binding is the content and must be easy to read at a glance. The subtle
-/// [`kbd`] chip is for inline hints in the chrome, not for reading off.
+/// binding is the content and must be easy to read at a glance.
 pub fn kbd_key(t: &KairnTheme, label: impl Into<SharedString>) -> gpui::Div {
     div()
         .font_family(t.mono_font.clone())

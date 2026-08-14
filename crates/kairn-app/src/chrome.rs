@@ -1,38 +1,22 @@
 //! Window chrome: the custom titlebar and the statusbar.
 
 use gpui::{
-    App, Context, Hsla, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder as _, px,
+    App, Context, Hsla, InteractiveElement, IntoElement, ParentElement, PathBuilder,
+    StatefulInteractiveElement, Styled, div, point, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{TitleBar, h_flex};
 
-use crate::keymap::{ToggleSidebar, ToggleSwitcher, chord};
+use crate::keymap::{ToggleSidebar, ToggleSwitcher, chord, chord_alt};
 use crate::theme::KairnTheme;
-use crate::ui::kbd;
+use crate::ui::hover_hint;
 use crate::workspace::{LayoutMode, Workspace};
+
+/// Inner height of the search-and-layout capsule; every control in it sits
+/// inside this one frame so nothing can render at its own height.
+const CAPSULE_H: f32 = 28.;
 
 impl Workspace {
     pub(crate) fn render_titlebar(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {
-        let jump_hint = h_flex()
-            .id("jump-hint")
-            .w(px(280.))
-            .px(px(10.))
-            .py(px(3.))
-            .gap(px(6.))
-            .rounded(px(7.))
-            .border_1()
-            .border_color(t.border)
-            .bg(t.bg)
-            .text_size(t.ui_px(12.))
-            .text_color(t.faint)
-            .cursor_pointer()
-            .hover(|s| s.border_color(t.faint))
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.on_toggle_switcher(&ToggleSwitcher, window, cx);
-            }))
-            .child(div().flex_1().child("Jump to session, day, or note"))
-            .child(kbd(t, chord("J")));
-
         let hover_bg = t.hover;
         let sidebar_btn = div()
             .id("sidebar-btn")
@@ -46,71 +30,85 @@ impl Workspace {
             .text_color(t.dim)
             .cursor_pointer()
             .hover(move |s| s.bg(hover_bg))
+            .tooltip(hover_hint("Sidebar", Some(chord("\\"))))
             .child("◧")
             .on_click(cx.listener(|this, _, window, cx| {
                 this.on_toggle_sidebar(&ToggleSidebar, window, cx);
             }));
 
-        // The layout switch: Notes | Split | Term. One click sets the layout,
-        // the active state stays lit. Notes-first, so Split is the resting
-        // state; Term hands the whole main area to the terminal.
-        let layout_seg = h_flex()
-            .gap(px(3.))
-            .p(px(2.))
-            .rounded(px(7.))
-            .bg(t.bg)
+        // Search and the layout switcher as one capsule: the left half opens
+        // the ⌘J overlay (a full search: note titles and bodies, days,
+        // sessions, library), the right half is all four layouts. The chord
+        // hints live in the hover tooltips, not in the chrome.
+        let search = div()
+            .id("jump-hint")
+            .flex()
+            .items_center()
+            .w(px(252.))
+            .h_full()
+            .px(px(12.))
+            .rounded_l(px(7.))
+            .text_size(t.ui_px(12.))
+            .text_color(t.faint)
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover_bg))
+            .tooltip(hover_hint("Search & jump", Some(chord("J"))))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.on_toggle_switcher(&ToggleSwitcher, window, cx);
+            }))
+            .child("Search notes, days, sessions");
+
+        let capsule = h_flex()
+            .h(px(CAPSULE_H))
+            .rounded(px(8.))
             .border_1()
             .border_color(t.border)
-            .child(self.layout_seg_button(
-                t,
-                "seg-notes",
-                self.layout == LayoutMode::NotesFull,
-                LayoutMode::NotesFull,
-                cx,
-            ))
-            .child(self.layout_seg_button(
-                t,
-                "seg-split",
-                self.layout == LayoutMode::Split,
-                LayoutMode::Split,
-                cx,
-            ))
-            .child(self.layout_seg_button(
-                t,
-                "seg-term",
-                self.layout == LayoutMode::TerminalFull,
-                LayoutMode::TerminalFull,
-                cx,
-            ));
+            .bg(t.bg)
+            .overflow_hidden()
+            .child(search)
+            .child(div().w(px(1.)).h_full().flex_none().bg(t.border))
+            .child(
+                h_flex()
+                    .h_full()
+                    .items_center()
+                    .gap(px(2.))
+                    .px(px(3.))
+                    .child(self.layout_mode_button(t, "mode-notes", LayoutMode::NotesFull, cx))
+                    .child(self.layout_mode_button(t, "mode-split", LayoutMode::Split, cx))
+                    .child(self.layout_mode_button(t, "mode-term", LayoutMode::TerminalFull, cx))
+                    .child(self.layout_mode_button(t, "mode-writing", LayoutMode::Writing, cx)),
+            );
 
         TitleBar::new()
             .child(h_flex().h_full().items_center().child(sidebar_btn))
-            .child(
-                h_flex()
-                    .gap(px(8.))
-                    .pr(px(8.))
-                    .child(jump_hint)
-                    .child(layout_seg),
-            )
+            .child(h_flex().pr(px(8.)).child(capsule))
     }
 
-    /// One cell of the layout segment: its glyph (drawn, so it renders the
-    /// same on every platform), lit when its layout is active.
-    fn layout_seg_button(
+    /// One cell of the layout switcher: its glyph (drawn, so every cell keeps
+    /// the same box on every platform and UI scale), lit when its layout is
+    /// active, named in its tooltip with the layout's chord.
+    fn layout_mode_button(
         &self,
         t: &KairnTheme,
         id: &'static str,
-        active: bool,
         mode: LayoutMode,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let active = self.layout == mode;
         let hover_bg = t.hover;
         let sel = t.sel;
         let color = if active { t.accent } else { t.dim };
+        let (name, key) = match mode {
+            LayoutMode::NotesFull => ("Notes", chord_alt("1")),
+            LayoutMode::Split => ("Notes + Terminal", chord_alt("2")),
+            LayoutMode::TerminalFull => ("Terminal", chord_alt("3")),
+            LayoutMode::Writing => ("Writing", chord_alt("4")),
+        };
         let glyph = match mode {
             LayoutMode::NotesFull => seg_icon_notes(color).into_any_element(),
-            LayoutMode::TerminalFull => seg_icon_term(t, color).into_any_element(),
-            _ => seg_icon_split(color).into_any_element(),
+            LayoutMode::Split => seg_icon_split(color).into_any_element(),
+            LayoutMode::TerminalFull => seg_icon_term(color).into_any_element(),
+            LayoutMode::Writing => seg_icon_writing(color).into_any_element(),
         };
         div()
             .id(id)
@@ -118,11 +116,12 @@ impl Workspace {
             .items_center()
             .justify_center()
             .w(px(30.))
-            .py(px(4.))
+            .h(px(22.))
             .rounded(px(5.))
             .cursor_pointer()
             .when(active, |d| d.bg(sel))
             .when(!active, |d| d.hover(move |s| s.bg(hover_bg)))
+            .tooltip(hover_hint(name, Some(key)))
             .child(glyph)
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.set_layout(mode, window, cx);
@@ -194,11 +193,44 @@ fn seg_icon_split(color: Hsla) -> impl IntoElement {
         .child(div().w(px(1.)).h_full().bg(color))
 }
 
-/// Terminal-full glyph: the `>_` prompt, the app's established terminal mark.
-fn seg_icon_term(t: &KairnTheme, color: Hsla) -> impl IntoElement {
+/// Terminal-full glyph: the `>_` prompt drawn as strokes, so its cell keeps
+/// the same box as the other drawn glyphs (as text it carried a full line
+/// box that made this cell taller than its neighbours).
+fn seg_icon_term(color: Hsla) -> impl IntoElement {
+    gpui::canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            let o = bounds.origin;
+            let mut chevron = PathBuilder::stroke(px(1.3));
+            chevron.move_to(point(o.x + px(1.4), o.y + px(1.6)));
+            chevron.line_to(point(o.x + px(5.2), o.y + px(5.5)));
+            chevron.line_to(point(o.x + px(1.4), o.y + px(9.4)));
+            if let Ok(path) = chevron.build() {
+                window.paint_path(path, color);
+            }
+            let mut underscore = PathBuilder::stroke(px(1.3));
+            underscore.move_to(point(o.x + px(7.6), o.y + px(9.4)));
+            underscore.line_to(point(o.x + px(12.6), o.y + px(9.4)));
+            if let Ok(path) = underscore.build() {
+                window.paint_path(path, color);
+            }
+        },
+    )
+    .w(px(14.))
+    .h(px(11.))
+}
+
+/// Writing glyph: ragged text lines with no frame, the chrome stripped away.
+fn seg_icon_writing(color: Hsla) -> impl IntoElement {
     div()
-        .font_family(t.mono_font.clone())
-        .text_size(t.ui_px(11.))
-        .text_color(color)
-        .child(">_")
+        .w(px(13.))
+        .h(px(11.))
+        .flex()
+        .flex_col()
+        .justify_between()
+        .py(px(0.5))
+        .child(div().h(px(1.)).w_full().bg(color))
+        .child(div().h(px(1.)).w_full().bg(color))
+        .child(div().h(px(1.)).w(px(8.)).bg(color))
+        .child(div().h(px(1.)).w(px(10.)).bg(color))
 }

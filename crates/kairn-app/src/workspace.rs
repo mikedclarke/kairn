@@ -733,6 +733,18 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_toggle_terminal_full))
             .on_action(cx.listener(Self::on_toggle_writing))
+            .on_action(cx.listener(|this, _: &LayoutNotes, w, cx| {
+                this.set_layout(LayoutMode::NotesFull, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &LayoutSplit, w, cx| {
+                this.set_layout(LayoutMode::Split, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &LayoutTerminal, w, cx| {
+                this.set_layout(LayoutMode::TerminalFull, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &LayoutWriting, w, cx| {
+                this.set_layout(LayoutMode::Writing, w, cx)
+            }))
             .on_action(cx.listener(Self::on_toggle_switcher))
             .on_action(cx.listener(Self::on_close_overlay))
             .on_action(cx.listener(Self::on_toggle_theme))

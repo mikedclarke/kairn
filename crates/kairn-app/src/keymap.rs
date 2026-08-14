@@ -8,6 +8,10 @@ actions!(
         ToggleSidebar,
         ToggleTerminalFull,
         ToggleWriting,
+        LayoutNotes,
+        LayoutSplit,
+        LayoutTerminal,
+        LayoutWriting,
         ToggleSwitcher,
         CloseOverlay,
         ToggleThemeMode,
@@ -79,6 +83,16 @@ pub fn init(cx: &mut App) {
             format!("ctrl-{k}")
         }
     };
+    // Primary+Alt chords (labelled by `chord_alt`): Cmd+Option on macOS,
+    // Ctrl+Alt on Linux, where they are free on both the shell and the
+    // desktop for digits.
+    let pa = |k: &str| {
+        if cfg!(target_os = "macos") {
+            format!("cmd-alt-{k}")
+        } else {
+            format!("ctrl-alt-{k}")
+        }
+    };
     cx.bind_keys([
         // gpui-component's Root binds tab/shift-tab to focus cycling, which
         // consumes them before a focused terminal can forward them to the
@@ -90,6 +104,13 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(&p("\\"), ToggleSidebar, None),
         KeyBinding::new(&p("shift-enter"), ToggleTerminalFull, None),
         KeyBinding::new(&p("alt-enter"), ToggleWriting, None),
+        // Direct layout chords, numbered in the titlebar switcher's
+        // left-to-right order. Alt+digit so they can't collide with the
+        // plain-digit session chords on either platform.
+        KeyBinding::new(&pa("1"), LayoutNotes, None),
+        KeyBinding::new(&pa("2"), LayoutSplit, None),
+        KeyBinding::new(&pa("3"), LayoutTerminal, None),
+        KeyBinding::new(&pa("4"), LayoutWriting, None),
         KeyBinding::new(&p("j"), ToggleSwitcher, None),
         KeyBinding::new(&p(","), OpenSettings, None),
         KeyBinding::new(&p("shift-k"), Capture, None),
@@ -189,6 +210,10 @@ pub fn keybind_list() -> Vec<(&'static str, Vec<(String, &'static str)>)> {
         (
             "Layout",
             vec![
+                (chord_alt("1"), "Notes layout"),
+                (chord_alt("2"), "Notes + terminal layout"),
+                (chord_alt("3"), "Terminal layout"),
+                (chord_alt("4"), "Writing layout"),
                 (chord_shift("⏎"), "Full-screen terminal on/off"),
                 (chord_alt("⏎"), "Writing mode on/off"),
             ],
