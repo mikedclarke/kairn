@@ -10,7 +10,7 @@ use crate::theme::KairnTheme;
 use crate::workspace::{PaneView, TaskQuery, Workspace, chord};
 
 /// The file manager by its platform name, for context-menu labels.
-const REVEAL_LABEL: &str = if cfg!(target_os = "macos") {
+pub(crate) const REVEAL_LABEL: &str = if cfg!(target_os = "macos") {
     "Reveal in Finder"
 } else {
     "Show in file manager"
@@ -37,6 +37,15 @@ impl Workspace {
             .flex_1()
             .min_h(px(0.))
             .overflow_y_scroll()
+            .track_scroll(&self.sidebar_scroll)
+            .on_scroll_wheel(cx.listener(|this, ev: &gpui::ScrollWheelEvent, _, cx| {
+                // Touchpad flicks only: wheel notches (Lines) are discrete
+                // by design, and macOS delivers real momentum events, so
+                // synthesizing there would double-scroll.
+                if cfg!(target_os = "linux") && ev.delta.precise() {
+                    this.sidebar_flick(f32::from(ev.delta.pixel_delta(px(20.)).y), cx);
+                }
+            }))
             .child(
                 gpui::canvas(
                     move |bounds, _, _| {
@@ -48,6 +57,54 @@ impl Workspace {
                 .size_full(),
             )
             .child(self.render_calendar(t, drop_day, cx));
+
+        // Sync conflicts anywhere in the vault: without this list, a
+        // conflict copy of a note that isn't open stays invisible forever.
+        // A rare blocking state, so the section only exists while conflicts
+        // do; each row jumps to the note, whose banner offers resolution.
+        if !self.vault_conflicts.is_empty() {
+            let mut owners: Vec<(std::path::PathBuf, usize)> = Vec::new();
+            for (owner, _) in &self.vault_conflicts {
+                match owners.last_mut() {
+                    Some((o, n)) if o == owner => *n += 1,
+                    _ => owners.push((owner.clone(), 1)),
+                }
+            }
+            let collapsed = self.section_collapsed("Conflicts");
+            side = side.child(
+                sechead(
+                    t,
+                    "sec-conflicts",
+                    "Sync conflicts",
+                    Some(owners.len().to_string()),
+                    collapsed,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_section("Conflicts", cx))),
+            );
+            if !collapsed {
+                for (i, (owner, copies)) in owners.into_iter().enumerate() {
+                    let stem = owner
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let label: SharedString = match NaiveDate::parse_from_str(&stem, "%Y%m%d") {
+                        Ok(date) => day_label(date),
+                        Err(_) => stem.into(),
+                    };
+                    let row = nav_item(t, ("conflict-row", i))
+                        .cursor_pointer()
+                        .child(div().w(px(7.)).h(px(7.)).flex_none().rounded_full().bg(t.amber))
+                        .child(div().flex_1().child(label))
+                        .when(copies > 1, |d| {
+                            d.child(count_label(t, &copies.to_string(), true))
+                        });
+                    side = side.child(row.on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_conflict_owner(&owner, cx);
+                    })));
+                }
+            }
+        }
 
         // Daily: today plus the next (or previous, per settings) two days.
         // The bounds store clears before the visibility checks so a hidden
@@ -178,13 +235,13 @@ impl Workspace {
                     row = row
                         .child(
                             div()
-                                .w(px(11.))
+                                .w(t.ui_px(14.))
                                 .flex_none()
-                                .text_size(t.ui_px(11.))
+                                .text_size(t.ui_px(14.))
                                 .text_color(t.dim)
                                 .child(if open { "▾" } else { "▸" }),
                         )
-                        .child(folder_icon(t))
+                        .child(folder_icon(t, open))
                         .child(div().flex_1().child(entry.name.clone()))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.toggle_notes_folder(path.clone(), cx);
@@ -207,7 +264,7 @@ impl Workspace {
                     let selected = self.view == PaneView::Note(entry.path.clone());
                     row = row
                         .when(selected, |d| d.bg(t.sel).text_color(t.text))
-                        .child(div().w(px(11.)).flex_none())
+                        .child(div().w(t.ui_px(14.)).flex_none())
                         .child(note_icon(t))
                         .child(
                             div()
@@ -242,6 +299,180 @@ impl Workspace {
                             cx.reveal_path(&reveal);
                         }))
                     }));
+                }
+            }
+        }
+
+        // Library: external local folders (per-machine), browsable read/write
+        // but never parsed into tasks or links. The + adds a folder via the
+        // native picker; each root can be removed from its context menu.
+        let collapsed = self.section_collapsed("Library");
+        side = side.child(
+            sechead(t, "sec-library", "Library", None, collapsed)
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_section("Library", cx)))
+                .child(sechead_plus(t, "library-plus").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.pick_library_root(cx);
+                    }),
+                )),
+        );
+        if !collapsed {
+            if self.library_trees.is_empty() {
+                side = side.child(
+                    nav_item(t, "library-empty")
+                        .text_color(t.faint)
+                        .child("No folders yet — add one with +"),
+                );
+            }
+            for (ri, (root, rows)) in self.library_trees.iter().enumerate() {
+                let root_name = root
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let open = self.library_expanded.contains(root);
+                let toggle = root.clone();
+                let menu_root = root.clone();
+                let ws = cx.weak_entity();
+                side = side.child(
+                    nav_item(t, ("lib-root", ri))
+                        .py(px(3.))
+                        .gap(px(6.))
+                        .child(
+                            div()
+                                .w(t.ui_px(14.))
+                                .flex_none()
+                                .text_size(t.ui_px(14.))
+                                .text_color(t.dim)
+                                .child(if open { "▾" } else { "▸" }),
+                        )
+                        .child(folder_icon(t, open))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(root_name),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_library_folder(toggle.clone(), cx);
+                        }))
+                        .context_menu(move |menu, _, _| {
+                            let reveal = menu_root.clone();
+                            let copy = menu_root.clone();
+                            let remove = menu_root.clone();
+                            let ws = ws.clone();
+                            menu.item(PopupMenuItem::new(REVEAL_LABEL).on_click(
+                                move |_, _, cx| {
+                                    cx.reveal_path(&reveal);
+                                },
+                            ))
+                            .item(PopupMenuItem::new("Copy path").on_click(
+                                move |_, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        copy.display().to_string(),
+                                    ));
+                                },
+                            ))
+                            .separator()
+                            .item(PopupMenuItem::new("Remove from Library").on_click(
+                                move |_, _, cx| {
+                                    let _ = ws.update(cx, |this, cx| {
+                                        this.remove_library_root(&remove, cx);
+                                    });
+                                },
+                            ))
+                        }),
+                );
+                for (i, entry) in rows.iter().enumerate() {
+                    let path = entry.path.clone();
+                    let indent = px(14. + (entry.depth + 1) as f32 * 12.);
+                    let row = nav_item(t, ("lib-row", ri * 4096 + i))
+                        .pl(indent)
+                        .py(px(3.))
+                        .gap(px(6.));
+                    let menu_path = entry.path.clone();
+                    if entry.is_dir {
+                        let open = self.library_expanded.contains(&entry.path);
+                        side = side.child(
+                            row.child(
+                                div()
+                                    .w(t.ui_px(14.))
+                                    .flex_none()
+                                    .text_size(t.ui_px(14.))
+                                    .text_color(t.dim)
+                                    .child(if open { "▾" } else { "▸" }),
+                            )
+                            .child(folder_icon(t, open))
+                            .child(div().flex_1().child(entry.name.clone()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_library_folder(path.clone(), cx);
+                            }))
+                            .context_menu(move |menu, _, _| {
+                                let reveal = menu_path.clone();
+                                let copy = menu_path.clone();
+                                menu.item(PopupMenuItem::new(REVEAL_LABEL).on_click(
+                                    move |_, _, cx| {
+                                        cx.reveal_path(&reveal);
+                                    },
+                                ))
+                                .item(PopupMenuItem::new("Copy path").on_click(
+                                    move |_, _, cx| {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                            copy.display().to_string(),
+                                        ));
+                                    },
+                                ))
+                            }),
+                        );
+                    } else {
+                        let selected = self.view == PaneView::Library(entry.path.clone());
+                        side = side.child(
+                            row.when(selected, |d| d.bg(t.sel).text_color(t.text))
+                                .child(div().w(t.ui_px(14.)).flex_none())
+                                .child(file_icon(t, &entry.path))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .child(entry.name.clone()),
+                                )
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_library_file(path.clone(), window, cx);
+                                }))
+                                .context_menu(move |menu, _, _| {
+                                    let open_with = menu_path.clone();
+                                    let reveal = menu_path.clone();
+                                    let copy = menu_path.clone();
+                                    menu.item(
+                                        PopupMenuItem::new("Open in default app").on_click(
+                                            move |_, _, cx| {
+                                                cx.open_with_system(&open_with);
+                                            },
+                                        ),
+                                    )
+                                    .item(PopupMenuItem::new(REVEAL_LABEL).on_click(
+                                        move |_, _, cx| {
+                                            cx.reveal_path(&reveal);
+                                        },
+                                    ))
+                                    .item(PopupMenuItem::new("Copy path").on_click(
+                                        move |_, _, cx| {
+                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                                copy.display().to_string(),
+                                            ));
+                                        },
+                                    ))
+                                }),
+                        );
+                    }
                 }
             }
         }
@@ -403,6 +634,10 @@ impl Workspace {
             }
         }
 
+        // The floating settings gear overlays the sidebar's bottom-left
+        // corner; a tail spacer lets the last rows scroll clear of it.
+        side = side.child(div().h(px(48.)).flex_none());
+
         div()
             .w(px(272.))
             .flex_none()
@@ -414,6 +649,69 @@ impl Workspace {
             .border_color(t.border)
             .text_size(t.ui_px(12.5))
             .child(side)
+    }
+
+    /// Synthesized momentum for touchpad flicks in the sidebar. Wayland
+    /// delivers finger scrolls as bare pixel deltas with no lift or
+    /// momentum phase, so the scroll dies the instant the finger leaves
+    /// the pad. Velocity is tracked while events stream in; a short
+    /// watchdog fires once they stop, and if the finger left with speed
+    /// the offset keeps moving with exponential decay until it runs out,
+    /// hits an edge, or fresh input lands (each event re-arms the task,
+    /// and assigning it drops — cancels — the old one).
+    pub(crate) fn sidebar_flick(&mut self, dy: f32, cx: &mut Context<Self>) {
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        self.sidebar_flick_samples.push_back((now, dy));
+        while self
+            .sidebar_flick_samples
+            .front()
+            .is_some_and(|(t, _)| now.duration_since(*t) > Duration::from_millis(100))
+        {
+            self.sidebar_flick_samples.pop_front();
+        }
+        self._sidebar_kinetic_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(60)).await;
+            let Ok(mut velocity) = this.update(cx, |ws, _| {
+                let now = Instant::now();
+                let mut sum = 0.0f32;
+                let mut oldest = now;
+                for (t, dy) in &ws.sidebar_flick_samples {
+                    sum += dy;
+                    if *t < oldest {
+                        oldest = *t;
+                    }
+                }
+                ws.sidebar_flick_samples.clear();
+                // The watchdog delay is part of the span: velocity at lift
+                // is what the finger left behind, in px/s.
+                sum / now.duration_since(oldest).as_secs_f32().max(0.06)
+            }) else {
+                return;
+            };
+            if velocity.abs() < 200. {
+                return;
+            }
+            velocity = velocity.clamp(-8000., 8000.);
+            loop {
+                cx.background_executor().timer(Duration::from_millis(16)).await;
+                velocity *= 0.95;
+                let moved = this.update(cx, |ws, cx| {
+                    let max = ws.sidebar_scroll.max_offset().height;
+                    let before = ws.sidebar_scroll.offset();
+                    let mut offset = before;
+                    offset.y = (offset.y + px(velocity * 0.016)).clamp(-max, px(0.));
+                    ws.sidebar_scroll.set_offset(offset);
+                    cx.notify();
+                    offset.y != before.y
+                });
+                match moved {
+                    Ok(true) if velocity.abs() >= 30. => {}
+                    _ => break,
+                }
+            }
+        }));
     }
 
     fn render_calendar(
@@ -630,13 +928,13 @@ fn sechead(
         .px(px(14.))
         .pt(px(16.))
         .pb(px(6.))
-        .text_size(t.ui_px(10.5))
+        .text_size(t.ui_px(12.))
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .text_color(t.faint)
         .cursor_pointer()
         .hover(move |s| s.text_color(hover_text))
         .child(label.to_uppercase())
-        .child(div().text_size(t.ui_px(11.)).child(if collapsed { "▸" } else { "▾" }))
+        .child(div().text_size(t.ui_px(13.)).child(if collapsed { "▸" } else { "▾" }))
         .child(div().flex_1());
     if let Some(count) = count {
         head = head.child(div().child(count));
@@ -653,49 +951,63 @@ fn sechead_plus(t: &KairnTheme, id: &'static str) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .flex_none()
-        .w(px(18.))
-        .h(px(18.))
+        .w(px(20.))
+        .h(px(20.))
         .flex()
         .items_center()
         .justify_center()
         .rounded(px(4.))
-        .text_size(t.ui_px(14.))
+        .text_size(t.ui_px(17.))
         .text_color(t.faint)
         .cursor_pointer()
         .hover(move |s| s.bg(hover_bg).text_color(hover_text))
         .child("+")
 }
 
-/// A tiny folder mark for the Notes browser, drawn with quads so no asset
-/// or glyph font is needed.
-fn folder_icon(t: &KairnTheme) -> impl IntoElement {
-    div()
+/// A sidebar icon from the app's embedded SVG set (see `KairnAssets`),
+/// scaled with the interface size and tinted per call.
+fn svg_icon(t: &KairnTheme, path: &'static str, color: gpui::Hsla) -> gpui::AnyElement {
+    gpui::svg()
+        .path(path)
         .flex_none()
-        .w(px(12.))
-        .h(px(10.))
-        .flex()
-        .flex_col()
-        .child(div().w(px(5.)).h(px(2.)).rounded(px(1.)).bg(t.faint.opacity(0.8)))
-        .child(div().w(px(12.)).h(px(8.)).rounded(px(2.)).bg(t.faint.opacity(0.55)))
+        .w(t.ui_px(13.))
+        .h(t.ui_px(13.))
+        .text_color(color)
+        .into_any_element()
 }
 
-/// A tiny document mark for the Notes browser: a bordered page with two
-/// text lines.
-fn note_icon(t: &KairnTheme) -> impl IntoElement {
-    div()
-        .flex_none()
-        .w(px(10.))
-        .h(px(12.))
-        .rounded(px(2.))
-        .border_1()
-        .border_color(t.faint)
-        .flex()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        .gap(px(1.5))
-        .child(div().w(px(5.)).h(px(1.)).bg(t.faint))
-        .child(div().w(px(5.)).h(px(1.)).bg(t.faint))
+/// The folder mark for the Notes and Library trees; open folders get the
+/// open-flap variant so expansion reads from the icon, not just the chevron.
+fn folder_icon(t: &KairnTheme, open: bool) -> gpui::AnyElement {
+    let path = if open { "kairn-icons/folder-open.svg" } else { "kairn-icons/folder.svg" };
+    svg_icon(t, path, t.faint)
+}
+
+/// The document mark for Notes rows (always markdown).
+fn note_icon(t: &KairnTheme) -> gpui::AnyElement {
+    svg_icon(t, "kairn-icons/file-text.svg", t.faint)
+}
+
+/// A per-kind file mark for Library rows, shaped and tinted so kinds read
+/// at a glance even when long names ellipsize before their extension:
+/// text page for markdown, code page for text/code, photo page for
+/// images, a red page for PDFs, and a blank page for everything else.
+fn file_icon(t: &KairnTheme, path: &std::path::Path) -> gpui::AnyElement {
+    use kairn_core::FileKind;
+
+    let is_pdf = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
+    if is_pdf {
+        return svg_icon(t, "kairn-icons/file.svg", t.red.opacity(0.8));
+    }
+    match kairn_core::file_kind(path) {
+        FileKind::Markdown => svg_icon(t, "kairn-icons/file-text.svg", t.faint),
+        FileKind::Text => svg_icon(t, "kairn-icons/file-code.svg", t.accent.opacity(0.9)),
+        FileKind::Image => svg_icon(t, "kairn-icons/file-image.svg", t.amber.opacity(0.9)),
+        FileKind::Other => svg_icon(t, "kairn-icons/file.svg", t.faint),
+    }
 }
 
 fn count_label(t: &KairnTheme, label: &str, hot: bool) -> impl IntoElement {

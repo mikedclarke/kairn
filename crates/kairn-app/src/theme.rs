@@ -299,6 +299,24 @@ pub fn apply(settings: &Settings, notes_root: &Path, window: Option<&mut Window>
     if let Some(f) = &settings.mono_font {
         t.mono_font = f.clone().into();
     }
+    // Styles must never carry a family the platform can't load: gpui's
+    // resolve_font formats an error per missing family on every text run,
+    // every frame, and on Linux the fallback walk pays that several times
+    // over before landing (GDL-710). Unset UI resolves here too — the old
+    // .SystemUIFont default only exists on macOS.
+    t.ui_font = Some(
+        t.ui_font
+            .take()
+            .filter(|f| loads_as_itself(f, cx))
+            .unwrap_or_else(|| auto_ui().into()),
+    );
+    if let Some(f) = t.editor_font.take() {
+        t.editor_font =
+            Some(if loads_as_itself(&f, cx) { f } else { auto_ui().into() });
+    }
+    if !loads_as_itself(&t.mono_font, cx) {
+        t.mono_font = auto_mono().into();
+    }
     if let Some(s) = settings.editor_font_size {
         t.editor_size = s.clamp(9., 32.);
     }
@@ -319,7 +337,7 @@ pub fn apply(settings: &Settings, notes_root: &Path, window: Option<&mut Window>
     theme.font_family = t
         .ui_font
         .clone()
-        .unwrap_or_else(|| ".SystemUIFont".into());
+        .unwrap_or_else(|| auto_ui().into());
     theme.mono_font_family = t.mono_font.clone();
     let colors = &mut theme.colors;
     colors.background = t.panel2;
@@ -358,11 +376,24 @@ pub fn apply(settings: &Settings, notes_root: &Path, window: Option<&mut Window>
 }
 
 static MONO_FONT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static UI_FONT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// Resolve the fallback mono font against the families actually installed,
-/// once at startup. Asking for a family that isn't there makes gpui fall
-/// back per glyph with mismatched advance widths — on Linux the terminal
-/// renders with broken letter spacing rather than failing loudly.
+/// Whether `family` loads as itself rather than through gpui's fallback
+/// stack. The round-trip matters: `resolve_font` never fails, so the only
+/// tell is whether the id it returns maps back to the family asked for.
+fn loads_as_itself(family: &str, cx: &App) -> bool {
+    let ts = cx.text_system();
+    let id = ts.resolve_font(&gpui::font(family.to_string()));
+    ts.get_font_for_id(id).is_some_and(|f| f.family.as_ref() == family)
+}
+
+/// Resolve the fallback mono and UI fonts against the families actually
+/// installed, once at startup. Asking for a family that isn't there has
+/// two costs: gpui falls back per glyph with mismatched advance widths
+/// (on Linux the terminal renders with broken letter spacing rather than
+/// failing loudly), and every text run pays a formatted-error fallback
+/// walk in `resolve_font` on every frame (found pegging the ThinkPad,
+/// GDL-710).
 pub fn resolve_fonts(cx: &App) {
     let installed: std::collections::HashSet<String> =
         cx.text_system().all_font_names().into_iter().collect();
@@ -396,11 +427,37 @@ pub fn resolve_fonts(cx: &App) {
         "monospace",
     );
     let _ = MONO_FONT.set(mono);
+    // The UI candidates are probed by actual resolution, not the installed
+    // list: gpui appends its own fallback-stack names (and .SystemUIFont)
+    // to `all_font_names` whether or not they exist, so membership there
+    // proves nothing. .SystemUIFont only genuinely loads on macOS.
+    let ui = [
+        ".SystemUIFont",
+        "Noto Sans",
+        "Adwaita Sans",
+        "Cantarell",
+        "Ubuntu",
+        "DejaVu Sans",
+        "Liberation Sans",
+        "Arial",
+        "Helvetica",
+    ]
+    .iter()
+    .find(|f| loads_as_itself(f, cx))
+    .copied()
+    .unwrap_or("Noto Sans");
+    let _ = UI_FONT.set(ui.to_string());
 }
 
 /// The auto-resolved mono family: what themes and settings fall back to.
 pub fn auto_mono() -> &'static str {
     MONO_FONT.get().map(String::as_str).unwrap_or("monospace")
+}
+
+/// The auto-resolved UI family: the system font on macOS, the best
+/// installed sans elsewhere.
+pub fn auto_ui() -> &'static str {
+    UI_FONT.get().map(String::as_str).unwrap_or("Noto Sans")
 }
 
 /// Terminal colors: the sage-tinted ANSI ramp with any theme-file

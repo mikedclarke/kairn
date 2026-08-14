@@ -66,6 +66,44 @@ fn is_recent_self_write(self_writes: &SelfWrites, path: &Path) -> bool {
     when.elapsed() < Duration::from_secs(2) && file_hash(path) == Some(*hash)
 }
 
+/// Whether a vault watcher event can change what the UI shows. Access
+/// events (reads) never can — and on Linux, inotify reports the reload's
+/// own file reads and directory walks back as Access events, so reacting
+/// to them makes every reload schedule the next one, a self-sustaining
+/// loop that pegs a core. macOS never surfaces reads, which is why only
+/// Linux showed it.
+fn notes_event_relevant(event: &notify::Event, self_writes: &SelfWrites) -> bool {
+    if matches!(event.kind, notify::EventKind::Access(_)) {
+        return false;
+    }
+    event.paths.is_empty()
+        || event.paths.iter().any(|p| {
+            // The activity log is the one `.kairn/` file the UI
+            // shows live: CLI writes must surface without a restart.
+            let watched_in_kairn = p.file_name().is_some_and(|n| n == "activity.jsonl");
+            (watched_in_kairn || !p.components().any(|c| c.as_os_str() == ".kairn"))
+                && !p
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().contains(".kairn-tmp"))
+                && !is_recent_self_write(self_writes, p)
+        })
+}
+
+/// Library counterpart of `notes_event_relevant`: the same Access guard,
+/// with events under ignored subtrees (VCS, builds, dotfiles) dropped at
+/// the source — a `.git` churn in a big root must not cost reloads.
+fn library_event_relevant(event: &notify::Event, self_writes: &SelfWrites) -> bool {
+    if matches!(event.kind, notify::EventKind::Access(_)) {
+        return false;
+    }
+    event.paths.is_empty()
+        || event.paths.iter().any(|p| {
+            !p.components().any(|c| {
+                c.as_os_str().to_str().is_some_and(notes::library_ignored_name)
+            }) && !is_recent_self_write(self_writes, p)
+        })
+}
+
 impl Workspace {
     /// Record a write this instance just made, so the watcher event it
     /// triggers doesn't cost a second full reload.
@@ -125,6 +163,7 @@ impl Workspace {
     /// title. A no-op when the editor is clean or absent.
     pub(crate) fn flush_note_editor(&mut self, cx: &mut Context<Self>) {
         self.save_note_editor(cx);
+        self.save_library_text(cx);
         if let Some(path) = self.note_editor.as_ref().map(|e| e.read(cx).path.clone()) {
             self.rename_note_to_title(path, cx);
         }
@@ -479,6 +518,259 @@ impl Workspace {
         cx.notify();
     }
 
+    // ----- library folders -----
+
+    /// Open a library file in the pane. Every kind funnels through the same
+    /// view; the pane renders it by kind (markdown editor, plain-text
+    /// editor, inline image, or a metadata card with open/reveal actions).
+    pub fn open_library_file(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.flush_note_editor(cx);
+        self.view = PaneView::Library(path.clone());
+        self.show_note_pane();
+        // Text files get their editor here, where a Window exists to build
+        // the input; the reload below sees the matching path and keeps it.
+        if notes::file_kind(&path) == notes::FileKind::Text {
+            self.open_library_text_editor(path, window, cx);
+        }
+        self.reload_notes(cx);
+        cx.notify();
+    }
+
+    /// Build (or keep) the plain-text editor for a library text file. An
+    /// unreadable file (permissions, not UTF-8 despite its extension) gets
+    /// no editor and falls back to the metadata card.
+    fn open_library_text_editor(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui_component::input::{InputEvent, InputState};
+
+        if self.library_text.as_ref().is_some_and(|ed| ed.path == path) {
+            return;
+        }
+        // Whatever the previous text file still holds gets written first.
+        self.save_library_text(cx);
+        let Ok(disk) = std::fs::read_to_string(&path) else {
+            self.library_text = None;
+            return;
+        };
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .auto_grow(10, 100_000)
+                .default_value(disk.clone())
+        });
+        let sub = cx.subscribe(&input, |this, _, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::Change)
+                && let Some(ed) = &mut this.library_text
+            {
+                // Debounced autosave, one pending write at a time.
+                ed._save = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(600))
+                        .await;
+                    let _ = this.update(cx, |ws, cx| ws.save_library_text(cx));
+                }));
+            }
+        });
+        self.library_text = Some(LibraryTextEditor {
+            path,
+            input,
+            baseline: disk,
+            _sub: sub,
+            _save: None,
+        });
+    }
+
+    /// Write the text editor's buffer if it differs from its baseline.
+    /// Atomic like every other write; the watcher skips it as a self-write.
+    pub(crate) fn save_library_text(&mut self, cx: &mut Context<Self>) {
+        let Some(ed) = &self.library_text else { return };
+        let value = ed.input.read(cx).value().to_string();
+        if value == ed.baseline {
+            return;
+        }
+        let path = ed.path.clone();
+        match notes::write_note(&path, &value) {
+            Ok(()) => {
+                self.note_self_write(&path);
+                if let Some(ed) = &mut self.library_text {
+                    ed.baseline = value;
+                }
+            }
+            Err(e) => eprintln!("kairn: could not save {}: {e}", path.display()),
+        }
+    }
+
+    /// Keep the text editor in step after a reload: drop it (saving first)
+    /// when the view moved elsewhere, and while it is clean, fold in
+    /// external edits so agent writes appear live. A dirty buffer keeps the
+    /// user's text; the next save wins.
+    fn sync_library_text(&mut self, cx: &mut Context<Self>) {
+        let keep = matches!(
+            &self.view,
+            PaneView::Library(p)
+                if self.library_text.as_ref().is_some_and(|ed| &ed.path == p)
+        );
+        if !keep {
+            self.save_library_text(cx);
+            self.library_text = None;
+            return;
+        }
+        let Some(ed) = &self.library_text else { return };
+        let Ok(disk) = std::fs::read_to_string(&ed.path) else { return };
+        let current = ed.input.read(cx).value().to_string();
+        if current != ed.baseline || disk == ed.baseline {
+            return;
+        }
+        // set_value needs a Window; reloads run without one, so the write
+        // into the input defers onto the active window.
+        let input = ed.input.clone();
+        let Some(win) = cx.active_window() else { return };
+        if let Some(ed) = &mut self.library_text {
+            ed.baseline = disk.clone();
+        }
+        cx.defer(move |cx| {
+            let _ = win.update(cx, |_, window, cx| {
+                input.update(cx, |state, cx| state.set_value(disk, window, cx));
+            });
+        });
+    }
+
+    /// Expand or collapse a library root or one of its folders.
+    pub fn toggle_library_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if !self.library_expanded.remove(&path) {
+            self.library_expanded.insert(path);
+        }
+        self.reload_library_trees();
+        cx.notify();
+    }
+
+    /// Rebuild every library root's visible rows. A collapsed root costs
+    /// nothing; expanded ones read only their expanded directories.
+    pub(crate) fn reload_library_trees(&mut self) {
+        let sort = if self.settings.library_sort == "name" {
+            notes::LibrarySort::Name
+        } else {
+            notes::LibrarySort::Modified
+        };
+        self.library_trees = self
+            .settings
+            .library_roots()
+            .into_iter()
+            .map(|root| {
+                let rows = if self.library_expanded.contains(&root) {
+                    notes::library_tree(&root, &self.library_expanded, sort)
+                } else {
+                    Vec::new()
+                };
+                (root, rows)
+            })
+            .collect();
+    }
+
+    /// Refresh only what a library event can touch: the sidebar trees, the
+    /// open library document, and an image view's sibling strip. Vault
+    /// scans stay out — an agent writing busily under a library root must
+    /// not cost a full notes re-parse per burst.
+    pub(crate) fn reload_library(&mut self, cx: &mut Context<Self>) {
+        self.reload_library_trees();
+        let PaneView::Library(path) = &self.view else { return };
+        let path = path.clone();
+        match notes::file_kind(&path) {
+            notes::FileKind::Markdown => {
+                let (disk_text, doc_error) = match std::fs::read_to_string(&path) {
+                    Ok(t) => (Some(t), None),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
+                    Err(e) => (None, Some(e.to_string())),
+                };
+                self.doc_error = doc_error;
+                self.doc_text = disk_text.clone();
+                self.sync_note_editor(disk_text.as_deref(), None, cx);
+            }
+            notes::FileKind::Image => {
+                self.library_siblings =
+                    path.parent().map(notes::library_images).unwrap_or_default();
+            }
+            notes::FileKind::Text | notes::FileKind::Other => {}
+        }
+        self.sync_library_text(cx);
+    }
+
+    /// The sidebar +: pick a directory with the native folder dialog and add
+    /// it as a library root.
+    pub fn pick_library_root(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Add to Library".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(mut paths))) = rx.await
+                && let Some(path) = paths.pop()
+            {
+                let _ = this.update(cx, |ws, cx| ws.add_library_root(path, cx));
+            }
+        })
+        .detach();
+    }
+
+    /// Add a directory as a library root (sidebar +, via the folder picker),
+    /// persisted to this machine's settings. Already-listed roots are not
+    /// duplicated; the new root opens expanded so the add visibly landed.
+    pub fn add_library_root(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let raw = crate::settings_dialog::home_relative(&path);
+        if self.settings.library_roots.iter().any(|r| *r == raw) {
+            return;
+        }
+        self.settings.library_roots.push(raw);
+        if let Err(e) = self.settings.save() {
+            eprintln!("kairn: failed to save settings: {e}");
+        }
+        self.library_expanded.insert(path);
+        self.rearm_library_watchers(cx);
+        self.reload_notes(cx);
+        cx.notify();
+    }
+
+    /// Remove a library root from the sidebar. Only the listing goes; the
+    /// files on disk are untouched. A library file on screen drops back to
+    /// the day view rather than showing a path the sidebar no longer owns.
+    pub fn remove_library_root(&mut self, root: &Path, cx: &mut Context<Self>) {
+        let resolved = self.settings.library_roots();
+        let Some(idx) = resolved.iter().position(|r| r == root) else { return };
+        self.settings.library_roots.remove(idx);
+        if let Err(e) = self.settings.save() {
+            eprintln!("kairn: failed to save settings: {e}");
+        }
+        self.library_expanded.retain(|p| !p.starts_with(root));
+        if matches!(&self.view, PaneView::Library(p) if p.starts_with(root)) {
+            self.flush_note_editor(cx);
+            self.view = PaneView::Day;
+        }
+        self.rearm_library_watchers(cx);
+        self.reload_notes(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn rearm_library_watchers(&mut self, cx: &mut Context<Self>) {
+        let (watchers, task) = Self::watch_library(
+            self.settings.library_roots(),
+            self.self_writes.clone(),
+            cx,
+        );
+        self._library_watchers = watchers;
+        self._library_watch_task = task;
+    }
+
     pub fn tasks_for(&self, query: TaskQuery) -> impl Iterator<Item = &notes::TaskRef> {
         let today = Local::now().date_naive();
         self.open_tasks.iter().filter(move |t| query.matches(t.due, today))
@@ -510,6 +802,7 @@ impl Workspace {
         self.open_tasks = task_scan.open;
         self.day_stats = task_scan.day_stats;
         self.notes_tree = notes::notes_tree(&self.notes_root, &self.notes_expanded);
+        self.reload_library_trees();
         self.agent_activity = notes::recent_activity(&self.notes_root, 6);
         let today = Local::now().date_naive();
         self.task_counts = [TaskQuery::Today, TaskQuery::Open, TaskQuery::Overdue].map(|q| {
@@ -524,6 +817,12 @@ impl Workspace {
         let path = match &self.view {
             PaneView::Day => scan.days.get(&self.selected_day).cloned(),
             PaneView::Note(p) => Some(p.clone()),
+            // Only markdown library files are documents here; other kinds
+            // (images, binaries) render from the view's path without a text
+            // read, which would fail on them anyway.
+            PaneView::Library(p) => {
+                (notes::file_kind(p) == notes::FileKind::Markdown).then(|| p.clone())
+            }
             PaneView::Tasks(_) => None,
         };
         let (disk_text, doc_error) = match path.as_deref() {
@@ -580,7 +879,8 @@ impl Workspace {
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .map(str::to_string),
-            PaneView::Tasks(_) => None,
+            // Library files are documents, not notes: no linked mentions.
+            PaneView::Library(_) | PaneView::Tasks(_) => None,
         };
         self.mentions = match title {
             Some(t) => notes::mentions_in(&scan, &dailies, &t, path.as_deref()),
@@ -588,17 +888,30 @@ impl Workspace {
         };
         // For a day with no file yet, check where the file would be: the
         // conflicted copy of a note that vanished is exactly the case that
-        // needs surfacing.
-        let conflict_probe = path.clone().or_else(|| match &self.view {
-            PaneView::Day => Some(notes::daily_path(&self.notes_root, self.selected_day)),
-            _ => None,
-        });
+        // needs surfacing. Library files stay out: resolving a conflict
+        // trashes into the vault, which must never touch external trees.
+        let conflict_probe = match &self.view {
+            PaneView::Library(_) => None,
+            PaneView::Day => path
+                .clone()
+                .or_else(|| Some(notes::daily_path(&self.notes_root, self.selected_day))),
+            _ => path.clone(),
+        };
         self.conflicts = conflict_probe
             .as_deref()
             .map(notes::conflict_copies)
             .unwrap_or_default();
+        self.vault_conflicts = notes::vault_conflicts(&self.notes_root);
         self.doc_path = path;
         self.note_days = scan.days;
+        // The image view's sibling strip: the other images in its folder.
+        self.library_siblings = match &self.view {
+            PaneView::Library(p) if notes::file_kind(p) == notes::FileKind::Image => {
+                p.parent().map(notes::library_images).unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        self.sync_library_text(cx);
         self.sync_note_editor(disk_text.as_deref(), seed.as_deref(), cx);
     }
 
@@ -820,6 +1133,43 @@ impl Workspace {
 
     /// Dismiss the orphaned-line banner, optionally appending its text to
     /// the note it was bound for so nothing typed is lost.
+    /// Resolve a sync conflict, keeping either the current note or the
+    /// conflict copy. The losing file moves to `Notes/@Trash/` (nothing is
+    /// destroyed); adopting the copy renames it into the note's place, and
+    /// the file watcher plus reload pick the new content up everywhere.
+    pub fn resolve_conflict(&mut self, copy: &Path, keep_copy: bool, cx: &mut Context<Self>) {
+        let result = if keep_copy {
+            match notes::conflict_owner(copy) {
+                Some(owner) => notes::adopt_conflict_copy(&self.notes_root, &owner, copy),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "not a sync-conflict file name",
+                )),
+            }
+        } else {
+            notes::trash_note(&self.notes_root, copy).map(|_| ())
+        };
+        match result {
+            Ok(()) => self.reload_notes(cx),
+            Err(e) => eprintln!("kairn: could not resolve conflict {}: {e}", copy.display()),
+        }
+        cx.notify();
+    }
+
+    /// Jump to the note a conflict copy shadows, where the banner offers the
+    /// resolution actions: a day opens on the calendar, anything else as a
+    /// note.
+    pub fn open_conflict_owner(&mut self, owner: &Path, cx: &mut Context<Self>) {
+        let day = owner
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|stem| chrono::NaiveDate::parse_from_str(stem, "%Y%m%d").ok());
+        match day {
+            Some(date) => self.select_day(date, cx),
+            None => self.open_note(owner.to_path_buf(), cx),
+        }
+    }
+
     pub fn resolve_orphan(&mut self, append: bool, cx: &mut Context<Self>) {
         let Some((path, text)) = self.orphaned.take() else { return };
         if append {
@@ -848,19 +1198,7 @@ impl Workspace {
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<()>();
         let handler = move |res: notify::Result<notify::Event>| {
             let Ok(event) = res else { return };
-            let relevant = event.paths.is_empty()
-                || event.paths.iter().any(|p| {
-                    // The activity log is the one `.kairn/` file the UI
-                    // shows live: CLI writes must surface without a restart.
-                    let watched_in_kairn = p.file_name().is_some_and(|n| n == "activity.jsonl");
-                    (watched_in_kairn
-                        || !p.components().any(|c| c.as_os_str() == ".kairn"))
-                        && !p
-                            .file_name()
-                            .is_some_and(|n| n.to_string_lossy().contains(".kairn-tmp"))
-                        && !is_recent_self_write(&self_writes, p)
-                });
-            if relevant {
+            if notes_event_relevant(&event, &self_writes) {
                 let _ = tx.unbounded_send(());
             }
         };
@@ -898,6 +1236,69 @@ impl Workspace {
             }
         });
         (watcher, task)
+    }
+
+    /// Watch every library root recursively, one watcher per root feeding a
+    /// shared debounced library-scoped reload: agent writes and Syncthing
+    /// syncs must appear in the tree and any open library file without a
+    /// restart, but library churn never re-scans the vault. Events under
+    /// ignored subtrees (VCS, builds, dotfiles) are dropped at the source —
+    /// a `.git` churn in a big root must not cost reloads.
+    pub(crate) fn watch_library(
+        roots: Vec<PathBuf>,
+        self_writes: SelfWrites,
+        cx: &mut Context<Self>,
+    ) -> (Vec<notify::RecommendedWatcher>, Option<Task<()>>) {
+        use futures::StreamExt as _;
+        use notify::Watcher as _;
+
+        if roots.is_empty() {
+            return (Vec::new(), None);
+        }
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<()>();
+        let mut watchers = Vec::new();
+        for root in roots {
+            let tx = tx.clone();
+            let self_writes = self_writes.clone();
+            let handler = move |res: notify::Result<notify::Event>| {
+                let Ok(event) = res else { return };
+                if library_event_relevant(&event, &self_writes) {
+                    let _ = tx.unbounded_send(());
+                }
+            };
+            // Never follow symlinks, same as the vault watcher: one link
+            // into a big tree exhausts inotify watches on Linux.
+            let watcher = notify::RecommendedWatcher::new(
+                handler,
+                notify::Config::default().with_follow_symlinks(false),
+            )
+            .and_then(|mut w| {
+                w.watch(&root, notify::RecursiveMode::Recursive)?;
+                Ok(w)
+            });
+            match watcher {
+                Ok(w) => watchers.push(w),
+                Err(e) => {
+                    eprintln!("kairn: library watching unavailable for {}: {e}", root.display())
+                }
+            }
+        }
+        let task = cx.spawn(async move |this, cx| {
+            while rx.next().await.is_some() {
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+                while rx.try_recv().is_ok() {}
+                let ok = this.update(cx, |ws, cx| {
+                    ws.reload_library(cx);
+                    cx.notify();
+                });
+                if ok.is_err() {
+                    break;
+                }
+            }
+        });
+        (watchers, Some(task))
     }
 
     /// Apply and persist edits from the settings dialog. A changed notes
@@ -963,6 +1364,18 @@ impl Workspace {
     }
 }
 
+/// The plain-text editor over a library code/text file: a multi-line mono
+/// input bound to its file, saving on debounce and at every flush point.
+pub(crate) struct LibraryTextEditor {
+    pub path: PathBuf,
+    pub input: gpui::Entity<gpui_component::input::InputState>,
+    /// The file's content at load or last save: saves write only when the
+    /// buffer differs, and external reloads land only while it is clean.
+    pub baseline: String,
+    pub(crate) _sub: gpui::Subscription,
+    pub(crate) _save: Option<Task<()>>,
+}
+
 /// Edits collected by the settings dialog, applied in one Save.
 pub struct SettingsPatch {
     pub notes_root: Option<String>,
@@ -978,4 +1391,53 @@ pub struct SettingsPatch {
     pub mono_font: Option<String>,
     pub editor_font_size: Option<f32>,
     pub ui_font_size: Option<f32>,
+}
+
+#[cfg(test)]
+mod watcher_event_tests {
+    use super::*;
+    use notify::event::{AccessKind, AccessMode, CreateKind, DataChange, EventKind, ModifyKind};
+
+    fn event(kind: EventKind, path: &str) -> notify::Event {
+        notify::Event::new(kind).add_path(PathBuf::from(path))
+    }
+
+    /// Linux inotify reports the reload's own reads and directory walks
+    /// back as Access events (IN_OPEN and friends). Treating those as
+    /// relevant makes every reload schedule the next one: a self-sustaining
+    /// loop that pegs a core. Reads never change content.
+    #[test]
+    fn reads_never_trigger_reloads() {
+        let writes = SelfWrites::default();
+        let open = EventKind::Access(AccessKind::Open(AccessMode::Any));
+        let close = EventKind::Access(AccessKind::Close(AccessMode::Read));
+        assert!(!notes_event_relevant(&event(open, "/vault/Notes/a.md"), &writes));
+        assert!(!notes_event_relevant(&event(close, "/vault/Calendar"), &writes));
+        assert!(!library_event_relevant(&event(open, "/lib/doc.md"), &writes));
+        assert!(!library_event_relevant(&event(close, "/lib/sub"), &writes));
+    }
+
+    #[test]
+    fn content_changes_still_reload() {
+        let writes = SelfWrites::default();
+        let modify = EventKind::Modify(ModifyKind::Data(DataChange::Any));
+        let create = EventKind::Create(CreateKind::File);
+        assert!(notes_event_relevant(&event(modify, "/vault/Notes/a.md"), &writes));
+        assert!(notes_event_relevant(&event(create, "/vault/Calendar/2026-08-13.md"), &writes));
+        let modify = EventKind::Modify(ModifyKind::Data(DataChange::Any));
+        assert!(library_event_relevant(&event(modify, "/lib/doc.md"), &writes));
+    }
+
+    #[test]
+    fn ignored_subtrees_stay_dropped() {
+        let writes = SelfWrites::default();
+        let modify = EventKind::Modify(ModifyKind::Data(DataChange::Any));
+        assert!(!notes_event_relevant(&event(modify, "/vault/.kairn/state.json"), &writes));
+        let modify = EventKind::Modify(ModifyKind::Data(DataChange::Any));
+        assert!(notes_event_relevant(&event(modify, "/vault/.kairn/activity.jsonl"), &writes));
+        let modify = EventKind::Modify(ModifyKind::Data(DataChange::Any));
+        assert!(!library_event_relevant(&event(modify, "/lib/node_modules/x.js"), &writes));
+        let modify = EventKind::Modify(ModifyKind::Data(DataChange::Any));
+        assert!(!library_event_relevant(&event(modify, "/lib/.git/index"), &writes));
+    }
 }

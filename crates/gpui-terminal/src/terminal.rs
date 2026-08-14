@@ -166,9 +166,14 @@ impl TerminalState {
     /// let terminal = TerminalState::new(80, 24, event_proxy);
     /// ```
     pub fn new(cols: usize, rows: usize, event_proxy: GpuiEventProxy) -> Self {
-        // Create a default configuration
-        // The Config struct controls various terminal behaviors like scrolling history
-        let config = Config::default();
+        // The Config struct controls various terminal behaviors like scrolling
+        // history. kitty_keyboard lets applications negotiate the kitty
+        // keyboard protocol (push/pop/query of CSI u flags); the key encoder
+        // in `input.rs` honours the resulting TermMode flags.
+        let config = Config {
+            kitty_keyboard: true,
+            ..Config::default()
+        };
 
         // Create dimensions for terminal initialization
         let dimensions = TermDimensions::new(cols, rows);
@@ -450,6 +455,43 @@ mod tests {
         let mode = terminal.mode();
         // Mode should be a valid TermMode value (just verify we can get it)
         let _bits = mode.bits();
+    }
+
+    #[test]
+    fn test_cursor_shape_and_visibility_sequences() {
+        use alacritty_terminal::vte::ansi::CursorShape;
+
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(80, 24, event_proxy);
+
+        // DECSCUSR: 5 = blinking bar (vim insert mode, Claude Code's prompt).
+        terminal.process_bytes(b"\x1b[5 q");
+        assert_eq!(
+            terminal.with_term(|term| term.cursor_style().shape),
+            CursorShape::Beam
+        );
+
+        // DECSCUSR: 4 = steady underline.
+        terminal.process_bytes(b"\x1b[4 q");
+        assert_eq!(
+            terminal.with_term(|term| term.cursor_style().shape),
+            CursorShape::Underline
+        );
+
+        // DECSCUSR: 0 = reset to default (block).
+        terminal.process_bytes(b"\x1b[0 q");
+        assert_eq!(
+            terminal.with_term(|term| term.cursor_style().shape),
+            CursorShape::Block
+        );
+
+        // DECTCEM: hide and show the cursor.
+        assert!(terminal.mode().contains(TermMode::SHOW_CURSOR));
+        terminal.process_bytes(b"\x1b[?25l");
+        assert!(!terminal.mode().contains(TermMode::SHOW_CURSOR));
+        terminal.process_bytes(b"\x1b[?25h");
+        assert!(terminal.mode().contains(TermMode::SHOW_CURSOR));
     }
 
     #[test]

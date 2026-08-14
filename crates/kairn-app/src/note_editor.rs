@@ -2581,28 +2581,29 @@ impl Element for NoteEditorElement {
         // invites the pick-up.
         if let Some((y, _height)) = handle_slot {
             let scale = t.editor_size / theme::EDITOR_BASE_SIZE;
-            let grip = window.text_system().shape_line(
-                SharedString::from("⠿"),
-                px(11. * scale),
-                &[TextRun {
-                    len: "⠿".len(),
-                    font: window.text_style().font(),
-                    color: t.faint,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                }],
-                None,
-            );
-            let slot = layout.slots.iter().find(|s| s.y == y);
-            if let Some(slot) = slot {
-                let x = bounds.origin.x + (layout.gutter - grip.width).max(px(0.)) / 2.;
-                let _ = grip.paint(
-                    point(x, bounds.origin.y + slot.y + slot.entry.pad_top),
-                    slot.entry.line_height,
-                    window,
-                    cx,
-                );
+            if let Some(slot) = layout.slots.iter().find(|s| s.y == y) {
+                // Two columns of three dots, painted as quads rather than a
+                // shaped ⠿ glyph: font fallback drew the braille ink high in
+                // its em box (worst on Linux), so the grip never centered on
+                // the line it belonged to.
+                let dot = px(2. * scale);
+                let gap = px(2. * scale);
+                let grip_w = dot * 2. + gap;
+                let grip_h = dot * 3. + gap * 2.;
+                let left = bounds.origin.x + (layout.gutter - grip_w).max(px(0.)) / 2.;
+                let row_top = bounds.origin.y + slot.y + slot.entry.pad_top;
+                let top = row_top + (slot.entry.line_height - grip_h) / 2.;
+                for row in 0..3 {
+                    for col in 0..2 {
+                        let origin = point(
+                            left + (dot + gap) * col as f32,
+                            top + (dot + gap) * row as f32,
+                        );
+                        let mut quad = fill(Bounds::new(origin, size(dot, dot)), t.faint);
+                        quad.corner_radii = Corners::all(dot / 2.);
+                        window.paint_quad(quad);
+                    }
+                }
             }
         }
         if let Some(hitbox) = prepaint {

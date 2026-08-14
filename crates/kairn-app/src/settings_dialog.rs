@@ -411,6 +411,11 @@ impl SettingsEditor {
                 (s.show_agents, s.show_daily, s.show_tasks)
             })
             .unwrap_or((true, true, true));
+        let library_sort = self
+            .workspace
+            .upgrade()
+            .map(|ws| ws.read(cx).settings.library_sort.clone())
+            .unwrap_or_else(|| "modified".to_string());
         let resolved = self
             .workspace
             .upgrade()
@@ -443,6 +448,16 @@ impl SettingsEditor {
             btn.on_click(cx.listener(move |this, _, _, cx| {
                 let _ = this.workspace.update(cx, |ws, cx| {
                     ws.set_day_timeline(on, cx);
+                });
+                cx.notify();
+            }))
+        };
+        let sort_button = |id: &'static str, label: &'static str, mode: &'static str| {
+            let btn = Button::new(id).label(label);
+            let btn = if mode == library_sort { btn.primary() } else { btn.outline() };
+            btn.on_click(cx.listener(move |this, _, _, cx| {
+                let _ = this.workspace.update(cx, |ws, cx| {
+                    ws.set_library_sort(mode, cx);
                 });
                 cx.notify();
             }))
@@ -571,6 +586,16 @@ impl SettingsEditor {
             .child(div().text_size(px(11.)).opacity(0.55).child(
                 "Hidden sections disappear from the sidebar entirely. Agents is the feed \
                  of agent CLI activity on this machine.",
+            ))
+            .child(Self::section("Library file order"))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(sort_button("lib-sort-modified", "Newest first", "modified"))
+                    .child(sort_button("lib-sort-name", "A to Z", "name")),
+            )
+            .child(div().text_size(px(11.)).opacity(0.55).child(
+                "How files sort inside Library folders. Folders always sort by name.",
             ))
             .child(Self::section("Command line tool"))
             .child(self.render_cli(cx))
@@ -925,7 +950,7 @@ impl Render for SettingsEditor {
 }
 
 /// A path for display: home-relative (`~/...`) when it is under $HOME.
-fn home_relative(p: &std::path::Path) -> String {
+pub(crate) fn home_relative(p: &std::path::Path) -> String {
     let s = p.display().to_string();
     match std::env::var("HOME") {
         Ok(h) if !h.is_empty() && s.starts_with(&h) => format!("~{}", &s[h.len()..]),

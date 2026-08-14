@@ -250,6 +250,47 @@ pub fn conflict_copies(path: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// The note a Syncthing conflict copy shadows: the same folder and
+/// extension, with the `.sync-conflict-…` infix stripped from the name.
+/// `None` when the name doesn't carry the infix.
+pub fn conflict_owner(copy: &Path) -> Option<PathBuf> {
+    let name = copy.file_name()?.to_str()?;
+    let idx = name.find(".sync-conflict-")?;
+    let ext = copy.extension()?.to_str()?;
+    Some(copy.parent()?.join(format!("{}.{ext}", &name[..idx])))
+}
+
+/// Every Syncthing conflict copy in the vault with the note it shadows,
+/// sorted by owner: conflicts on notes that aren't open would otherwise be
+/// invisible until the note happens to be viewed.
+pub fn vault_conflicts(root: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let is_conflict = |p: &Path| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains(".sync-conflict-"))
+    };
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir(root.join("Calendar")) {
+        for path in entries.flatten().map(|e| e.path()) {
+            if path.is_file()
+                && is_conflict(&path)
+                && let Some(owner) = conflict_owner(&path)
+            {
+                out.push((owner, path));
+            }
+        }
+    }
+    for (_, path) in notes_files(root) {
+        if is_conflict(&path)
+            && let Some(owner) = conflict_owner(&path)
+        {
+            out.push((owner, path));
+        }
+    }
+    out.sort();
+    out
+}
+
 /// One visible row of the Notes browser.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NoteEntry {
@@ -613,6 +654,37 @@ mod tests {
         // The copy itself has no copies, and unrelated days are untouched.
         assert!(conflict_copies(&copy).is_empty());
         assert!(conflict_copies(&root.0.join("Calendar/20260807.md")).is_empty());
+    }
+
+    #[test]
+    fn conflict_owner_strips_the_infix() {
+        let copy = Path::new("/v/Calendar/20260811.sync-conflict-20260812-084345-IPHONE.md");
+        assert_eq!(
+            conflict_owner(copy),
+            Some(PathBuf::from("/v/Calendar/20260811.md"))
+        );
+        assert_eq!(conflict_owner(Path::new("/v/Calendar/20260811.md")), None);
+    }
+
+    #[test]
+    fn vault_conflicts_cover_calendar_and_notes() {
+        let root = ScratchRoot::new("vault-conflicts");
+        let day = root.write("Calendar/20260806.md", "* mine\n");
+        let day_copy = root.write(
+            "Calendar/20260806.sync-conflict-20260807-101112-AAAAAAA.md",
+            "* theirs\n",
+        );
+        let note = root.write("Notes/Projects/Plan.md", "# plan\n");
+        let note_copy = root.write(
+            "Notes/Projects/Plan.sync-conflict-20260808-090000-BBBBBBB.md",
+            "# stale plan\n",
+        );
+        root.write("Calendar/20260807.md", "* unrelated\n");
+
+        assert_eq!(
+            vault_conflicts(&root.0),
+            vec![(day, day_copy), (note, note_copy)]
+        );
     }
 
     #[test]

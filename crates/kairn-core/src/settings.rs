@@ -64,6 +64,15 @@ pub struct Settings {
     /// the default `~/kairn`. A leading `~` is expanded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes_root: Option<String>,
+    /// Extra local directories browsable in the sidebar's Library section.
+    /// Per-machine by design: each machine lists the paths that exist on it,
+    /// and the list never syncs between devices. A leading `~` is expanded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub library_roots: Vec<String>,
+    /// Library file ordering: "modified" (newest first) or "name". Folders
+    /// always sort by name. Unknown values read as "modified".
+    #[serde(default = "default_library_sort")]
+    pub library_sort: String,
     #[serde(default)]
     pub ssh_hosts: Vec<SshHost>,
     /// Launch shortcuts that run on this machine, in the user's order.
@@ -143,11 +152,17 @@ fn default_template_rule() -> String {
     "always".to_string()
 }
 
+fn default_library_sort() -> String {
+    "modified".to_string()
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: default_theme(),
             notes_root: None,
+            library_roots: Vec::new(),
+            library_sort: default_library_sort(),
             ssh_hosts: Vec::new(),
             local_apps: Vec::new(),
             show_agents: true,
@@ -178,6 +193,13 @@ fn home_dir() -> PathBuf {
 }
 
 pub fn config_path() -> PathBuf {
+    // KAIRN_CONFIG points the settings file elsewhere for this process only
+    // (dev, testing, screenshots), the way KAIRN_ROOT does the notes root.
+    if let Ok(p) = std::env::var("KAIRN_CONFIG")
+        && !p.is_empty()
+    {
+        return PathBuf::from(p);
+    }
     home_dir().join(".config").join("kairn").join("settings.json")
 }
 
@@ -194,6 +216,18 @@ impl Settings {
                 }
             }
         }
+    }
+
+    /// Resolved library roots, `~` expanded, in the configured order.
+    pub fn library_roots(&self) -> Vec<PathBuf> {
+        self.library_roots
+            .iter()
+            .filter(|raw| !raw.is_empty())
+            .map(|raw| match raw.strip_prefix("~/") {
+                Some(rest) => home_dir().join(rest),
+                None => PathBuf::from(raw),
+            })
+            .collect()
     }
 
     pub fn load() -> Self {

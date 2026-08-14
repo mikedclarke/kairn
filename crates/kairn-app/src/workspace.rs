@@ -45,6 +45,9 @@ pub enum PaneView {
     Day,
     /// A note from the `Notes/` tree.
     Note(PathBuf),
+    /// A file from a sidebar Library root: rendered by kind (markdown
+    /// editor, image, or a metadata card), never fed into tasks or links.
+    Library(PathBuf),
     /// A generated list of open tasks from the daily notes.
     Tasks(TaskQuery),
 }
@@ -127,6 +130,10 @@ pub struct Workspace {
     pub mentions: Vec<notes::Mention>,
     /// Syncthing conflict copies sitting next to the pane's document.
     pub conflicts: Vec<PathBuf>,
+    /// Every Syncthing conflict in the vault as (owner note, conflict copy),
+    /// for the sidebar's conflict list: conflicts on notes that aren't open
+    /// would otherwise stay invisible.
+    pub vault_conflicts: Vec<(PathBuf, PathBuf)>,
     /// Read error for the pane's document: the file exists but couldn't be
     /// read (permissions, invalid UTF-8). Rendered instead of pretending
     /// there is no note.
@@ -148,6 +155,17 @@ pub struct Workspace {
     pub notes_tree: Vec<notes::NoteEntry>,
     /// Folders currently expanded in the Notes browser.
     pub(crate) notes_expanded: HashSet<PathBuf>,
+    /// Each configured library root with its visible tree rows, in the
+    /// settings order. Rebuilt on reload; empty when no roots are set.
+    pub library_trees: Vec<(PathBuf, Vec<notes::LibraryEntry>)>,
+    /// Library roots and folders currently expanded in the sidebar.
+    pub(crate) library_expanded: HashSet<PathBuf>,
+    /// Images sharing the open library image's folder, for the sibling
+    /// strip under the image view. Computed on reload, not per frame.
+    pub(crate) library_siblings: Vec<PathBuf>,
+    /// The plain-text editor over a library code/text file. Present only
+    /// while a Text-kind library file is on screen.
+    pub(crate) library_text: Option<crate::vault_state::LibraryTextEditor>,
     /// Open/done task tallies for Monday..Sunday of the selected day's week,
     /// so the week strip can show the same indicators as the calendar.
     pub week_stats: [notes::DayTaskStats; 7],
@@ -181,11 +199,24 @@ pub struct Workspace {
     /// Hold-for-heading state: dwelling a drag on a day target for a moment
     /// opens a menu of that day's headings to drop under.
     pub(crate) hold: HoldState,
+    /// The sidebar scroll position, tracked so synthesized momentum can
+    /// keep it moving after a touchpad flick (see `sidebar_flick`).
+    pub(crate) sidebar_scroll: gpui::ScrollHandle,
+    /// Timestamped vertical deltas from the last ~100ms of touchpad
+    /// scrolling, the velocity source for synthesized momentum.
+    pub(crate) sidebar_flick_samples: std::collections::VecDeque<(std::time::Instant, f32)>,
+    /// The pending momentum watchdog or animation; replacing it cancels
+    /// the old one, so fresh finger input always wins.
+    pub(crate) _sidebar_kinetic_task: Option<Task<()>>,
     _activity_timer: Task<()>,
     /// Watches the notes root so outside edits (agents, Syncthing, NotePlan
     /// elsewhere) appear without a restart. Dropped with the workspace.
     pub(crate) _notes_watcher: Option<notify::RecommendedWatcher>,
     pub(crate) _notes_watch_task: Task<()>,
+    /// One watcher per library root (agent writes and Syncthing must appear
+    /// live there too), plus the shared debounce task draining their events.
+    pub(crate) _library_watchers: Vec<notify::RecommendedWatcher>,
+    pub(crate) _library_watch_task: Option<Task<()>>,
 }
 
 impl Workspace {
@@ -235,6 +266,8 @@ impl Workspace {
         let self_writes = crate::vault_state::SelfWrites::default();
         let (notes_watcher, notes_watch_task) =
             Self::watch_notes(notes_root.clone(), self_writes.clone(), cx);
+        let (library_watchers, library_watch_task) =
+            Self::watch_library(settings.library_roots(), self_writes.clone(), cx);
 
         // Closing the window must not drop a pending edit.
         let flush = cx.weak_entity();
@@ -290,6 +323,7 @@ impl Workspace {
             doc_path: None,
             mentions: Vec::new(),
             conflicts: Vec::new(),
+            vault_conflicts: Vec::new(),
             doc_error: None,
             dailies_skipped: 0,
             root_missing,
@@ -298,6 +332,10 @@ impl Workspace {
             open_tasks: Vec::new(),
             notes_tree: Vec::new(),
             notes_expanded: HashSet::new(),
+            library_trees: Vec::new(),
+            library_expanded: HashSet::new(),
+            library_siblings: Vec::new(),
+            library_text: None,
             week_stats: [notes::DayTaskStats::default(); 7],
             day_timeline: Vec::new(),
             task_counts: [0; 3],
@@ -309,10 +347,15 @@ impl Workspace {
             calendar_drop_bounds: Default::default(),
             daily_drop_bounds: Default::default(),
             sidebar_bounds: Default::default(),
+            sidebar_scroll: gpui::ScrollHandle::new(),
+            sidebar_flick_samples: std::collections::VecDeque::new(),
+            _sidebar_kinetic_task: None,
             hold: HoldState::Idle,
             _activity_timer: activity_timer,
             _notes_watcher: notes_watcher,
             _notes_watch_task: notes_watch_task,
+            _library_watchers: library_watchers,
+            _library_watch_task: library_watch_task,
         };
         this.reload_notes(cx);
         // No session on launch: the terminal pane opens on the start page
@@ -525,6 +568,19 @@ impl Workspace {
         if let Err(e) = self.settings.save() {
             eprintln!("kairn: failed to save settings: {e}");
         }
+        cx.notify();
+    }
+
+    /// Order library files by "modified" (newest first) or "name".
+    pub fn set_library_sort(&mut self, mode: &str, cx: &mut Context<Self>) {
+        if self.settings.library_sort == mode {
+            return;
+        }
+        self.settings.library_sort = mode.to_string();
+        if let Err(e) = self.settings.save() {
+            eprintln!("kairn: failed to save settings: {e}");
+        }
+        self.reload_library_trees();
         cx.notify();
     }
 

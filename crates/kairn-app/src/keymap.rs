@@ -1,6 +1,6 @@
 //! Actions, key bindings, and the platform-correct chord labels.
 
-use gpui::{App, KeyBinding, actions};
+use gpui::{App, KeyBinding, NoAction, actions};
 
 actions!(
     kairn,
@@ -80,6 +80,13 @@ pub fn init(cx: &mut App) {
         }
     };
     cx.bind_keys([
+        // gpui-component's Root binds tab/shift-tab to focus cycling, which
+        // consumes them before a focused terminal can forward them to the
+        // PTY (Tab completion, backtab \x1b[Z). A NoAction binding in the
+        // deeper Terminal context disables the Root binding there, letting
+        // the raw keystrokes fall through to the terminal's key handler.
+        KeyBinding::new("tab", NoAction, Some("Terminal")),
+        KeyBinding::new("shift-tab", NoAction, Some("Terminal")),
         KeyBinding::new(&p("\\"), ToggleSidebar, None),
         KeyBinding::new(&p("shift-enter"), ToggleTerminalFull, None),
         KeyBinding::new(&p("alt-enter"), ToggleWriting, None),

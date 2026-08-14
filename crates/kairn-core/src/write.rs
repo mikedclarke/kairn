@@ -128,6 +128,17 @@ pub fn write_note(path: &Path, content: &str) -> io::Result<()> {
     atomic_write(path, content)
 }
 
+/// Resolve a sync conflict by adopting the conflict copy: the current note
+/// moves to the vault trash (the losing version stays recoverable from
+/// `Notes/@Trash/`) and the copy is renamed into its place. A note that
+/// vanished, leaving only the copy, is simply recreated by the rename.
+pub fn adopt_conflict_copy(root: &Path, note: &Path, copy: &Path) -> io::Result<()> {
+    if note.exists() {
+        trash_note(root, note)?;
+    }
+    fs::rename(copy, note)
+}
+
 /// A file stem the user typed for a new or renamed note, checked before it
 /// touches the filesystem: non-empty, no path separators, and not dot- or
 /// `@`-prefixed (hidden files and NotePlan's special folders).
@@ -921,6 +932,35 @@ mod tests {
 
         // Trashing from the trash is refused.
         assert!(trash_note(&root.0, &dest).is_err());
+    }
+
+    #[test]
+    fn adopt_conflict_copy_trashes_note_and_takes_its_place() {
+        let root = ScratchRoot::new("adopt-conflict");
+        let note = root.write("Calendar/20260811.md", "* carried\n");
+        let copy = root.write(
+            "Calendar/20260811.sync-conflict-20260812-084345-IPHONE.md",
+            "* stale\n",
+        );
+        adopt_conflict_copy(&root.0, &note, &copy).expect("adopt");
+        assert_eq!(fs::read_to_string(&note).expect("read"), "* stale\n");
+        assert!(!copy.exists());
+        // The losing version is recoverable from the trash.
+        let trashed = root.0.join("Notes/@Trash/20260811.md");
+        assert_eq!(fs::read_to_string(&trashed).expect("read"), "* carried\n");
+    }
+
+    #[test]
+    fn adopt_conflict_copy_recreates_a_vanished_note() {
+        let root = ScratchRoot::new("adopt-vanished");
+        let copy = root.write(
+            "Calendar/20260811.sync-conflict-20260812-084345-IPHONE.md",
+            "* only version\n",
+        );
+        let note = root.0.join("Calendar/20260811.md");
+        adopt_conflict_copy(&root.0, &note, &copy).expect("adopt");
+        assert_eq!(fs::read_to_string(&note).expect("read"), "* only version\n");
+        assert!(!copy.exists());
     }
 
     #[test]

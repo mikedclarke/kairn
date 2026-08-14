@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use gpui::{AppContext, Context, Edges, Entity, SharedString, WeakEntity, px};
+use gpui::{AppContext, ClipboardItem, Context, Edges, Entity, SharedString, WeakEntity, px};
 use gpui_terminal::{TerminalConfig, TerminalView};
 use parking_lot::Mutex;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -222,6 +222,12 @@ pub fn spawn(
                 let _ = title_workspace.update(cx, |ws, cx| {
                     ws.set_session_title(id, title.into(), cx);
                 });
+            })
+            // OSC 52: applications copy through the terminal (herdr's
+            // copy, tmux/vim yanks over SSH). Without this the copy
+            // silently does nothing.
+            .with_clipboard_store_callback(|_window, cx, text| {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
             })
             .with_exit_callback(move |window, cx| {
                 // Reap here so the dead shell doesn't linger as a zombie.

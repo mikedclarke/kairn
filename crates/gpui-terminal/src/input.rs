@@ -9,9 +9,9 @@
 //!
 //! | Key | Sequence | Notes |
 //! |-----|----------|-------|
-//! | Enter | `\r` (0x0D) | Carriage return |
-//! | Escape | `\x1b` (0x1B) | ESC |
-//! | Backspace | `\x7f` (0x7F) | DEL |
+//! | Enter | `\r` (0x0D) | Carriage return; Alt prefixes ESC |
+//! | Escape | `\x1b` (0x1B) | ESC; Alt sends ESC ESC |
+//! | Backspace | `\x7f` (0x7F) | DEL; Alt prefixes ESC |
 //! | Tab | `\t` (0x09) | Horizontal tab |
 //! | Shift+Tab | `\x1b[Z` | Backtab |
 //! | Space | ` ` (0x20) | Space |
@@ -46,6 +46,21 @@
 //! | F1-F4 | `\x1bOP` - `\x1bOS` |
 //! | F5-F12 | `\x1b[15~` - `\x1b[24~` |
 //!
+//! ## Modified Special Keys
+//!
+//! Shift, Alt, and Ctrl on arrows, navigation, and function keys use the
+//! xterm modifier parameter `1 + shift(1) + alt(2) + ctrl(4)`:
+//!
+//! | Combination | Sequence |
+//! |-------------|----------|
+//! | Ctrl+Right | `\x1b[1;5C` |
+//! | Shift+Up | `\x1b[1;2A` |
+//! | Alt+Delete | `\x1b[3;3~` |
+//! | Ctrl+F5 | `\x1b[15;5~` |
+//!
+//! Modified arrows always use the CSI form, even in application cursor mode,
+//! matching xterm.
+//!
 //! ## Control Combinations
 //!
 //! Ctrl+A through Ctrl+Z map to ASCII control characters 0x01-0x1A:
@@ -59,13 +74,26 @@
 //!
 //! ## Alt Combinations
 //!
-//! Alt+key sends ESC followed by the key: `\x1b` + key
+//! Alt+key sends ESC followed by the key: `\x1b` + key. Ctrl+Alt+key sends
+//! ESC followed by the control byte.
 //!
 //! # Terminal Mode Effects
 //!
 //! The [`TermMode`] flags affect key sequences:
 //!
-//! - **APP_CURSOR**: Changes arrow key sequences from CSI to SS3 format
+//! - **APP_CURSOR**: Changes unmodified arrow key sequences from CSI to SS3
+//!   format
+//! - **DISAMBIGUATE_ESC_CODES** (kitty keyboard protocol): Esc becomes
+//!   `\x1b[27u`, Ctrl/Alt-modified printables become `\x1b[<codepoint>;<mods>u`,
+//!   and modified Enter/Tab/Backspace/Space take the same CSI u form, so
+//!   applications can tell Shift+Enter from Enter. Unmodified printables,
+//!   Enter, Tab, Backspace, arrows, navigation and function keys keep their
+//!   legacy sequences.
+//! - **REPORT_ALL_KEYS_AS_ESC** is deliberately never honoured: herdr requests
+//!   it but its prefix matcher cannot decode CSI u printables, so encoding
+//!   plain keys as CSI u kills its `Ctrl+B <letter>` bindings. Masking the
+//!   flag in the encoder keeps plain keys legacy while the other kitty flags
+//!   still work.
 //!
 //! # Example
 //!
@@ -90,7 +118,7 @@ use gpui::Keystroke;
 ///
 /// This function translates GPUI keyboard events into the appropriate byte sequences
 /// expected by terminal applications. It handles special keys, control characters,
-/// and application cursor mode.
+/// modified keys (xterm modifier encoding), and application cursor mode.
 ///
 /// # Arguments
 ///
@@ -114,106 +142,193 @@ use gpui::Keystroke;
 /// assert_eq!(bytes, Some(b"\r".to_vec()));
 /// ```
 pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
+    let mods = keystroke.modifiers;
+    // xterm modifier parameter: 1 + shift(1) + alt(2) + ctrl(4).
+    let param = 1 + u8::from(mods.shift) + u8::from(mods.alt) * 2 + u8::from(mods.control) * 4;
+    let modified = param > 1;
+
+    // CSI keys whose final byte is a letter: `\x1b[H`, or `\x1b[1;5H` when
+    // a modifier is held.
+    let csi_letter = |letter: char| -> Vec<u8> {
+        if modified {
+            format!("\x1b[1;{param}{letter}").into_bytes()
+        } else {
+            format!("\x1b[{letter}").into_bytes()
+        }
+    };
+    // CSI keys with a numeric code and `~` final: `\x1b[3~`, or `\x1b[3;3~`
+    // when a modifier is held.
+    let csi_tilde = |num: u8| -> Vec<u8> {
+        if modified {
+            format!("\x1b[{num};{param}~").into_bytes()
+        } else {
+            format!("\x1b[{num}~").into_bytes()
+        }
+    };
+
+    // Kitty keyboard protocol: when the application has negotiated
+    // disambiguation, the ambiguous legacy keys switch to CSI u sequences
+    // (`\x1b[<codepoint>u`, or `\x1b[<codepoint>;<mods>u` with modifiers).
+    // REPORT_ALL_KEYS_AS_ESC is deliberately ignored (see the module docs:
+    // honouring it breaks herdr's prefix keys), so unmodified printables,
+    // Enter, Tab and Backspace always keep their legacy bytes, and arrows,
+    // navigation and function keys keep their legacy CSI forms below.
+    if mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
+        let csi_u = |code: u32| -> Vec<u8> {
+            if modified {
+                format!("\x1b[{code};{param}u").into_bytes()
+            } else {
+                format!("\x1b[{code}u").into_bytes()
+            }
+        };
+        match keystroke.key.as_str() {
+            // A bare Esc must not be a raw 0x1b: under disambiguation that
+            // reads as the start of an escape sequence.
+            "escape" => return Some(csi_u(27)),
+            "enter" if modified => return Some(csi_u(13)),
+            "tab" if modified => return Some(csi_u(9)),
+            "backspace" if modified => return Some(csi_u(127)),
+            "space" if mods.control || mods.alt => return Some(csi_u(32)),
+            key => {
+                // Ctrl/Alt-modified printables: CSI u on the unshifted
+                // codepoint (kitty reports lowercase letters). Shift alone
+                // stays legacy text; arrows/nav/function keys have multi-char
+                // names and fall through to their legacy forms.
+                if (mods.control || mods.alt)
+                    && key.chars().count() == 1
+                    && let Some(ch) = key.chars().next()
+                    && !ch.is_control()
+                {
+                    return Some(csi_u(ch.to_ascii_lowercase() as u32));
+                }
+            }
+        }
+    }
+
     // Handle special keys first
     match keystroke.key.as_str() {
-        // Basic control characters
+        // Basic control characters. Alt prefixes ESC (meta), matching xterm.
         "space" => {
-            if keystroke.modifiers.control {
-                return Some(b"\x00".to_vec()); // Ctrl+Space = NUL
+            let mut bytes = Vec::new();
+            if mods.alt {
+                bytes.push(0x1b);
             }
-            return Some(b" ".to_vec());
+            bytes.push(if mods.control { 0x00 } else { b' ' });
+            return Some(bytes);
         }
-        "enter" => return Some(b"\r".to_vec()),
-        "escape" => return Some(b"\x1b".to_vec()),
-        "backspace" => return Some(b"\x7f".to_vec()),
+        "enter" => {
+            if mods.alt {
+                return Some(b"\x1b\r".to_vec());
+            }
+            return Some(b"\r".to_vec());
+        }
+        "escape" => {
+            if mods.alt {
+                return Some(b"\x1b\x1b".to_vec());
+            }
+            return Some(b"\x1b".to_vec());
+        }
+        "backspace" => {
+            if mods.alt {
+                return Some(b"\x1b\x7f".to_vec());
+            }
+            return Some(b"\x7f".to_vec());
+        }
         "tab" => {
             // Shift+Tab sends a different sequence
-            if keystroke.modifiers.shift {
+            if mods.shift {
                 return Some(b"\x1b[Z".to_vec());
             }
             return Some(b"\t".to_vec());
         }
 
-        // Arrow keys - check APP_CURSOR mode
-        "up" => {
-            if mode.contains(TermMode::APP_CURSOR) {
-                return Some(b"\x1bOA".to_vec());
+        // Arrow keys - modified arrows always take the CSI form with the
+        // xterm modifier parameter; unmodified arrows check APP_CURSOR mode.
+        "up" | "down" | "right" | "left" => {
+            let letter = match keystroke.key.as_str() {
+                "up" => 'A',
+                "down" => 'B',
+                "right" => 'C',
+                _ => 'D',
+            };
+            if modified {
+                return Some(csi_letter(letter));
             }
-            return Some(b"\x1b[A".to_vec());
-        }
-        "down" => {
             if mode.contains(TermMode::APP_CURSOR) {
-                return Some(b"\x1bOB".to_vec());
+                return Some(format!("\x1bO{letter}").into_bytes());
             }
-            return Some(b"\x1b[B".to_vec());
-        }
-        "right" => {
-            if mode.contains(TermMode::APP_CURSOR) {
-                return Some(b"\x1bOC".to_vec());
-            }
-            return Some(b"\x1b[C".to_vec());
-        }
-        "left" => {
-            if mode.contains(TermMode::APP_CURSOR) {
-                return Some(b"\x1bOD".to_vec());
-            }
-            return Some(b"\x1b[D".to_vec());
+            return Some(format!("\x1b[{letter}").into_bytes());
         }
 
         // Navigation keys
-        "home" => return Some(b"\x1b[H".to_vec()),
-        "end" => return Some(b"\x1b[F".to_vec()),
-        "pageup" => return Some(b"\x1b[5~".to_vec()),
-        "pagedown" => return Some(b"\x1b[6~".to_vec()),
-        "insert" => return Some(b"\x1b[2~".to_vec()),
-        "delete" => return Some(b"\x1b[3~".to_vec()),
+        "home" => return Some(csi_letter('H')),
+        "end" => return Some(csi_letter('F')),
+        "pageup" => return Some(csi_tilde(5)),
+        "pagedown" => return Some(csi_tilde(6)),
+        "insert" => return Some(csi_tilde(2)),
+        "delete" => return Some(csi_tilde(3)),
 
-        // Function keys
-        "f1" => return Some(b"\x1bOP".to_vec()),
-        "f2" => return Some(b"\x1bOQ".to_vec()),
-        "f3" => return Some(b"\x1bOR".to_vec()),
-        "f4" => return Some(b"\x1bOS".to_vec()),
-        "f5" => return Some(b"\x1b[15~".to_vec()),
-        "f6" => return Some(b"\x1b[17~".to_vec()),
-        "f7" => return Some(b"\x1b[18~".to_vec()),
-        "f8" => return Some(b"\x1b[19~".to_vec()),
-        "f9" => return Some(b"\x1b[20~".to_vec()),
-        "f10" => return Some(b"\x1b[21~".to_vec()),
-        "f11" => return Some(b"\x1b[23~".to_vec()),
-        "f12" => return Some(b"\x1b[24~".to_vec()),
+        // Function keys - unmodified F1-F4 use SS3, modified use CSI,
+        // matching xterm.
+        "f1" | "f2" | "f3" | "f4" => {
+            let letter = match keystroke.key.as_str() {
+                "f1" => 'P',
+                "f2" => 'Q',
+                "f3" => 'R',
+                _ => 'S',
+            };
+            if modified {
+                return Some(csi_letter(letter));
+            }
+            return Some(format!("\x1bO{letter}").into_bytes());
+        }
+        "f5" => return Some(csi_tilde(15)),
+        "f6" => return Some(csi_tilde(17)),
+        "f7" => return Some(csi_tilde(18)),
+        "f8" => return Some(csi_tilde(19)),
+        "f9" => return Some(csi_tilde(20)),
+        "f10" => return Some(csi_tilde(21)),
+        "f11" => return Some(csi_tilde(23)),
+        "f12" => return Some(csi_tilde(24)),
 
         _ => {}
     }
 
-    // Handle Ctrl+key combinations
-    if keystroke.modifiers.control {
+    // Handle Ctrl+key combinations. Alt on top prefixes ESC.
+    if mods.control {
         let key = keystroke.key.as_str();
 
-        // Ctrl+A through Ctrl+Z map to 0x01 through 0x1a
         if key.len() == 1 {
             let ch = key.chars().next().unwrap();
-            if ch.is_ascii_alphabetic() {
-                // Convert to uppercase and then to control character
-                let upper = ch.to_ascii_uppercase();
-                let ctrl_char = (upper as u8) - b'@';
-                return Some(vec![ctrl_char]);
-            }
 
-            // Special Ctrl combinations
-            match ch {
-                '[' => return Some(b"\x1b".to_vec()),  // Ctrl+[
-                '\\' => return Some(b"\x1c".to_vec()), // Ctrl+\
-                ']' => return Some(b"\x1d".to_vec()),  // Ctrl+]
-                '^' => return Some(b"\x1e".to_vec()),  // Ctrl+^
-                '_' => return Some(b"\x1f".to_vec()),  // Ctrl+_
-                '?' => return Some(b"\x7f".to_vec()),  // Ctrl+?
-                _ => {}
+            // Ctrl+A through Ctrl+Z map to 0x01 through 0x1a; the rest are
+            // the special punctuation control combinations.
+            let ctrl_byte = if ch.is_ascii_alphabetic() {
+                Some((ch.to_ascii_uppercase() as u8) - b'@')
+            } else {
+                match ch {
+                    '[' => Some(0x1b),  // Ctrl+[
+                    '\\' => Some(0x1c), // Ctrl+\
+                    ']' => Some(0x1d),  // Ctrl+]
+                    '^' => Some(0x1e),  // Ctrl+^
+                    '_' => Some(0x1f),  // Ctrl+_
+                    '?' => Some(0x7f),  // Ctrl+?
+                    _ => None,
+                }
+            };
+            if let Some(byte) = ctrl_byte {
+                let mut bytes = Vec::new();
+                if mods.alt {
+                    bytes.push(0x1b);
+                }
+                bytes.push(byte);
+                return Some(bytes);
             }
         }
     }
 
     // Handle Alt+key combinations
-    if keystroke.modifiers.alt {
+    if mods.alt {
         let key = keystroke.key.as_str();
         if key.len() == 1 {
             // Alt+key sends ESC followed by the key
@@ -229,8 +344,8 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u
     // Handle regular printable characters
     // Use key_char if available (contains the actual typed character with modifiers like Shift)
     if let Some(key_char) = &keystroke.key_char
-        && !keystroke.modifiers.control
-        && !keystroke.modifiers.alt
+        && !mods.control
+        && !mods.alt
     {
         return Some(key_char.as_bytes().to_vec());
     }
@@ -239,9 +354,9 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u
     let key = keystroke.key.as_str();
     if key.len() == 1 {
         let ch = key.chars().next().unwrap();
-        if ch.is_ascii() && !keystroke.modifiers.control {
+        if ch.is_ascii() && !mods.control {
             // Handle shift modifier for uppercase
-            let ch = if keystroke.modifiers.shift {
+            let ch = if mods.shift {
                 ch.to_ascii_uppercase()
             } else {
                 ch
@@ -249,7 +364,7 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u
             return Some(vec![ch as u8]);
         }
         // For non-ASCII characters, encode as UTF-8
-        if !keystroke.modifiers.control && !keystroke.modifiers.alt {
+        if !mods.control && !mods.alt {
             return Some(key.as_bytes().to_vec());
         }
     }
@@ -332,6 +447,52 @@ mod tests {
     }
 
     #[test]
+    fn test_modified_arrow_keys() {
+        let mode = TermMode::empty();
+
+        // Ctrl+Right = word forward in most shells
+        let ctrl_right = Keystroke::parse("ctrl-right").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_right, mode),
+            Some(b"\x1b[1;5C".to_vec())
+        );
+
+        // Shift+Up = extend selection in TUIs
+        let shift_up = Keystroke::parse("shift-up").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&shift_up, mode),
+            Some(b"\x1b[1;2A".to_vec())
+        );
+
+        // Alt+Left
+        let alt_left = Keystroke::parse("alt-left").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&alt_left, mode),
+            Some(b"\x1b[1;3D".to_vec())
+        );
+
+        // Ctrl+Shift+Down combines to parameter 6
+        let ctrl_shift_down = Keystroke::parse("ctrl-shift-down").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_shift_down, mode),
+            Some(b"\x1b[1;6B".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_modified_arrows_ignore_app_cursor_mode() {
+        // xterm sends the CSI form for modified arrows even in application
+        // cursor mode.
+        let mode = TermMode::APP_CURSOR;
+
+        let ctrl_up = Keystroke::parse("ctrl-up").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_up, mode),
+            Some(b"\x1b[1;5A".to_vec())
+        );
+    }
+
+    #[test]
     fn test_navigation_keys() {
         let mode = TermMode::empty();
 
@@ -358,6 +519,32 @@ mod tests {
     }
 
     #[test]
+    fn test_modified_navigation_keys() {
+        let mode = TermMode::empty();
+
+        // Ctrl+Home = top of buffer
+        let ctrl_home = Keystroke::parse("ctrl-home").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_home, mode),
+            Some(b"\x1b[1;5H".to_vec())
+        );
+
+        // Alt+Delete
+        let alt_delete = Keystroke::parse("alt-delete").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&alt_delete, mode),
+            Some(b"\x1b[3;3~".to_vec())
+        );
+
+        // Shift+PageUp
+        let shift_pageup = Keystroke::parse("shift-pageup").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&shift_pageup, mode),
+            Some(b"\x1b[5;2~".to_vec())
+        );
+    }
+
+    #[test]
     fn test_function_keys() {
         let mode = TermMode::empty();
 
@@ -372,6 +559,24 @@ mod tests {
 
         let f12 = Keystroke::parse("f12").unwrap();
         assert_eq!(keystroke_to_bytes(&f12, mode), Some(b"\x1b[24~".to_vec()));
+    }
+
+    #[test]
+    fn test_modified_function_keys() {
+        let mode = TermMode::empty();
+
+        // Modified F1-F4 switch from SS3 to CSI
+        let ctrl_f1 = Keystroke::parse("ctrl-f1").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_f1, mode),
+            Some(b"\x1b[1;5P".to_vec())
+        );
+
+        let ctrl_f5 = Keystroke::parse("ctrl-f5").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_f5, mode),
+            Some(b"\x1b[15;5~".to_vec())
+        );
     }
 
     #[test]
@@ -396,6 +601,18 @@ mod tests {
     }
 
     #[test]
+    fn test_ctrl_alt_combinations() {
+        let mode = TermMode::empty();
+
+        // Ctrl+Alt+A = ESC then 0x01
+        let ctrl_alt_a = Keystroke::parse("ctrl-alt-a").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_alt_a, mode),
+            Some(vec![0x1b, 0x01])
+        );
+    }
+
+    #[test]
     fn test_alt_combinations() {
         let mode = TermMode::empty();
 
@@ -406,6 +623,32 @@ mod tests {
         // Alt+x sends ESC followed by 'x'
         let alt_x = Keystroke::parse("alt-x").unwrap();
         assert_eq!(keystroke_to_bytes(&alt_x, mode), Some(b"\x1bx".to_vec()));
+    }
+
+    #[test]
+    fn test_alt_special_keys() {
+        let mode = TermMode::empty();
+
+        // Alt+Backspace = ESC DEL (delete word back in shells)
+        let alt_backspace = Keystroke::parse("alt-backspace").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&alt_backspace, mode),
+            Some(b"\x1b\x7f".to_vec())
+        );
+
+        // Alt+Enter = ESC CR
+        let alt_enter = Keystroke::parse("alt-enter").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&alt_enter, mode),
+            Some(b"\x1b\r".to_vec())
+        );
+
+        // Alt+Escape = ESC ESC
+        let alt_escape = Keystroke::parse("alt-escape").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&alt_escape, mode),
+            Some(b"\x1b\x1b".to_vec())
+        );
     }
 
     #[test]
@@ -428,5 +671,170 @@ mod tests {
 
         let space = Keystroke::parse("space").unwrap();
         assert_eq!(keystroke_to_bytes(&space, mode), Some(b" ".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_escape_disambiguated() {
+        let mode = TermMode::DISAMBIGUATE_ESC_CODES;
+
+        // A raw 0x1b would read as the start of a sequence; kitty sends CSI 27u.
+        let esc = Keystroke::parse("escape").unwrap();
+        assert_eq!(keystroke_to_bytes(&esc, mode), Some(b"\x1b[27u".to_vec()));
+
+        let alt_esc = Keystroke::parse("alt-escape").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&alt_esc, mode),
+            Some(b"\x1b[27;3u".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_kitty_shift_enter_distinct_from_enter() {
+        let mode = TermMode::DISAMBIGUATE_ESC_CODES;
+
+        let enter = Keystroke::parse("enter").unwrap();
+        assert_eq!(keystroke_to_bytes(&enter, mode), Some(b"\r".to_vec()));
+
+        let shift_enter = Keystroke::parse("shift-enter").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&shift_enter, mode),
+            Some(b"\x1b[13;2u".to_vec())
+        );
+
+        let ctrl_enter = Keystroke::parse("ctrl-enter").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_enter, mode),
+            Some(b"\x1b[13;5u".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_kitty_modified_tab_backspace_space() {
+        let mode = TermMode::DISAMBIGUATE_ESC_CODES;
+
+        // Unmodified keep their legacy bytes.
+        let tab = Keystroke::parse("tab").unwrap();
+        assert_eq!(keystroke_to_bytes(&tab, mode), Some(b"\t".to_vec()));
+        let backspace = Keystroke::parse("backspace").unwrap();
+        assert_eq!(keystroke_to_bytes(&backspace, mode), Some(b"\x7f".to_vec()));
+
+        // Modified switch to CSI u.
+        let shift_tab = Keystroke::parse("shift-tab").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&shift_tab, mode),
+            Some(b"\x1b[9;2u".to_vec())
+        );
+        let ctrl_backspace = Keystroke::parse("ctrl-backspace").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_backspace, mode),
+            Some(b"\x1b[127;5u".to_vec())
+        );
+        let ctrl_space = Keystroke::parse("ctrl-space").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_space, mode),
+            Some(b"\x1b[32;5u".to_vec())
+        );
+        // Shift+Space still types a space.
+        let shift_space = Keystroke::parse("shift-space").unwrap();
+        assert_eq!(keystroke_to_bytes(&shift_space, mode), Some(b" ".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_ctrl_and_alt_printables() {
+        let mode = TermMode::DISAMBIGUATE_ESC_CODES;
+
+        // Ctrl+letter: CSI u on the lowercase codepoint instead of the
+        // control byte.
+        let ctrl_c = Keystroke::parse("ctrl-c").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_c, mode),
+            Some(b"\x1b[99;5u".to_vec())
+        );
+        let ctrl_b = Keystroke::parse("ctrl-b").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_b, mode),
+            Some(b"\x1b[98;5u".to_vec())
+        );
+        // Ctrl+[ no longer collides with Esc.
+        let ctrl_bracket = Keystroke::parse("ctrl-[").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_bracket, mode),
+            Some(b"\x1b[91;5u".to_vec())
+        );
+
+        // Alt+letter: CSI u instead of the ESC prefix.
+        let alt_a = Keystroke::parse("alt-a").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&alt_a, mode),
+            Some(b"\x1b[97;3u".to_vec())
+        );
+        let ctrl_alt_a = Keystroke::parse("ctrl-alt-a").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_alt_a, mode),
+            Some(b"\x1b[97;7u".to_vec())
+        );
+        let ctrl_shift_a = Keystroke::parse("ctrl-shift-a").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_shift_a, mode),
+            Some(b"\x1b[97;6u".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_kitty_plain_keys_and_arrows_stay_legacy() {
+        let mode = TermMode::DISAMBIGUATE_ESC_CODES;
+
+        let p = Keystroke::parse("p").unwrap();
+        assert_eq!(keystroke_to_bytes(&p, mode), Some(b"p".to_vec()));
+
+        let up = Keystroke::parse("up").unwrap();
+        assert_eq!(keystroke_to_bytes(&up, mode), Some(b"\x1b[A".to_vec()));
+
+        let ctrl_right = Keystroke::parse("ctrl-right").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_right, mode),
+            Some(b"\x1b[1;5C".to_vec())
+        );
+
+        let home = Keystroke::parse("home").unwrap();
+        assert_eq!(keystroke_to_bytes(&home, mode), Some(b"\x1b[H".to_vec()));
+
+        let f5 = Keystroke::parse("f5").unwrap();
+        assert_eq!(keystroke_to_bytes(&f5, mode), Some(b"\x1b[15~".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_report_all_keys_flag_is_masked() {
+        // herdr requests REPORT_ALL_KEYS_AS_ESC but cannot decode CSI u
+        // printables; the encoder must never honour it.
+        let mode = TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_ALL_KEYS_AS_ESC;
+
+        // Plain printables and Enter stay legacy so `Ctrl+B p` keeps working.
+        let p = Keystroke::parse("p").unwrap();
+        assert_eq!(keystroke_to_bytes(&p, mode), Some(b"p".to_vec()));
+        let enter = Keystroke::parse("enter").unwrap();
+        assert_eq!(keystroke_to_bytes(&enter, mode), Some(b"\r".to_vec()));
+        let tab = Keystroke::parse("tab").unwrap();
+        assert_eq!(keystroke_to_bytes(&tab, mode), Some(b"\t".to_vec()));
+
+        // Disambiguation itself still applies.
+        let esc = Keystroke::parse("escape").unwrap();
+        assert_eq!(keystroke_to_bytes(&esc, mode), Some(b"\x1b[27u".to_vec()));
+        let ctrl_b = Keystroke::parse("ctrl-b").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_b, mode),
+            Some(b"\x1b[98;5u".to_vec())
+        );
+
+        // The flag alone (no disambiguation negotiated) changes nothing.
+        let only_report_all = TermMode::REPORT_ALL_KEYS_AS_ESC;
+        assert_eq!(
+            keystroke_to_bytes(&esc, only_report_all),
+            Some(b"\x1b".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_b, only_report_all),
+            Some(vec![0x02])
+        );
     }
 }

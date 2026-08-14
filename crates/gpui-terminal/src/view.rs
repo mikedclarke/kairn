@@ -50,10 +50,12 @@
 use crate::colors::ColorPalette;
 use crate::event::{GpuiEventProxy, TerminalEvent};
 use crate::input::keystroke_to_bytes;
+use crate::links::{URL_REGEX, link_at_point};
 use crate::render::TerminalRenderer;
 use crate::terminal::TerminalState;
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
 use alacritty_terminal::term::TermMode;
+use alacritty_terminal::term::search::RegexSearch;
 use gpui::{Edges, *};
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -386,6 +388,10 @@ pub struct TerminalView {
     /// Writer for sending input to the terminal process
     stdin_writer: Arc<parking_lot::Mutex<Box<dyn Write + Send>>>,
 
+    /// Palette shared with the event proxy, which answers color queries
+    /// from it; kept in sync by `update_config`
+    shared_palette: Arc<parking_lot::Mutex<ColorPalette>>,
+
     /// Receiver for terminal events from the event proxy
     event_rx: mpsc::Receiver<TerminalEvent>,
 
@@ -429,6 +435,18 @@ pub struct TerminalView {
     /// Last grid cell a motion report was sent for, so drags report once per
     /// cell instead of once per pixel
     last_motion_cell: Option<AlacPoint>,
+
+    /// Link under the pointer while the platform modifier is held: its URI
+    /// and inclusive buffer-coordinate span, for underlining and opening
+    hovered_link: Option<(String, AlacPoint, AlacPoint)>,
+
+    /// Last pointer position over the terminal, so a modifier press without
+    /// movement can still resolve the link under the pointer
+    last_mouse_position: Option<Point<Pixels>>,
+
+    /// Compiled URL pattern for plain-text link detection, reused across
+    /// lookups (DFA construction is not free)
+    url_regex: RegexSearch,
 
     /// Focus listeners that forward focus in/out to applications that request
     /// reporting (CSI ?1004); registered on first render, when a Window exists
@@ -477,8 +495,20 @@ impl TerminalView {
         // Clone event_tx for the reader task to send Exit event when PTY closes
         let exit_event_tx = event_tx.clone();
 
+        // Wrap stdin writer in Arc<Mutex> for thread-safe access. Created
+        // before the event proxy so the proxy can answer terminal queries
+        // (cursor position, color queries) directly on the PTY.
+        let stdin_writer = Arc::new(parking_lot::Mutex::new(
+            Box::new(stdin_writer) as Box<dyn Write + Send>
+        ));
+
+        // The palette is shared with the proxy so color queries stay correct
+        // after runtime config updates.
+        let shared_palette = Arc::new(parking_lot::Mutex::new(config.colors.clone()));
+
         // Create event proxy for alacritty
-        let event_proxy = GpuiEventProxy::new(event_tx);
+        let event_proxy = GpuiEventProxy::new(event_tx)
+            .with_pty_responder(stdin_writer.clone(), shared_palette.clone());
 
         // Create terminal state
         let state = TerminalState::new(config.cols, config.rows, event_proxy);
@@ -493,11 +523,6 @@ impl TerminalView {
 
         // Create focus handle
         let focus_handle = cx.focus_handle();
-
-        // Wrap stdin writer in Arc<Mutex> for thread-safe access
-        let stdin_writer = Arc::new(parking_lot::Mutex::new(
-            Box::new(stdin_writer) as Box<dyn Write + Send>
-        ));
 
         // Create async channel for bytes (push-based notification)
         // Using flume instead of smol::channel because flume is executor-agnostic
@@ -545,6 +570,7 @@ impl TerminalView {
             renderer,
             focus_handle,
             stdin_writer,
+            shared_palette,
             event_rx,
             config,
             _reader_task: reader_task,
@@ -558,6 +584,9 @@ impl TerminalView {
             scroll_accum: 0.0,
             pressed_mouse_button: None,
             last_motion_cell: None,
+            hovered_link: None,
+            last_mouse_position: None,
+            url_regex: RegexSearch::new(URL_REGEX).expect("URL_REGEX compiles"),
             focus_subscriptions: Vec::new(),
         }
     }
@@ -826,6 +855,52 @@ impl TerminalView {
         ))
     }
 
+    /// The link under `position`, if any: an OSC 8 hyperlink carried by the
+    /// cell, or else a plain URL in the visible text. Returns the URI and the
+    /// inclusive buffer-coordinate span to underline.
+    fn link_at(&mut self, position: Point<Pixels>) -> Option<(String, AlacPoint, AlacPoint)> {
+        let viewport_point = self.grid_point(position)?;
+        let url_regex = &mut self.url_regex;
+        self.state.with_term(|term| {
+            // grid_point is viewport-relative; cells and searches use buffer
+            // coordinates, where the visible top row is -display_offset.
+            let display_offset = term.grid().display_offset() as i32;
+            let point = AlacPoint::new(
+                Line(viewport_point.line.0 - display_offset),
+                viewport_point.column,
+            );
+            link_at_point(term, point, url_regex)
+        })
+    }
+
+    /// Track the link under the pointer: underlined while the platform
+    /// modifier (Cmd on macOS, Ctrl elsewhere) is held over one.
+    fn update_hovered_link(
+        &mut self,
+        position: Point<Pixels>,
+        modifiers: &Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        let link = if modifiers.secondary() { self.link_at(position) } else { None };
+        if self.hovered_link != link {
+            self.hovered_link = link;
+            cx.notify();
+        }
+    }
+
+    /// Modifier changes re-resolve the hovered link in place, so pressing or
+    /// releasing the modifier updates the underline without pointer movement.
+    fn on_modifiers_changed(
+        &mut self,
+        event: &ModifiersChangedEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(position) = self.last_mouse_position {
+            self.update_hovered_link(position, &event.modifiers, cx);
+        }
+    }
+
     /// Handle mouse down events.
     ///
     /// Focuses the terminal, and forwards the press to the application as an
@@ -840,6 +915,16 @@ impl TerminalView {
         // Request focus when clicking the terminal
         window.focus(&self.focus_handle);
         cx.notify();
+
+        // Cmd+click (Ctrl+click outside macOS) opens the link under the
+        // pointer instead of reporting the press to the application.
+        if event.button == MouseButton::Left
+            && event.modifiers.secondary()
+            && let Some((uri, _, _)) = self.link_at(event.position)
+        {
+            cx.open_url(&uri);
+            return;
+        }
 
         let mode = self.state.mode();
         if !mode.intersects(TermMode::MOUSE_MODE) || event.modifiers.shift {
@@ -904,8 +989,11 @@ impl TerminalView {
         &mut self,
         event: &MouseMoveEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
+        self.last_mouse_position = Some(event.position);
+        self.update_hovered_link(event.position, &event.modifiers, cx);
+
         let mode = self.state.mode();
         if !mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION)
             || event.modifiers.shift
@@ -1077,6 +1165,8 @@ impl TerminalView {
         self.renderer.font_size = config.font_size;
         self.renderer.line_height_multiplier = config.line_height_multiplier;
         self.renderer.palette = config.colors.clone();
+        // Keep the event proxy's color-query palette in sync
+        *self.shared_palette.lock() = config.colors.clone();
         // Palette and metrics feed the cached layouts; start fresh
         self.renderer.invalidate_caches();
 
@@ -1133,10 +1223,15 @@ impl Render for TerminalView {
         let resize_callback = self.resize_callback.clone();
         let padding = self.config.padding;
         let last_layout = self.last_layout.clone();
+        let hover_link = self.hovered_link.as_ref().map(|(_, start, end)| (*start, *end));
 
         div()
             .size_full()
             .bg(rgb(0x1e1e1e))
+            // Named so embedders can scope key bindings to the terminal, and
+            // in particular disable ancestor bindings (focus-cycling Tab) that
+            // would otherwise consume keys before they reach the PTY.
+            .key_context("Terminal")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
@@ -1146,6 +1241,7 @@ impl Render for TerminalView {
             .on_mouse_up(MouseButton::Right, cx.listener(Self::on_mouse_up))
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .child(
                 canvas(
@@ -1222,7 +1318,15 @@ impl Render for TerminalView {
 
                         // Paint the terminal with measured dimensions
                         let gen_now = generation.load(std::sync::atomic::Ordering::Relaxed);
-                        measured_renderer.paint(bounds, padding, &term, gen_now, window, cx);
+                        measured_renderer.paint(
+                            bounds,
+                            padding,
+                            &term,
+                            gen_now,
+                            hover_link,
+                            window,
+                            cx,
+                        );
                     },
                 )
                 .size_full(),
@@ -1231,4 +1335,5 @@ impl Render for TerminalView {
 }
 
 // Tests are omitted due to macro expansion issues with the test attribute
-// in this configuration. Integration tests can be added separately.
+// in this configuration (the gpui glob import shadows #[test]). Logic that
+// wants tests lives in gpui-free modules; see links.rs.
