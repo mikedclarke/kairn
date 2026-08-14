@@ -78,16 +78,16 @@ pub struct Settings {
     /// Launch shortcuts that run on this machine, in the user's order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_apps: Vec<HostApp>,
-    /// Whether the sidebar shows the Agents activity section; hiding it
-    /// suits working fully remote over SSH, where local agent activity
-    /// stays empty.
-    #[serde(default = "default_true")]
+    /// Whether the sidebar shows the Agents activity section; hidden by
+    /// default (it stays empty until agents drive the CLI on this machine).
+    #[serde(default)]
     pub show_agents: bool,
-    /// Whether the sidebar shows the Daily / Weekly / Monthly buttons.
+    /// Whether the sidebar shows the calendar area: the mini calendar, the
+    /// timeline / Daily / Weekly / Monthly switcher, and the day timeline.
     #[serde(default = "default_true")]
     pub show_daily: bool,
-    /// Whether the sidebar shows the Tasks section.
-    #[serde(default = "default_true")]
+    /// Whether the sidebar shows the Tasks section; hidden by default.
+    #[serde(default)]
     pub show_tasks: bool,
     /// Direction of the retired three-day sidebar list. Kept so settings
     /// files that carry it still load; nothing reads it.
@@ -138,7 +138,7 @@ fn default_true() -> bool {
 }
 
 fn default_week_strip() -> String {
-    "off".to_string()
+    "daily".to_string()
 }
 
 fn default_template_rule() -> String {
@@ -158,9 +158,9 @@ impl Default for Settings {
             library_sort: default_library_sort(),
             ssh_hosts: Vec::new(),
             local_apps: Vec::new(),
-            show_agents: true,
+            show_agents: false,
             show_daily: true,
-            show_tasks: true,
+            show_tasks: false,
             daily_forward: true,
             sidebar_collapsed: Vec::new(),
             week_strip: default_week_strip(),
