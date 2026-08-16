@@ -495,12 +495,28 @@ impl TerminalView {
         // Clone event_tx for the reader task to send Exit event when PTY closes
         let exit_event_tx = event_tx.clone();
 
+        // Diagnostic byte tap on both PTY directions, inert unless
+        // KAIRN_PTY_LOG is set (see pty_log module docs).
+        let pty_logger = crate::pty_log::PtyLogger::from_env();
+        let stdin_writer: Box<dyn Write + Send> = match &pty_logger {
+            Some(logger) => Box::new(crate::pty_log::LoggingWriter::new(
+                stdin_writer,
+                logger.clone(),
+            )),
+            None => Box::new(stdin_writer),
+        };
+        let stdout_reader: Box<dyn Read + Send> = match &pty_logger {
+            Some(logger) => Box::new(crate::pty_log::LoggingReader::new(
+                stdout_reader,
+                logger.clone(),
+            )),
+            None => Box::new(stdout_reader),
+        };
+
         // Wrap stdin writer in Arc<Mutex> for thread-safe access. Created
         // before the event proxy so the proxy can answer terminal queries
         // (cursor position, color queries) directly on the PTY.
-        let stdin_writer = Arc::new(parking_lot::Mutex::new(
-            Box::new(stdin_writer) as Box<dyn Write + Send>
-        ));
+        let stdin_writer = Arc::new(parking_lot::Mutex::new(stdin_writer));
 
         // The palette is shared with the proxy so color queries stay correct
         // after runtime config updates.
