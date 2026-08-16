@@ -270,8 +270,8 @@ impl Workspace {
                 }
                 NoteEditorEvent::OpenDate(date) => this.select_day(*date, cx),
                 NoteEditorEvent::OpenUrl(url) => cx.open_url(url),
-                NoteEditorEvent::BlockDropped { range, position } => {
-                    this.on_block_dropped(range.clone(), *position, cx);
+                NoteEditorEvent::BlockDropped { ranges, position } => {
+                    this.on_block_dropped(ranges.clone(), *position, cx);
                 }
                 NoteEditorEvent::DragMoved { position } => {
                     this.on_drag_moved(*position, cx);
@@ -288,7 +288,7 @@ impl Workspace {
     /// at its top, and anywhere else the drag just ends.
     pub(crate) fn on_block_dropped(
         &mut self,
-        range: std::ops::Range<usize>,
+        ranges: Vec<std::ops::Range<usize>>,
         position: gpui::Point<gpui::Pixels>,
         cx: &mut Context<Self>,
     ) {
@@ -325,9 +325,9 @@ impl Workspace {
         self.hold = HoldState::Idle;
 
         if let Some((day, heading)) = menu_choice {
-            self.move_block_to_day(range, day, heading, cx);
+            self.move_blocks_to_day(&ranges, day, heading, cx);
         } else if let Some(day) = self.resolve_day_drop(position) {
-            self.move_block_to_day(range, day, None, cx);
+            self.move_blocks_to_day(&ranges, day, None, cx);
         }
         cx.notify();
     }
@@ -620,7 +620,7 @@ impl Workspace {
             if matches_grab {
                 let offset = line_start_offset(&text, drag.line_idx);
                 let range = notes::block_range(&text, offset);
-                self.move_block_to_day(range, day, None, cx);
+                self.move_blocks_to_day(&[range], day, None, cx);
             }
             return;
         }
@@ -634,7 +634,16 @@ impl Workspace {
         // lands on what's actually on screen.
         self.flush_note_editor(cx);
         match notes::replace_line_on_disk(&path, drag.line_idx, &drag.expected, &new_line) {
-            Ok(Some(_)) => self.note_self_write(&path),
+            Ok(Some(idx)) => {
+                self.note_self_write(&path);
+                self.vault_history.push(crate::history::VaultOp::Retime {
+                    ms: crate::note_editor::now_ms(),
+                    path,
+                    line_idx: idx,
+                    before: drag.expected.clone(),
+                    after: new_line,
+                });
+            }
             Ok(None) => {}
             Err(e) => eprintln!("kairn: could not update {}: {e}", path.display()),
         }
@@ -647,9 +656,9 @@ impl Workspace {
     /// vanished. The target's own day is an in-buffer move (one undo step);
     /// anything else inserts on disk first and removes from the buffer
     /// second, so a crash duplicates rather than loses.
-    fn move_block_to_day(
+    fn move_blocks_to_day(
         &mut self,
-        range: std::ops::Range<usize>,
+        ranges: &[std::ops::Range<usize>],
         day: NaiveDate,
         heading: Option<(usize, String)>,
         cx: &mut Context<Self>,
@@ -667,18 +676,24 @@ impl Workspace {
                     Some(line_start_offset(text, line))
                 })
                 .unwrap_or(0);
-            editor.update(cx, |ed, cx| ed.move_block_to(range, offset, cx));
+            editor.update(cx, |ed, cx| ed.move_blocks_to(ranges, offset, cx));
             return;
         }
 
-        let block = editor.read(cx).block_text(range.clone());
+        let block = editor.read(cx).blocks_text(ranges);
         if block.trim().is_empty() {
             return;
         }
+        let from_line_idx = editor.read(cx).first_block_line_idx(ranges);
+        let source = editor.read(cx).path.clone();
+        let mut to_line_idx = 0usize;
         let written = match heading {
             Some((idx, raw)) => {
                 match notes::insert_block_under_heading(&target, idx, &raw, &block) {
-                    Ok(Some(_)) => Ok(Some(target.clone())),
+                    Ok(Some(landed)) => {
+                        to_line_idx = landed;
+                        Ok(Some(target.clone()))
+                    }
                     // The heading (or the whole file) vanished or went
                     // ambiguous underneath the menu: land at the top rather
                     // than guessing.
@@ -702,11 +717,160 @@ impl Workspace {
         match written {
             Ok(path) => {
                 self.note_self_write(&path);
-                editor.update(cx, |ed, cx| ed.remove_block(range, cx));
+                editor.update(cx, |ed, cx| ed.remove_blocks_unrecorded(ranges, cx));
+                // Flush the removal now so the move history's disk-level
+                // inverses always see the source as it really is.
+                self.save_note_editor(cx);
+                self.vault_history.push(crate::history::VaultOp::Transfer {
+                    ms: crate::note_editor::now_ms(),
+                    from: source,
+                    to: path,
+                    block,
+                    from_line_idx,
+                    to_line_idx,
+                });
                 self.reload_notes(cx);
             }
             Err(e) => eprintln!("kairn: could not move block to {day}: {e}"),
         }
+    }
+
+    /// Take back the newest cross-note move or retime: both halves are disk
+    /// edits verified by content, so a vault that changed underneath (sync,
+    /// an agent, the other machine) makes the undo refuse quietly rather
+    /// than guess.
+    pub(crate) fn vault_undo(&mut self, cx: &mut Context<Self>) {
+        use crate::history::VaultOp;
+        let Some(op) = self.vault_history.pop_undo() else { return };
+        self.flush_note_editor(cx);
+        match op {
+            VaultOp::Transfer { ms, from, to, block, from_line_idx, to_line_idx } => {
+                match notes::remove_block_lines(&to, &block) {
+                    Ok(Some(_)) => {
+                        self.note_self_write(&to);
+                        match notes::insert_block_at_line(&from, from_line_idx, &block) {
+                            Ok(idx) => {
+                                self.note_self_write(&from);
+                                self.vault_history.push_undone(VaultOp::Transfer {
+                                    ms,
+                                    from,
+                                    to,
+                                    block,
+                                    from_line_idx: idx,
+                                    to_line_idx,
+                                });
+                            }
+                            Err(e) => {
+                                // Out of the target but not back in the
+                                // source: return it to the target rather
+                                // than losing text.
+                                eprintln!(
+                                    "kairn: undo could not restore into {}: {e}",
+                                    from.display()
+                                );
+                                let _ = notes::insert_block_at_line(&to, to_line_idx, &block);
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        eprintln!("kairn: undo skipped, the moved block changed on disk")
+                    }
+                    Err(e) => eprintln!("kairn: undo failed reading {}: {e}", to.display()),
+                }
+            }
+            VaultOp::Retime { ms, path, line_idx, before, after } => {
+                match notes::replace_line_on_disk(&path, line_idx, &after, &before) {
+                    Ok(Some(idx)) => {
+                        self.note_self_write(&path);
+                        self.vault_history.push_undone(VaultOp::Retime {
+                            ms,
+                            path,
+                            line_idx: idx,
+                            before,
+                            after,
+                        });
+                    }
+                    Ok(None) => {
+                        eprintln!("kairn: undo skipped, the line changed on disk")
+                    }
+                    Err(e) => eprintln!("kairn: undo failed on {}: {e}", path.display()),
+                }
+            }
+        }
+        self.finish_vault_op(cx);
+    }
+
+    /// Re-apply the most recently undone vault op, with the same
+    /// verification contract as [`Self::vault_undo`].
+    pub(crate) fn vault_redo(&mut self, cx: &mut Context<Self>) {
+        use crate::history::VaultOp;
+        let Some(op) = self.vault_history.pop_redo() else { return };
+        self.flush_note_editor(cx);
+        match op {
+            VaultOp::Transfer { ms, from, to, block, from_line_idx, to_line_idx } => {
+                match notes::remove_block_lines(&from, &block) {
+                    Ok(Some(idx)) => {
+                        self.note_self_write(&from);
+                        match notes::insert_block_at_line(&to, to_line_idx, &block) {
+                            Ok(landed) => {
+                                self.note_self_write(&to);
+                                self.vault_history.push_redone(VaultOp::Transfer {
+                                    ms,
+                                    from,
+                                    to,
+                                    block,
+                                    from_line_idx: idx,
+                                    to_line_idx: landed,
+                                });
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "kairn: redo could not insert into {}: {e}",
+                                    to.display()
+                                );
+                                let _ =
+                                    notes::insert_block_at_line(&from, from_line_idx, &block);
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        eprintln!("kairn: redo skipped, the moved block changed on disk")
+                    }
+                    Err(e) => eprintln!("kairn: redo failed reading {}: {e}", from.display()),
+                }
+            }
+            VaultOp::Retime { ms, path, line_idx, before, after } => {
+                match notes::replace_line_on_disk(&path, line_idx, &before, &after) {
+                    Ok(Some(idx)) => {
+                        self.note_self_write(&path);
+                        self.vault_history.push_redone(VaultOp::Retime {
+                            ms,
+                            path,
+                            line_idx: idx,
+                            before,
+                            after,
+                        });
+                    }
+                    Ok(None) => {
+                        eprintln!("kairn: redo skipped, the line changed on disk")
+                    }
+                    Err(e) => eprintln!("kairn: redo failed on {}: {e}", path.display()),
+                }
+            }
+        }
+        self.finish_vault_op(cx);
+    }
+
+    /// Shared tail of a vault-level undo/redo: fold the disk changes back
+    /// into the open editor, then drop the merge-absorption record the
+    /// reconcile just pushed; the vault history owns that change, and a
+    /// buffer undo re-reverting the merge would strand the moved text.
+    fn finish_vault_op(&mut self, cx: &mut Context<Self>) {
+        self.reload_notes(cx);
+        if let Some(editor) = &self.note_editor {
+            editor.update(cx, |ed, _| ed.drop_merge_undo());
+        }
+        cx.notify();
     }
 
     pub fn notes_expanded_contains(&self, path: &std::path::Path) -> bool {

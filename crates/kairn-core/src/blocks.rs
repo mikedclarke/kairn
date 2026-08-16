@@ -51,6 +51,35 @@ pub fn block_range(text: &str, at: usize) -> Range<usize> {
     start..end
 }
 
+/// The draggable blocks a text selection touches: for each selected line
+/// not already inside an earlier block, its [`block_range`] (so children
+/// travel with their parent even when the selection ends above them).
+/// Blank lines are skipped; the result is non-overlapping, in document
+/// order. A caret (empty selection) or a selection over nothing but blanks
+/// yields nothing.
+pub fn selection_block_ranges(text: &str, sel: Range<usize>) -> Vec<Range<usize>> {
+    let start = sel.start.min(sel.end).min(text.len());
+    let end = sel.start.max(sel.end).min(text.len());
+    if start == end {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
+    // A selection ending exactly at a line start (triple-click style) does
+    // not include that line.
+    while line_start < end {
+        let line_end = text[line_start..].find('\n').map_or(text.len(), |i| line_start + i);
+        if text[line_start..line_end].trim().is_empty() {
+            line_start = line_end + 1;
+            continue;
+        }
+        let block = block_range(text, line_start);
+        line_start = block.end + 1;
+        ranges.push(block);
+    }
+    ranges
+}
+
 /// A heading of a note, addressed for section-targeted drops.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeadingRef {
@@ -186,6 +215,58 @@ mod tests {
         let text = "\t* one\n\t\tsub\n\t* two\n";
         let range = block_range(text, 1);
         assert_eq!(&text[range], "\t* one\n\t\tsub");
+    }
+
+    #[test]
+    fn selection_blocks_split_at_siblings_and_keep_children() {
+        let text = "* one\n\tsub\n* two\n* three\nrest\n";
+        // Selection from inside "one" to inside "two": both blocks, the
+        // child riding with its parent.
+        let ranges = selection_block_ranges(text, 2..13);
+        let blocks: Vec<&str> = ranges.iter().map(|r| &text[r.clone()]).collect();
+        assert_eq!(blocks, vec!["* one\n\tsub", "* two"]);
+    }
+
+    #[test]
+    fn selection_blocks_skip_blank_lines() {
+        let text = "* a\n\n* b\n";
+        let ranges = selection_block_ranges(text, 0..8);
+        let blocks: Vec<&str> = ranges.iter().map(|r| &text[r.clone()]).collect();
+        assert_eq!(blocks, vec!["* a", "* b"]);
+    }
+
+    #[test]
+    fn selection_ending_at_a_line_start_excludes_that_line() {
+        // Triple-click of "* a" selects through its newline; "* b" stays out.
+        let text = "* a\n* b\n";
+        let ranges = selection_block_ranges(text, 0..4);
+        assert_eq!(ranges, vec![0..3]);
+    }
+
+    #[test]
+    fn selection_children_extend_past_the_selection_end() {
+        let text = "* a\n\tone\n\ttwo\nnext\n";
+        // Selection stops inside the parent line; the whole block comes.
+        let ranges = selection_block_ranges(text, 0..2);
+        assert_eq!(&text[ranges[0].clone()], "* a\n\tone\n\ttwo");
+        assert_eq!(ranges.len(), 1);
+    }
+
+    #[test]
+    fn caret_or_blank_selection_yields_nothing() {
+        let text = "* a\n\n* b\n";
+        assert!(selection_block_ranges(text, 2..2).is_empty());
+        assert!(selection_block_ranges(text, 4..5).is_empty());
+    }
+
+    #[test]
+    fn selection_starting_mid_child_takes_sibling_children_separately() {
+        let text = "* a\n\tone\n\ttwo\nz\n";
+        // From inside "\tone" to the end: the equal-depth children are
+        // their own blocks, then "z".
+        let ranges = selection_block_ranges(text, 5..15);
+        let blocks: Vec<&str> = ranges.iter().map(|r| &text[r.clone()]).collect();
+        assert_eq!(blocks, vec!["\tone", "\ttwo", "z"]);
     }
 
     #[test]

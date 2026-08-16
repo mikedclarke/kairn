@@ -142,8 +142,21 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("right", EditorRight, Some("NoteEditor")),
         KeyBinding::new("up", EditorUp, Some("NoteEditor")),
         KeyBinding::new("down", EditorDown, Some("NoteEditor")),
-        KeyBinding::new(&p("z"), EditorUndo, Some("NoteEditor")),
-        KeyBinding::new(&p("shift-z"), EditorRedo, Some("NoteEditor")),
+        // Undo/redo live in the Workspace context, not the editor's: the
+        // workspace coordinates buffer undo with its cross-note move
+        // history, and the chord must work right after a mouse drag, when
+        // nothing keyboard-focused holds the editor context. Text inputs
+        // keep their own undo (gpui-component binds it in the deeper Input
+        // context, which wins).
+        KeyBinding::new(&p("z"), EditorUndo, Some("Workspace")),
+        // Redo: on Linux the undo chord already carries Shift
+        // (Ctrl+Shift+Z), so redo takes Ctrl+Shift+Y; `p("shift-z")` would
+        // collide with undo there.
+        KeyBinding::new(
+            if cfg!(target_os = "macos") { "cmd-shift-z" } else { "ctrl-shift-y" },
+            EditorRedo,
+            Some("Workspace"),
+        ),
         KeyBinding::new(&p("v"), EditorPaste, Some("NoteEditor")),
         KeyBinding::new(&p("c"), EditorCopy, Some("NoteEditor")),
         KeyBinding::new(&p("x"), EditorCut, Some("NoteEditor")),
@@ -229,8 +242,15 @@ pub fn keybind_list() -> Vec<(&'static str, Vec<(String, &'static str)>)> {
             "Notes",
             vec![
                 (chord("S"), "Save the open note now"),
-                (chord("Z"), "Undo"),
-                (chord_shift("Z"), "Redo"),
+                (chord("Z"), "Undo (edits and task moves)"),
+                (
+                    if cfg!(target_os = "macos") {
+                        chord_shift("Z")
+                    } else {
+                        "Ctrl+Shift+Y".to_string()
+                    },
+                    "Redo",
+                ),
                 (chord("C"), "Copy"),
                 (chord("X"), "Cut"),
                 (chord("V"), "Paste"),

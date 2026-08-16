@@ -1,5 +1,6 @@
 mod chrome;
 mod cli_install;
+mod history;
 mod keymap;
 mod name_dialog;
 mod note_editor;

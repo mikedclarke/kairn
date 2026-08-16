@@ -241,6 +241,10 @@ pub struct Workspace {
     /// Hold-for-heading state: dwelling a drag on a day target for a moment
     /// opens a menu of that day's headings to drop under.
     pub(crate) hold: HoldState,
+    /// Structural undo: cross-note moves and timeline retimes, which the
+    /// note buffer's own undo cannot represent. The undo chord orders these
+    /// against buffer steps by timestamp.
+    pub(crate) vault_history: crate::history::VaultHistory,
     /// The sidebar scroll position, tracked so synthesized momentum can
     /// keep it moving after a touchpad flick (see `sidebar_flick`).
     pub(crate) sidebar_scroll: gpui::ScrollHandle,
@@ -397,6 +401,7 @@ impl Workspace {
             sidebar_flick_samples: std::collections::VecDeque::new(),
             _sidebar_kinetic_task: None,
             hold: HoldState::Idle,
+            vault_history: Default::default(),
             _activity_timer: activity_timer,
             _notes_watcher: notes_watcher,
             _notes_watch_task: notes_watch_task,
@@ -683,6 +688,49 @@ impl Workspace {
         cx.quit();
     }
 
+    /// The undo chord, owned here rather than by the editor: whichever
+    /// changed the vault most recently is what gets taken back, a buffer
+    /// step (typing, an in-note reorder) or a structural op (a block moved
+    /// to another day, a timeline retime). Text inputs bind their own undo
+    /// in a deeper context and never reach this.
+    fn on_undo(&mut self, _: &EditorUndo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_view.is_some() {
+            return;
+        }
+        let buffer_ms = self.note_editor.as_ref().and_then(|e| e.read(cx).last_undo_ms());
+        let vault_ms = self.vault_history.last_undo_ms();
+        let structural = match (buffer_ms, vault_ms) {
+            (Some(b), Some(v)) => v > b,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if structural {
+            self.vault_undo(cx);
+        } else if let Some(editor) = &self.note_editor {
+            editor.update(cx, |ed, cx| ed.undo(cx));
+        }
+    }
+
+    /// Redo mirrors undo: steps were undone newest-first across both
+    /// histories, so they re-apply oldest-first.
+    fn on_redo(&mut self, _: &EditorRedo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_view.is_some() {
+            return;
+        }
+        let buffer_ms = self.note_editor.as_ref().and_then(|e| e.read(cx).last_redo_ms());
+        let vault_ms = self.vault_history.last_redo_ms();
+        let structural = match (buffer_ms, vault_ms) {
+            (Some(b), Some(v)) => v < b,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if structural {
+            self.vault_redo(cx);
+        } else if let Some(editor) = &self.note_editor {
+            editor.update(cx, |ed, cx| ed.redo(cx));
+        }
+    }
+
     fn on_activate_nth(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.activate_session(n, window, cx);
     }
@@ -785,6 +833,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_capture))
             .on_action(cx.listener(Self::on_save_note))
+            .on_action(cx.listener(Self::on_undo))
+            .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::on_new_local_session))
             .on_action(cx.listener(Self::on_quit))
             .on_action(cx.listener(|this, _: &Session1, w, cx| this.on_activate_nth(0, w, cx)))

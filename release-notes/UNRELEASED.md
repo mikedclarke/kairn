@@ -14,6 +14,10 @@ same fact twice; no em dashes. Rewrite to this standard before releasing.
 
 A clock tab on the calendar switcher opens a day timeline in the sidebar: the day's timed tasks appear as blocks that drag to a new time, resize from the bottom edge to change length, and drop onto a calendar day to move there.
 
+Select several tasks and drag any handle inside the selection to move them all at once: within the note, onto a calendar day, or into a section via the hold menu.
+
+Undo now covers moves: Cmd+Z (Ctrl+Shift+Z on Linux) takes back a drag to another day, an in-note reorder, or a timeline retime, and Cmd+Shift+Z (Ctrl+Shift+Y on Linux) re-applies it.
+
 Every layout has a direct keyboard shortcut in switcher order: Cmd+Option+1 to 4 on macOS, Ctrl+Alt+1 to 4 on Linux.
 
 Titlebar controls show a hover tooltip naming the control with its keyboard shortcut beneath, so shortcuts are learnable from the UI.
