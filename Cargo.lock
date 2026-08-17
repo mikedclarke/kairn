@@ -3446,7 +3446,7 @@ dependencies = [
 
 [[package]]
 name = "kairn-app"
-version = "0.2.7"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3459,11 +3459,12 @@ dependencies = [
  "notify 8.2.0",
  "parking_lot",
  "portable-pty",
+ "serde_json",
 ]
 
 [[package]]
 name = "kairn-bridge"
-version = "0.2.7"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3474,7 +3475,7 @@ dependencies = [
 
 [[package]]
 name = "kairn-cli"
-version = "0.2.7"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3486,7 +3487,7 @@ dependencies = [
 
 [[package]]
 name = "kairn-core"
-version = "0.2.7"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3496,7 +3497,7 @@ dependencies = [
 
 [[package]]
 name = "kairn-ffi"
-version = "0.2.7"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "kairn-core",
@@ -3506,7 +3507,7 @@ dependencies = [
 
 [[package]]
 name = "kairn-sync"
-version = "0.2.7"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "blake3",
