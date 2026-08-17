@@ -31,11 +31,10 @@ use notes::{Line, NoteBuffer, SpanKind, TaskState};
 use crate::keymap::{
     EditorBackspace, EditorCopy, EditorCut, EditorDelete, EditorDeleteToLineStart,
     EditorDeleteWordBack, EditorDocEnd, EditorDocStart, EditorDown, EditorEnter, EditorLeft,
-    EditorLineEnd, EditorLineStart, EditorPaste, EditorRedo, EditorRight, EditorSelectAll,
+    EditorLineEnd, EditorLineStart, EditorPaste, EditorRight, EditorSelectAll,
     EditorSelectDocEnd, EditorSelectDocStart, EditorSelectDown, EditorSelectLeft,
     EditorSelectLineEnd, EditorSelectLineStart, EditorSelectRight, EditorSelectUp,
-    EditorSelectWordLeft, EditorSelectWordRight, EditorUndo, EditorUp, EditorWordLeft,
-    EditorWordRight,
+    EditorSelectWordLeft, EditorSelectWordRight, EditorUp, EditorWordLeft, EditorWordRight,
 };
 use crate::theme::{self, KairnTheme, KairnThemeExt as _};
 
@@ -61,8 +60,8 @@ pub enum NoteEditorEvent {
     OpenDate(chrono::NaiveDate),
     OpenUrl(String),
     /// A line drag was released outside the editor; the workspace moves the
-    /// block if the pointer sat on a day drop target.
-    BlockDropped { range: Range<usize>, position: Point<Pixels> },
+    /// blocks if the pointer sat on a day drop target.
+    BlockDropped { ranges: Vec<Range<usize>>, position: Point<Pixels> },
     /// A moved line drag's pointer position, every move: the workspace's
     /// hold-menu state machine ticks on these.
     DragMoved { position: Point<Pixels> },
@@ -137,9 +136,14 @@ impl LineSlot {
 }
 
 struct LineDrag {
-    /// Byte range of the dragged block at mouse down: the grabbed line plus
-    /// its deeper-indented run (`block_range`), final newline excluded.
-    range: Range<usize>,
+    /// Byte ranges of the dragged blocks at mouse down, in document order:
+    /// each the grabbed line plus its deeper-indented run (`block_range`),
+    /// final newline excluded. One entry for a plain grab; several when the
+    /// grab landed inside a multi-line selection, which then travels whole.
+    ranges: Vec<Range<usize>>,
+    /// Line-start offset of the line the grab actually landed on, for the
+    /// released-in-place click behaviours (toggle, cursor placement).
+    anchor: usize,
     origin: Point<Pixels>,
     /// Where the pointer is now, window coordinates: the workspace reads it
     /// to place the drag ghost and light up day drop targets.
@@ -197,7 +201,7 @@ impl ShapeCache {
     const CAPACITY: usize = 8192;
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -894,17 +898,39 @@ impl NoteEditor {
         self.after_cursor_move(cx);
     }
 
-    fn on_undo(&mut self, _: &EditorUndo, _: &mut Window, cx: &mut Context<Self>) {
+    /// Undo the buffer's most recent step. Called by the workspace, which
+    /// owns the undo chord and orders buffer steps against its own
+    /// cross-note move history.
+    pub fn undo(&mut self, cx: &mut Context<Self>) {
         if let Some(cursor) = self.buffer.undo() {
             self.cursor = cursor;
             self.after_edit(cx);
         }
     }
 
-    fn on_redo(&mut self, _: &EditorRedo, _: &mut Window, cx: &mut Context<Self>) {
+    pub fn redo(&mut self, cx: &mut Context<Self>) {
         if let Some(cursor) = self.buffer.redo() {
             self.cursor = cursor;
             self.after_edit(cx);
+        }
+    }
+
+    pub fn last_undo_ms(&self) -> Option<u64> {
+        self.buffer.last_undo_ms()
+    }
+
+    pub fn last_redo_ms(&self) -> Option<u64> {
+        self.buffer.last_redo_ms()
+    }
+
+    /// Forget a merge-absorption undo record (merge groups carry timestamp
+    /// 0) sitting on top of the stack. Called after a vault-level undo or
+    /// redo rewrote this note's file: the vault history owns that change,
+    /// and a buffer undo re-reverting the absorbed merge would strand the
+    /// text the vault op just placed.
+    pub fn drop_merge_undo(&mut self) {
+        if self.buffer.last_undo_ms() == Some(0) {
+            self.buffer.drop_last_undo();
         }
     }
 
@@ -1070,7 +1096,8 @@ impl NoteEditor {
         match click {
             Click::Handle { line_start } => {
                 self.line_drag = Some(LineDrag {
-                    range: notes::block_range(self.text(), line_start),
+                    ranges: self.drag_ranges_for(line_start),
+                    anchor: line_start,
                     origin: event.position,
                     position: event.position,
                     moved: false,
@@ -1081,7 +1108,8 @@ impl NoteEditor {
             }
             Click::Glyph { line_start, toggles } => {
                 self.line_drag = Some(LineDrag {
-                    range: notes::block_range(self.text(), line_start),
+                    ranges: self.drag_ranges_for(line_start),
+                    anchor: line_start,
                     origin: event.position,
                     position: event.position,
                     moved: false,
@@ -1123,6 +1151,27 @@ impl NoteEditor {
                 }
             }
         }
+    }
+
+    /// What a grab on `line_start` picks up: when the line sits inside a
+    /// multi-line selection, every block the selection touches travels as
+    /// one drag; otherwise just the line's own block.
+    fn drag_ranges_for(&self, line_start: usize) -> Vec<Range<usize>> {
+        let own_block = notes::block_range(self.text(), line_start);
+        if let Some(sel) = self.selection() {
+            let multi_line = self.text()[sel.clone()].contains('\n');
+            let line_end = self.text()[line_start..]
+                .find('\n')
+                .map_or(self.text().len(), |i| line_start + i);
+            let grabbed_selected = sel.start < line_end + 1 && sel.end > line_start;
+            if multi_line && grabbed_selected {
+                let ranges = notes::selection_block_ranges(self.text(), sel);
+                if !ranges.is_empty() {
+                    return ranges;
+                }
+            }
+        }
+        vec![own_block]
     }
 
     /// Window-level mouse move while the primary button is down: extends a
@@ -1173,27 +1222,31 @@ impl NoteEditor {
                     // A handle press-and-release does nothing: the handle is
                     // purely a grab point.
                 } else if drag.toggles {
-                    let line = self.line_range_at(drag.range.start);
+                    let line = self.line_range_at(drag.anchor);
                     self.toggle_task_in(line, cx);
                 } else {
                     // A glyph without a toggle (bullet, scheduled or
                     // cancelled task): the click still lands the cursor at
                     // the line's content instead of dying.
-                    let line = self.line_range_at(drag.range.start);
+                    let line = self.line_range_at(drag.anchor);
                     let target = self.hidden_marker_end(&line).unwrap_or(line.start);
                     window.focus(&self.focus_handle);
                     self.move_cursor_to(target, false, cx);
                 }
             } else if let Some(target) = drag.target {
+                // A completed drop focuses the editor, so undo lands here
+                // without an extra click.
+                window.focus(&self.focus_handle);
                 let new_start =
-                    self.buffer.move_block(drag.range, target, self.cursor, now_ms());
+                    self.buffer.move_blocks(&drag.ranges, target, self.cursor, now_ms());
                 self.cursor = new_start;
                 self.after_edit(cx);
             } else {
                 // Released outside the editor: the workspace decides whether
                 // the pointer was over a day drop target.
+                window.focus(&self.focus_handle);
                 cx.emit(NoteEditorEvent::BlockDropped {
-                    range: drag.range,
+                    ranges: drag.ranges,
                     position: drag.position,
                 });
             }
@@ -1330,19 +1383,25 @@ impl NoteEditor {
         self.after_edit(cx);
     }
 
-    /// The in-flight line drag, once it has actually moved: the block's
-    /// first line, how many further lines travel with it, and the pointer's
-    /// window position. The workspace reads this to draw the drag ghost and
-    /// light day drop targets.
+    /// The in-flight line drag, once it has actually moved: the first
+    /// block's first line, how many further lines travel with it (across
+    /// every dragged block), and the pointer's window position. The
+    /// workspace reads this to draw the drag ghost and light day drop
+    /// targets.
     pub fn line_drag(&self) -> Option<(String, usize, Point<Pixels>)> {
         let drag = self.line_drag.as_ref()?;
         if !drag.moved {
             return None;
         }
-        let block = &self.text()[drag.range.clone()];
-        let mut lines = block.split('\n');
-        let first = lines.next().unwrap_or("").to_string();
-        Some((first, lines.count(), drag.position))
+        let total: usize = drag
+            .ranges
+            .iter()
+            .map(|r| self.block_text(r.clone()).split('\n').count())
+            .sum();
+        let first_range = drag.ranges.first()?.clone();
+        let block = self.block_text(first_range);
+        let first = block.split('\n').next().unwrap_or("").to_string();
+        Some((first, total.saturating_sub(1), drag.position))
     }
 
     /// The text of a block the editor reported dropped, for the workspace's
@@ -1352,34 +1411,53 @@ impl NoteEditor {
         self.text()[range.start.min(len)..range.end.min(len)].to_string()
     }
 
+    /// The dropped blocks' texts joined into the one block a cross-note
+    /// move inserts, in document order.
+    pub fn blocks_text(&self, ranges: &[Range<usize>]) -> String {
+        let parts: Vec<String> =
+            ranges.iter().map(|r| self.block_text(r.clone())).collect();
+        parts.join("\n")
+    }
+
+    /// Line index (in the buffer's text) of the first dropped block, for
+    /// the workspace's move history to know where an undo should put the
+    /// block back.
+    pub fn first_block_line_idx(&self, ranges: &[Range<usize>]) -> usize {
+        let at = ranges.first().map_or(0, |r| r.start).min(self.text().len());
+        self.text()[..at].matches('\n').count()
+    }
+
     /// The buffer's current text: the live document, ahead of whatever the
     /// autosave has flushed to disk.
     pub fn doc(&self) -> &str {
         self.text()
     }
 
-    /// Remove a dropped block from this note (the source half of a move to
-    /// another day), together with the newline that separated it from its
-    /// neighbours. One undoable step.
-    pub fn remove_block(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
-        let len = self.text().len();
-        let mut start = range.start.min(len);
-        let mut end = range.end.min(len).max(start);
-        if end < len {
-            end += 1;
-        } else {
-            // The block ends the file: take the preceding newline so the
-            // remaining last line keeps the no-trailing-newline convention.
-            start = start.saturating_sub(1);
+    /// Remove dropped blocks from this note (the source half of a move to
+    /// another day), each with the newline that separated it from its
+    /// neighbours. The buffer keeps no undo record: the workspace's move
+    /// history owns the whole cross-note move, and a buffer-level undo here
+    /// would resurrect the block while the copy in the target day survived.
+    pub fn remove_blocks_unrecorded(&mut self, ranges: &[Range<usize>], cx: &mut Context<Self>) {
+        let len_before = self.text().len();
+        self.cursor = self.buffer.remove_blocks(ranges, self.cursor, now_ms());
+        // A removal that did nothing recorded nothing; only a real one may
+        // drop its record.
+        if self.text().len() != len_before {
+            self.buffer.drop_last_undo();
         }
-        self.cursor = self.buffer.edit(start..end, "", self.cursor, now_ms());
         self.after_edit(cx);
     }
 
-    /// Move a block within this note to the line boundary `target` (the
+    /// Move blocks within this note to the line boundary `target` (the
     /// in-buffer half of a drop on the note's own day). One undoable step.
-    pub fn move_block_to(&mut self, range: Range<usize>, target: usize, cx: &mut Context<Self>) {
-        self.cursor = self.buffer.move_block(range, target, self.cursor, now_ms());
+    pub fn move_blocks_to(
+        &mut self,
+        ranges: &[Range<usize>],
+        target: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.cursor = self.buffer.move_blocks(ranges, target, self.cursor, now_ms());
         self.after_edit(cx);
     }
 
@@ -1587,8 +1665,6 @@ impl Render for NoteEditor {
             .on_action(cx.listener(Self::on_right))
             .on_action(cx.listener(Self::on_up))
             .on_action(cx.listener(Self::on_down))
-            .on_action(cx.listener(Self::on_undo))
-            .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::on_paste))
             .on_action(cx.listener(Self::on_copy))
             .on_action(cx.listener(Self::on_cut))
@@ -1904,7 +1980,9 @@ fn kind_style(line: &Line, t: &KairnTheme) -> (KindStyle, Glyph) {
 fn span_style(kind: SpanKind, base: Hsla, t: &KairnTheme) -> (Hsla, Option<Hsla>, FontWeight, FontStyle) {
     match kind {
         SpanKind::Text => (base, None, FontWeight::NORMAL, FontStyle::Normal),
-        SpanKind::WikiLink | SpanKind::Link | SpanKind::Url => {
+        // Times take the link colour but stay inert: no click target ever
+        // attaches to them.
+        SpanKind::WikiLink | SpanKind::Link | SpanKind::Url | SpanKind::Time => {
             (t.accent, None, FontWeight::NORMAL, FontStyle::Normal)
         }
         SpanKind::Tag | SpanKind::DateRef => (t.amber, None, FontWeight::NORMAL, FontStyle::Normal),
@@ -2299,7 +2377,7 @@ impl Element for NoteEditorElement {
                 selection,
                 text,
                 ed.line_drag.as_ref().filter(|d| d.moved).and_then(|d| d.target),
-                ed.line_drag.as_ref().filter(|d| d.moved).map(|d| d.range.clone()),
+                ed.line_drag.as_ref().filter(|d| d.moved).map(|d| d.ranges.clone()),
                 ed.hover_handle_slot(),
             )
         };
@@ -2552,28 +2630,34 @@ impl Element for NoteEditorElement {
             }
         }
 
-        // The dragged block lifts (dims) while a line drag is in flight, so
-        // it reads as picked up rather than duplicated by the ghost.
-        if let Some(lifted) = &drag_lifted {
-            let mut span: Option<(Pixels, Pixels)> = None;
-            for slot in &layout.slots {
-                if slot.raw_start >= lifted.start && slot.raw_start < lifted.end.max(lifted.start + 1) {
-                    let top = bounds.origin.y + slot.y;
-                    let bottom = top + slot.height;
-                    span = Some(match span {
-                        Some((t0, b0)) => (t0.min(top), b0.max(bottom)),
-                        None => (top, bottom),
-                    });
+        // The dragged blocks lift (dim) while a line drag is in flight, so
+        // they read as picked up rather than duplicated by the ghost. Each
+        // block dims separately: a multi-select drag may carry disjoint
+        // runs.
+        if let Some(lifted_ranges) = &drag_lifted {
+            for lifted in lifted_ranges {
+                let mut span: Option<(Pixels, Pixels)> = None;
+                for slot in &layout.slots {
+                    if slot.raw_start >= lifted.start
+                        && slot.raw_start < lifted.end.max(lifted.start + 1)
+                    {
+                        let top = bounds.origin.y + slot.y;
+                        let bottom = top + slot.height;
+                        span = Some(match span {
+                            Some((t0, b0)) => (t0.min(top), b0.max(bottom)),
+                            None => (top, bottom),
+                        });
+                    }
                 }
-            }
-            if let Some((top, bottom)) = span {
-                window.paint_quad(fill(
-                    Bounds::new(
-                        point(bounds.origin.x, top),
-                        size(bounds.size.width, bottom - top),
-                    ),
-                    t.bg.opacity(0.65),
-                ));
+                if let Some((top, bottom)) = span {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(bounds.origin.x, top),
+                            size(bounds.size.width, bottom - top),
+                        ),
+                        t.bg.opacity(0.65),
+                    ));
+                }
             }
         }
 

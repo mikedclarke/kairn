@@ -178,6 +178,26 @@ impl NoteBuffer {
         }
     }
 
+    /// Timestamp of the most recent undo step, `None` when the stack is
+    /// empty. A history above the buffer (the workspace's cross-file move
+    /// stack) orders its own entries against these.
+    pub fn last_undo_ms(&self) -> Option<u64> {
+        self.undo.last().map(|g| g.last_ms)
+    }
+
+    /// Timestamp of the most recently undone step (the next redo), `None`
+    /// when there is nothing to redo.
+    pub fn last_redo_ms(&self) -> Option<u64> {
+        self.redo.last().map(|g| g.last_ms)
+    }
+
+    /// Discard the most recent undo step without applying it: for an edit
+    /// whose undo a higher-level history owns (the buffer half of a
+    /// cross-file move). The text keeps the edit; only the record goes.
+    pub fn drop_last_undo(&mut self) {
+        self.undo.pop();
+    }
+
     /// Undo the most recent group. Returns the cursor position to restore,
     /// `None` if there was nothing to undo.
     pub fn undo(&mut self) -> Option<usize> {
@@ -274,33 +294,7 @@ impl NoteBuffer {
             new_text.push('\n');
         }
         let new_start: usize = lines.iter().take(dst).map(|l| l.len() + 1).sum();
-
-        // Reordering never changes the length; apply just the region that
-        // moved as a single op so undo restores it in one step.
-        let len = self.text.len();
-        let mut prefix =
-            self.text.bytes().zip(new_text.bytes()).take_while(|(a, b)| a == b).count();
-        while !self.text.is_char_boundary(prefix) {
-            prefix -= 1;
-        }
-        let mut suffix = self
-            .text
-            .bytes()
-            .rev()
-            .zip(new_text.bytes().rev())
-            .take_while(|(a, b)| a == b)
-            .count()
-            .min(len - prefix);
-        while !self.text.is_char_boundary(len - suffix) {
-            suffix -= 1;
-        }
-        self.edit_with_kind(
-            prefix..len - suffix,
-            &new_text[prefix..new_text.len() - suffix],
-            cursor_before,
-            now_ms,
-            GroupKind::Other,
-        );
+        self.apply_rewrite(&new_text, cursor_before, now_ms);
         new_start
     }
 
@@ -349,13 +343,125 @@ impl NoteBuffer {
             new_text.push('\n');
         }
         let new_start: usize = lines.iter().take(dst).map(|l| l.len() + 1).sum();
+        self.apply_rewrite(&new_text, cursor_before, now_ms);
+        new_start
+    }
 
-        // Reordering never changes the length; apply just the region that
-        // moved as a single op so undo restores it in one step.
-        let len = self.text.len();
-        let mut prefix =
-            self.text.bytes().zip(new_text.bytes()).take_while(|(a, b)| a == b).count();
-        while !self.text.is_char_boundary(prefix) {
+    /// Move several whole-line blocks (each range spanning first line start
+    /// to last line end as [`crate::block_range`] returns, non-overlapping,
+    /// in document order) so they sit together at the line boundary `target`
+    /// (a line-start offset, or the text length for the end), keeping their
+    /// document order. One undoable step; a move that changes nothing
+    /// records nothing. Returns the byte offset the first moved block starts
+    /// at afterwards.
+    pub fn move_blocks(
+        &mut self,
+        ranges: &[Range<usize>],
+        target: usize,
+        cursor_before: usize,
+        now_ms: u64,
+    ) -> usize {
+        match ranges {
+            [] => return floor_boundary(&self.text, cursor_before),
+            [only] => return self.move_block(only.clone(), target, cursor_before, now_ms),
+            _ => {}
+        }
+        let trailing_nl = self.text.ends_with('\n');
+        let mut lines: Vec<String> = self.text.split('\n').map(str::to_string).collect();
+        if trailing_nl {
+            lines.pop();
+        }
+        let moved_flags = self.block_line_flags(ranges, lines.len());
+        let target = floor_boundary(&self.text, target);
+        let dst_line = if target >= self.text.len() {
+            lines.len()
+        } else {
+            self.text[..target].matches('\n').count()
+        };
+        // The insert position among the lines that stay put: dragged lines
+        // above the target no longer count.
+        let dst = moved_flags[..dst_line.min(lines.len())].iter().filter(|d| !**d).count();
+        let moved: Vec<String> = lines
+            .iter()
+            .zip(&moved_flags)
+            .filter(|(_, d)| **d)
+            .map(|(l, _)| l.clone())
+            .collect();
+        let mut remaining: Vec<String> = lines
+            .into_iter()
+            .zip(&moved_flags)
+            .filter(|(_, d)| !**d)
+            .map(|(l, _)| l)
+            .collect();
+        remaining.splice(dst..dst, moved);
+        let mut new_text = remaining.join("\n");
+        if trailing_nl {
+            new_text.push('\n');
+        }
+        let new_start: usize = remaining.iter().take(dst).map(|l| l.len() + 1).sum();
+        self.apply_rewrite(&new_text, cursor_before, now_ms);
+        new_start
+    }
+
+    /// Remove several whole-line blocks (ranges as [`crate::block_range`]
+    /// returns, non-overlapping, in document order), each taking its line
+    /// ending with it. One undoable step. Returns the cursor position after
+    /// the edit.
+    pub fn remove_blocks(
+        &mut self,
+        ranges: &[Range<usize>],
+        cursor_before: usize,
+        now_ms: u64,
+    ) -> usize {
+        let trailing_nl = self.text.ends_with('\n');
+        let mut lines: Vec<String> = self.text.split('\n').map(str::to_string).collect();
+        if trailing_nl {
+            lines.pop();
+        }
+        let removed_flags = self.block_line_flags(ranges, lines.len());
+        let remaining: Vec<String> = lines
+            .into_iter()
+            .zip(&removed_flags)
+            .filter(|(_, d)| !**d)
+            .map(|(l, _)| l)
+            .collect();
+        let mut new_text = remaining.join("\n");
+        if trailing_nl && !remaining.is_empty() {
+            new_text.push('\n');
+        }
+        self.apply_rewrite(&new_text, cursor_before, now_ms)
+    }
+
+    /// Which line indices the byte ranges cover, each range extended to
+    /// whole lines the way [`Self::move_block`] treats its span.
+    fn block_line_flags(&self, ranges: &[Range<usize>], line_count: usize) -> Vec<bool> {
+        let mut flags = vec![false; line_count];
+        for range in ranges {
+            let start = floor_boundary(&self.text, range.start.min(range.end));
+            let block_start = self.text[..start].rfind('\n').map_or(0, |i| i + 1);
+            let end = floor_boundary(&self.text, range.end.min(self.text.len())).max(start);
+            let block_end = self.text[end..].find('\n').map_or(self.text.len(), |i| end + i);
+            let first = self.text[..block_start].matches('\n').count();
+            let count = self.text[block_start..block_end].matches('\n').count() + 1;
+            for flag in flags.iter_mut().skip(first).take(count) {
+                *flag = true;
+            }
+        }
+        flags
+    }
+
+    /// Replace the whole text with `new_text` as one undo step, recording
+    /// only the region that actually changed. Identical texts record
+    /// nothing. Returns the cursor position after the edit.
+    fn apply_rewrite(&mut self, new_text: &str, cursor_before: usize, now_ms: u64) -> usize {
+        let old_len = self.text.len();
+        let mut prefix = self
+            .text
+            .bytes()
+            .zip(new_text.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        while !self.text.is_char_boundary(prefix) || !new_text.is_char_boundary(prefix) {
             prefix -= 1;
         }
         let mut suffix = self
@@ -365,18 +471,20 @@ impl NoteBuffer {
             .zip(new_text.bytes().rev())
             .take_while(|(a, b)| a == b)
             .count()
-            .min(len - prefix);
-        while !self.text.is_char_boundary(len - suffix) {
+            .min(old_len - prefix)
+            .min(new_text.len() - prefix);
+        while !self.text.is_char_boundary(old_len - suffix)
+            || !new_text.is_char_boundary(new_text.len() - suffix)
+        {
             suffix -= 1;
         }
         self.edit_with_kind(
-            prefix..len - suffix,
+            prefix..old_len - suffix,
             &new_text[prefix..new_text.len() - suffix],
             cursor_before,
             now_ms,
             GroupKind::Other,
-        );
-        new_start
+        )
     }
 
     /// Absorb the file's current content into the buffer without writing:
@@ -656,6 +764,89 @@ mod tests {
         let mut b = NoteBuffer::new("a\nb\nc\n");
         assert_eq!(b.move_block(0..1, 4, 0, 1000), 2);
         assert_eq!(b.text(), "b\na\nc\n");
+    }
+
+    #[test]
+    fn move_blocks_gathers_disjoint_blocks_in_order() {
+        // "* a" (with child) and "* c" travel together past "z".
+        let mut b = NoteBuffer::new("* a\n\tsub\nx\n* c\nz\nend\n");
+        let new_start = b.move_blocks(&[0..8, 11..14], 17, 0, 1000);
+        assert_eq!(b.text(), "x\nz\n* a\n\tsub\n* c\nend\n");
+        assert_eq!(new_start, 4);
+        assert_eq!(&b.text()[new_start..new_start + 3], "* a");
+    }
+
+    #[test]
+    fn move_blocks_to_end_and_to_top() {
+        let mut b = NoteBuffer::new("a\nb\nc\nd");
+        assert_eq!(b.move_blocks(&[0..1, 4..5], 7, 0, 1000), 4);
+        assert_eq!(b.text(), "b\nd\na\nc");
+        let mut b = NoteBuffer::new("a\nb\nc\nd");
+        assert_eq!(b.move_blocks(&[2..3, 6..7], 0, 0, 1000), 0);
+        assert_eq!(b.text(), "b\nd\na\nc");
+    }
+
+    #[test]
+    fn move_blocks_is_one_undo_step() {
+        let mut b = NoteBuffer::new("a\nb\nc\nd\n");
+        b.move_blocks(&[0..1, 4..5], 8, 3, 1000);
+        assert_eq!(b.text(), "b\nd\na\nc\n");
+        assert_eq!(b.undo(), Some(3));
+        assert_eq!(b.text(), "a\nb\nc\nd\n");
+        assert!(b.redo().is_some());
+        assert_eq!(b.text(), "b\nd\na\nc\n");
+    }
+
+    #[test]
+    fn move_blocks_noop_records_nothing() {
+        // Both blocks already sit together right where the target is.
+        let mut b = NoteBuffer::new("a\nb\nc\n");
+        b.move_blocks(&[0..1, 2..3], 0, 0, 1000);
+        assert_eq!(b.text(), "a\nb\nc\n");
+        assert_eq!(b.undo(), None);
+    }
+
+    #[test]
+    fn remove_blocks_takes_lines_and_endings() {
+        let mut b = NoteBuffer::new("* a\n\tsub\nkeep\n* c\n");
+        b.remove_blocks(&[0..8, 14..17], 0, 1000);
+        assert_eq!(b.text(), "keep\n");
+        assert_eq!(b.undo(), Some(0));
+        assert_eq!(b.text(), "* a\n\tsub\nkeep\n* c\n");
+    }
+
+    #[test]
+    fn remove_blocks_at_eof_without_trailing_newline() {
+        let mut b = NoteBuffer::new("keep\n* a\n\tsub");
+        b.remove_blocks(&[5..13], 0, 1000);
+        assert_eq!(b.text(), "keep");
+    }
+
+    #[test]
+    fn remove_blocks_everything_leaves_empty() {
+        let mut b = NoteBuffer::new("a\nb\n");
+        b.remove_blocks(&[0..1, 2..3], 0, 1000);
+        assert_eq!(b.text(), "");
+        b.undo();
+        assert_eq!(b.text(), "a\nb\n");
+    }
+
+    #[test]
+    fn undo_stack_peeks_and_drops() {
+        let mut b = NoteBuffer::new("");
+        assert_eq!(b.last_undo_ms(), None);
+        b.edit(0..0, "a", 0, 1000);
+        b.break_undo_group();
+        b.edit(1..1, "b", 1, 2000);
+        assert_eq!(b.last_undo_ms(), Some(2000));
+        b.undo();
+        assert_eq!(b.last_undo_ms(), Some(1000));
+        assert_eq!(b.last_redo_ms(), Some(2000));
+        // Dropping the record keeps the text but forgets the step.
+        b.drop_last_undo();
+        assert_eq!(b.text(), "a");
+        assert_eq!(b.last_undo_ms(), None);
+        assert_eq!(b.undo(), None);
     }
 
     #[test]

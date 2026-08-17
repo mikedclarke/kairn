@@ -489,6 +489,87 @@ pub fn remove_line_on_disk(
     Ok(Some(idx))
 }
 
+/// Insert `block` (which may span lines) so it starts at line `line_idx`,
+/// clamped to the end of the file. The undo half of a cross-note move:
+/// puts a block back where it was taken from. A missing file is created.
+/// Line-ending and trailing-newline conventions are preserved. Returns the
+/// line index the block landed at.
+pub fn insert_block_at_line(path: &Path, line_idx: usize, block: &str) -> io::Result<usize> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let idx = line_idx.min(lines.len());
+    let crlf = text.contains("\r\n");
+    let ending = if crlf { "\r\n" } else { "\n" };
+    let block = if crlf { block.replace('\n', "\r\n") } else { block.to_string() };
+    let mut out = String::with_capacity(text.len() + block.len() + 2);
+    for (i, line) in lines.iter().enumerate() {
+        if i == idx {
+            out.push_str(&block);
+            out.push_str(ending);
+        }
+        out.push_str(line);
+        out.push_str(ending);
+    }
+    if idx == lines.len() {
+        out.push_str(&block);
+        out.push_str(ending);
+    }
+    if !text.ends_with('\n') && !text.is_empty() {
+        while out.ends_with('\n') || out.ends_with('\r') {
+            out.pop();
+        }
+    }
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    atomic_write(path, &out)?;
+    Ok(idx)
+}
+
+/// Remove `block`'s lines from the note: the contiguous run of lines
+/// exactly equal to the block's lines, required to be unique in the file so
+/// a stale caller can't take out the wrong copy. The undo half of a
+/// cross-note move (removing what the move inserted). Returns the line
+/// index the block was removed from; `Ok(None)` when the block is gone or
+/// ambiguous and nothing was written.
+pub fn remove_block_lines(path: &Path, block: &str) -> io::Result<Option<usize>> {
+    let text = fs::read_to_string(path)?;
+    let lines: Vec<&str> = text.lines().collect();
+    let block_lines: Vec<&str> = block.lines().collect();
+    if block_lines.is_empty() {
+        return Ok(None);
+    }
+    let mut starts = (0..=lines.len().saturating_sub(block_lines.len()))
+        .filter(|&i| lines[i..i + block_lines.len()] == block_lines[..]);
+    let Some(idx) = starts.next() else {
+        return Ok(None);
+    };
+    if starts.next().is_some() {
+        return Ok(None);
+    }
+    let crlf = text.contains("\r\n");
+    let ending = if crlf { "\r\n" } else { "\n" };
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in lines.iter().enumerate() {
+        if (idx..idx + block_lines.len()).contains(&i) {
+            continue;
+        }
+        out.push_str(line);
+        out.push_str(ending);
+    }
+    if !text.ends_with('\n') && !text.is_empty() {
+        while out.ends_with('\n') || out.ends_with('\r') {
+            out.pop();
+        }
+    }
+    atomic_write(path, &out)?;
+    Ok(Some(idx))
+}
+
 /// A heading reduced to what identifies its section: hashes, NotePlan `==`
 /// highlight markers, surrounding whitespace, and case all ignored, so
 /// `### ==Todays Tasks==` matches a request for `todays tasks`.
@@ -1245,6 +1326,47 @@ mod tests {
         let mon_path =
             capture(&root.0, monday, "stand-up", "weekdays").expect("io").expect("written");
         assert_eq!(fs::read_to_string(&mon_path).expect("read"), "### Tasks\n* stand-up\n");
+    }
+
+    #[test]
+    fn insert_block_at_line_places_and_clamps() {
+        let root = ScratchRoot::new("insert-at-line");
+        let path = root.write("Calendar/20260805.md", "# Day\n* a\n* b\n");
+        insert_block_at_line(&path, 2, "* back\n\tsub").expect("io");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "# Day\n* a\n* back\n\tsub\n* b\n"
+        );
+        // Past the end clamps to the end; a missing file is created.
+        let short = root.write("Calendar/20260806.md", "* one\n");
+        insert_block_at_line(&short, 99, "* last").expect("io");
+        assert_eq!(fs::read_to_string(&short).expect("read"), "* one\n* last\n");
+        let fresh = root.0.join("Calendar/20260807.md");
+        insert_block_at_line(&fresh, 0, "* only").expect("io");
+        assert_eq!(fs::read_to_string(&fresh).expect("read"), "* only\n");
+        // No trailing newline stays that way.
+        let bare = root.write("Calendar/20260808.md", "* one");
+        insert_block_at_line(&bare, 0, "* zero").expect("io");
+        assert_eq!(fs::read_to_string(&bare).expect("read"), "* zero\n* one");
+    }
+
+    #[test]
+    fn remove_block_lines_needs_a_unique_contiguous_match() {
+        let root = ScratchRoot::new("remove-block");
+        let path = root.write("Calendar/20260805.md", "* keep\n* moved\n\tsub\n* end\n");
+        assert_eq!(remove_block_lines(&path, "* moved\n\tsub").expect("io"), Some(1));
+        assert_eq!(fs::read_to_string(&path).expect("read"), "* keep\n* end\n");
+        // Gone now: refuses rather than guessing.
+        assert_eq!(remove_block_lines(&path, "* moved\n\tsub").expect("io"), None);
+        // Ambiguous: two copies, nothing written.
+        let twice = root.write("Calendar/20260806.md", "* x\n* y\n* x\n");
+        assert_eq!(remove_block_lines(&twice, "* x").expect("io"), None);
+        assert_eq!(fs::read_to_string(&twice).expect("read"), "* x\n* y\n* x\n");
+        // Removing the last line of a no-trailing-newline file keeps the
+        // convention.
+        let bare = root.write("Calendar/20260807.md", "* a\n* b");
+        assert_eq!(remove_block_lines(&bare, "* b").expect("io"), Some(1));
+        assert_eq!(fs::read_to_string(&bare).expect("read"), "* a");
     }
 
     #[test]

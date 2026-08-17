@@ -377,6 +377,12 @@ impl Workspace {
     }
 
     pub(crate) fn on_close_overlay(&mut self, _: &CloseOverlay, window: &mut Window, cx: &mut Context<Self>) {
+        // With no overlay up, Esc closes the settings page instead (its root
+        // carries the same Overlay key context).
+        if self.overlay.is_none() && self.settings_view.is_some() {
+            self.close_settings(window, cx);
+            return;
+        }
         self.close_overlays(window, cx);
     }
 
@@ -626,7 +632,7 @@ impl Workspace {
                     .border_b_1()
                     .border_color(t.border)
                     .child(div().w(px(2.)).h(px(16.)).bg(t.accent))
-                    .child("Jump to session, day, or note"),
+                    .child("Search notes, days, sessions"),
             );
 
         let query = input.read(cx).value().trim().to_string();

@@ -1,9 +1,9 @@
 use gpui::{
-    AppContext, Context, Entity, IntoElement, ParentElement, PathPromptOptions, Render, Styled,
-    WeakEntity, Window, div, prelude::FluentBuilder as _, px,
+    AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
+    PathPromptOptions, Render, StatefulInteractiveElement, Styled, WeakEntity, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    WindowExt,
     button::{Button, ButtonVariants},
     h_flex,
     input::{Input, InputState},
@@ -13,7 +13,6 @@ use gpui_component::{
 
 use gpui::SharedString;
 use kairn_core::settings::{HostApp, SshHost};
-use kairn_core::themes::ThemeEntry;
 use crate::cli_install;
 use crate::keymap::keybind_list;
 use crate::theme::KairnThemeExt as _;
@@ -33,7 +32,7 @@ enum Tab {
 impl Tab {
     const ALL: [(Tab, &'static str); 5] = [
         (Tab::General, "General"),
-        (Tab::Theme, "Theme"),
+        (Tab::Theme, "Appearance"),
         (Tab::Templates, "Templates"),
         (Tab::Ssh, "SSH hosts"),
         (Tab::Keybinds, "Keybinds"),
@@ -41,6 +40,7 @@ impl Tab {
 }
 
 type FontSelect = Entity<SelectState<SearchableVec<String>>>;
+type ThemeSelect = Entity<SelectState<SearchableVec<String>>>;
 
 /// The sentinel first entry of every font picker: no override stored, the
 /// built-in choice applies.
@@ -99,11 +99,15 @@ pub struct SettingsEditor {
     template_body: Entity<InputState>,
     /// Pending apply rule; lands with Save like the body.
     template_rule: String,
-    /// Pending theme id ("dark"/"light" or a theme-file stem); lands with
-    /// Save, so browsing choices never repaints the app behind the dialog.
-    theme_choice: String,
-    /// Theme files found in `.kairn/themes/` at open.
-    themes: Vec<ThemeEntry>,
+    /// Picker rows as (stored id, shown name): the built-in themes then the
+    /// vault's `.kairn/themes/` files, in display order.
+    theme_items: Vec<(String, String)>,
+    /// Pending theme choice; lands with Save, so browsing choices never
+    /// repaints the app behind the page.
+    theme_select: ThemeSelect,
+    /// The id loaded from settings, kept when the select resolves nothing
+    /// (a theme configured on another machine and absent here).
+    theme_loaded: String,
     ui_font: FontSelect,
     editor_font: FontSelect,
     mono_font: FontSelect,
@@ -116,6 +120,9 @@ pub struct SettingsEditor {
     ui_size_loaded: Option<f32>,
     /// Result line under the "Install kairn command" button, set on click.
     cli_status: Option<String>,
+    /// Focus anchor for the page, so its Overlay key context (Esc closes)
+    /// is active as soon as settings open.
+    focus_handle: FocusHandle,
 }
 
 struct HostRow {
@@ -231,6 +238,39 @@ impl SettingsEditor {
         });
 
         let themes = kairn_core::themes::list_themes(&ws.notes_root);
+        let mut theme_items: Vec<(String, String)> = crate::theme::BUILTIN_THEMES
+            .iter()
+            .map(|(id, name)| (id.to_string(), name.to_string()))
+            .collect();
+        for t in &themes {
+            // A vault file with a built-in's id is shadowed by the built-in
+            // when the theme applies, so listing it would offer the same
+            // theme twice.
+            if crate::theme::BUILTIN_THEMES.iter().any(|(id, _)| *id == t.id) {
+                continue;
+            }
+            // A vault name colliding with an earlier entry carries its id, so
+            // the select's string values stay unambiguous.
+            let name = if theme_items.iter().any(|(_, n)| *n == t.name) {
+                format!("{} ({})", t.name, t.id)
+            } else {
+                t.name.clone()
+            };
+            theme_items.push((t.id.clone(), name));
+        }
+        let selected_theme = theme_items
+            .iter()
+            .find(|(id, _)| *id == ws.settings.theme)
+            .map(|(_, name)| name.clone());
+        let theme_select = cx.new(|cx| {
+            let names: Vec<String> = theme_items.iter().map(|(_, n)| n.clone()).collect();
+            let mut state =
+                SelectState::new(SearchableVec::new(names), None, window, cx).searchable(true);
+            if let Some(name) = &selected_theme {
+                state.set_selected_value(name, window, cx);
+            }
+            state
+        });
         // Installed families, macOS dot-prefixed system internals excluded, as
         // a set to filter the curated candidate lists against.
         let installed: std::collections::HashSet<String> = cx
@@ -294,14 +334,16 @@ impl SettingsEditor {
             template_loaded,
             template_body,
             template_rule: ws.settings.daily_template_rule.clone(),
-            theme_choice: ws.settings.theme.clone(),
-            themes,
+            theme_items,
+            theme_select,
+            theme_loaded: ws.settings.theme.clone(),
             ui_font,
             editor_font,
             mono_font,
             editor_size,
             ui_size,
             cli_status: None,
+            focus_handle: cx.focus_handle(),
             fonts_loaded: (
                 ws.settings.ui_font.clone(),
                 ws.settings.editor_font.clone(),
@@ -333,7 +375,16 @@ impl SettingsEditor {
             .collect()
     }
 
-    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn focus_handle(&self) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+
+    /// Everything the page edits in batch (notes root, hosts, shortcuts,
+    /// template, theme, fonts), read out of the inputs as a patch for
+    /// [`Workspace::apply_settings`]. Pure read: the caller applies it, so
+    /// both close paths (the page's Back row and the workspace's Esc / gear
+    /// toggle) can run without re-entering the other entity.
+    pub(crate) fn collect_patch(&self, cx: &Context<Self>) -> crate::vault_state::SettingsPatch {
         let body = self.template_body.read(cx).value().to_string();
         let font_of = |sel: &FontSelect, loaded: &Option<String>| match sel
             .read(cx)
@@ -359,23 +410,31 @@ impl SettingsEditor {
         };
         let editor_font_size = parse_size(&self.editor_size, self.fonts_loaded.3);
         let ui_font_size = parse_size(&self.ui_size, self.ui_size_loaded);
-        let patch = crate::vault_state::SettingsPatch {
+        crate::vault_state::SettingsPatch {
             notes_root: self.notes_root_choice.clone(),
             hosts: self.collect_hosts(cx),
             local_apps: collect_apps(&self.local_apps, cx),
             daily_template_rule: self.template_rule.clone(),
             template_body: (body != self.template_loaded).then_some(body),
-            theme: self.theme_choice.clone(),
+            // Selected display name mapped back to its stored id; no
+            // selection keeps the loaded id rather than resetting it.
+            theme: self
+                .theme_select
+                .read(cx)
+                .selected_value()
+                .and_then(|v| {
+                    self.theme_items
+                        .iter()
+                        .find(|(_, name)| name == v)
+                        .map(|(id, _)| id.clone())
+                })
+                .unwrap_or_else(|| self.theme_loaded.clone()),
             ui_font: font_of(&self.ui_font, &self.fonts_loaded.0),
             editor_font: font_of(&self.editor_font, &self.fonts_loaded.1),
             mono_font: font_of(&self.mono_font, &self.fonts_loaded.2),
             editor_font_size,
             ui_font_size,
-        };
-        let _ = self.workspace.update(cx, |ws, cx| {
-            ws.apply_settings(patch, window, cx);
-        });
-        window.close_dialog(cx);
+        }
     }
 
     fn section(label: &'static str) -> gpui::Div {
@@ -388,21 +447,11 @@ impl SettingsEditor {
     }
 
     fn render_general(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let daily_forward = self
-            .workspace
-            .upgrade()
-            .map(|ws| ws.read(cx).settings.daily_forward)
-            .unwrap_or(true);
         let week_strip = self
             .workspace
             .upgrade()
             .map(|ws| ws.read(cx).settings.week_strip.clone())
             .unwrap_or_else(|| "always".to_string());
-        let day_timeline = self
-            .workspace
-            .upgrade()
-            .map(|ws| ws.read(cx).settings.day_timeline)
-            .unwrap_or(true);
         let (show_agents, show_daily, show_tasks) = self
             .workspace
             .upgrade()
@@ -422,32 +471,12 @@ impl SettingsEditor {
             .map(|ws| home_relative(&ws.read(cx).notes_root))
             .unwrap_or_default();
 
-        let daily_button = |id: &'static str, label: &'static str, forward: bool| {
-            let btn = Button::new(id).label(label);
-            let btn = if forward == daily_forward { btn.primary() } else { btn.outline() };
-            btn.on_click(cx.listener(move |this, _, _, cx| {
-                let _ = this.workspace.update(cx, |ws, cx| {
-                    ws.set_daily_forward(forward, cx);
-                });
-                cx.notify();
-            }))
-        };
         let strip_button = |id: &'static str, label: &'static str, mode: &'static str| {
             let btn = Button::new(id).label(label);
             let btn = if mode == week_strip { btn.primary() } else { btn.outline() };
             btn.on_click(cx.listener(move |this, _, _, cx| {
                 let _ = this.workspace.update(cx, |ws, cx| {
                     ws.set_week_strip(mode, cx);
-                });
-                cx.notify();
-            }))
-        };
-        let timeline_button = |id: &'static str, label: &'static str, on: bool| {
-            let btn = Button::new(id).label(label);
-            let btn = if on == day_timeline { btn.primary() } else { btn.outline() };
-            btn.on_click(cx.listener(move |this, _, _, cx| {
-                let _ = this.workspace.update(cx, |ws, cx| {
-                    ws.set_day_timeline(on, cx);
                 });
                 cx.notify();
             }))
@@ -554,13 +583,6 @@ impl SettingsEditor {
                 "Currently {resolved}; a change lands on Save. A NotePlan-style folder \
                  works as-is; Calendar/, Notes/ and .kairn/ are created if missing."
             )))
-            .child(Self::section("Sidebar daily list"))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(daily_button("daily-forward", "Today + next 2 days", true))
-                    .child(daily_button("daily-back", "Today + previous 2 days", false)),
-            )
             .child(Self::section("Week strip above notes"))
             .child(
                 h_flex()
@@ -569,23 +591,14 @@ impl SettingsEditor {
                     .child(strip_button("strip-daily", "Daily notes only", "daily"))
                     .child(strip_button("strip-off", "Hidden", "off")),
             )
-            .child(Self::section("Day timeline"))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(timeline_button("timeline-on", "Shown", true))
-                    .child(timeline_button("timeline-off", "Hidden", false)),
-            )
-            .child(div().text_size(px(11.)).opacity(0.55).child(
-                "The pill row of timed lines (09:00 standup) at the top of a daily note.",
-            ))
             .child(Self::section("Sidebar sections"))
-            .child(vis_row("Daily", "daily", "daily-vis-on", "daily-vis-off", show_daily))
+            .child(vis_row("Calendar", "daily", "daily-vis-on", "daily-vis-off", show_daily))
             .child(vis_row("Tasks", "tasks", "tasks-vis-on", "tasks-vis-off", show_tasks))
             .child(vis_row("Agents", "agents", "agents-on", "agents-off", show_agents))
             .child(div().text_size(px(11.)).opacity(0.55).child(
-                "Hidden sections disappear from the sidebar entirely. Agents is the feed \
-                 of agent CLI activity on this machine.",
+                "Hidden sections disappear from the sidebar entirely. Calendar is the mini \
+                 month with the timeline and period switcher; Agents is the feed of agent \
+                 CLI activity on this machine.",
             ))
             .child(Self::section("Library file order"))
             .child(
@@ -599,13 +612,6 @@ impl SettingsEditor {
             ))
             .child(Self::section("Command line tool"))
             .child(self.render_cli(cx))
-            .child(Self::section("About"))
-            .child(
-                div()
-                    .text_size(px(11.))
-                    .opacity(0.55)
-                    .child(concat!("Kairn ", env!("CARGO_PKG_VERSION"))),
-            )
     }
 
     fn render_cli(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -656,27 +662,7 @@ impl SettingsEditor {
             })
     }
 
-    fn render_theme(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let mut choices: Vec<(String, String)> = vec![
-            ("dark".to_string(), "Dark".to_string()),
-            ("light".to_string(), "Light".to_string()),
-        ];
-        choices.extend(
-            crate::theme::BUILTIN_PRESETS
-                .iter()
-                .map(|(id, name)| (id.to_string(), name.to_string())),
-        );
-        choices.extend(self.themes.iter().map(|t| (t.id.clone(), t.name.clone())));
-        let mut theme_row = h_flex().gap_2().flex_wrap();
-        for (i, (id, name)) in choices.into_iter().enumerate() {
-            let btn = Button::new(("theme-choice", i)).label(name);
-            let btn = if id == self.theme_choice { btn.primary() } else { btn.outline() };
-            theme_row = theme_row.child(btn.on_click(cx.listener(move |this, _, _, cx| {
-                this.theme_choice = id.clone();
-                cx.notify();
-            })));
-        }
-
+    fn render_theme(&self, _cx: &mut Context<Self>) -> gpui::Div {
         let label = |text: &'static str| {
             div().w(px(120.)).flex_none().text_size(px(12.5)).child(text)
         };
@@ -692,12 +678,11 @@ impl SettingsEditor {
             .gap_2()
             .w_full()
             .child(Self::section("Theme"))
-            .child(theme_row)
+            .child(Select::new(&self.theme_select))
             .child(div().text_size(px(11.)).opacity(0.55).child(
-                "Dark, Light, and the coloured presets are built in. For full \
-                 control, custom themes are JSON files in .kairn/themes/ inside \
-                 your notes folder; any colours, fonts, and terminal shades they \
-                 leave out fall back to the built-ins.",
+                "For full control, custom themes are JSON files in \
+                 .kairn/themes/ inside your notes folder; any colours, fonts, \
+                 and terminal shades they leave out fall back to the built-ins.",
             ))
             .child(Self::section("Fonts"))
             .child(font_row("Interface", &self.ui_font))
@@ -901,16 +886,129 @@ impl SettingsEditor {
 }
 
 impl Render for SettingsEditor {
+    /// The settings page: a rail of sections on the left, one scrollable
+    /// content column on the right, capped at a reading measure. Nothing
+    /// resizes across sections; tall sections scroll. Batch edits land when
+    /// the page closes (Back, Esc, or the settings chord again).
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let tabs = h_flex().gap_1().children(Tab::ALL.map(|(tab, label)| {
-            let btn = Button::new(label).label(label);
-            let btn = if tab == self.tab { btn.primary() } else { btn.ghost() };
-            btn.on_click(cx.listener(move |this, _, _, cx| {
-                this.tab = tab;
-                cx.notify();
-            }))
-        }));
+        let t = cx.kairn().clone();
 
+        let hover_bg = t.hover;
+        let mut rail = v_flex()
+            .w(px(220.))
+            .h_full()
+            .flex_none()
+            .gap(px(2.))
+            .p(px(10.))
+            .bg(t.panel)
+            .border_r_1()
+            .border_color(t.border)
+            .child(
+                div()
+                    .id("settings-back")
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(10.))
+                    .py(px(6.))
+                    .mb(px(8.))
+                    .rounded(px(6.))
+                    .text_size(t.ui_px(12.5))
+                    .text_color(t.dim)
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover_bg))
+                    .child("‹ Back")
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .font_family(t.mono_font.clone())
+                            .text_size(t.ui_px(10.5))
+                            .text_color(t.faint)
+                            .border_1()
+                            .border_color(t.border)
+                            .rounded(px(4.))
+                            .px(px(4.))
+                            .bg(t.bg)
+                            .child("esc"),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        // Apply from this side: collect here, hand the patch
+                        // to the workspace, never re-enter this entity.
+                        let patch = this.collect_patch(cx);
+                        let _ = this.workspace.update(cx, |ws, cx| {
+                            ws.settings_view = None;
+                            ws.apply_settings(patch, window, cx);
+                            cx.notify();
+                        });
+                    })),
+            )
+            .child(
+                div()
+                    .px(px(10.))
+                    .pb(px(4.))
+                    .text_size(t.ui_px(10.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(t.faint)
+                    .child("SETTINGS"),
+            );
+        for (tab, label) in Tab::ALL {
+            let active = tab == self.tab;
+            let sel = t.sel;
+            let accent = t.accent;
+            let dim = t.dim;
+            rail = rail.child(
+                div()
+                    .id(label)
+                    .flex()
+                    .items_center()
+                    .px(px(10.))
+                    .py(px(6.))
+                    .rounded(px(6.))
+                    .text_size(t.ui_px(12.5))
+                    .cursor_pointer()
+                    .when(active, |d| d.bg(sel).text_color(accent))
+                    .when(!active, |d| {
+                        d.text_color(dim).hover(move |s| s.bg(hover_bg))
+                    })
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.tab = tab;
+                        cx.notify();
+                    })),
+            );
+        }
+        rail = rail.child(div().flex_1()).child(
+            div()
+                .px(px(10.))
+                .py(px(8.))
+                .text_size(t.ui_px(11.))
+                .text_color(t.faint)
+                .child(concat!("Kairn ", env!("CARGO_PKG_VERSION"))),
+        );
+
+        let (title, sub, scroll_id) = match self.tab {
+            Tab::General => (
+                "General",
+                "Notes location, what the sidebar shows, and the week strip.",
+                "settings-scroll-general",
+            ),
+            Tab::Theme => ("Appearance", "Theme, fonts, and text sizes.", "settings-scroll-theme"),
+            Tab::Templates => (
+                "Templates",
+                "What new daily notes start with.",
+                "settings-scroll-templates",
+            ),
+            Tab::Ssh => (
+                "SSH hosts",
+                "Saved connections and their launch shortcuts.",
+                "settings-scroll-ssh",
+            ),
+            Tab::Keybinds => (
+                "Keybinds",
+                "Everything the app answers to.",
+                "settings-scroll-keybinds",
+            ),
+        };
         let content = match self.tab {
             Tab::General => self.render_general(cx),
             Tab::Theme => self.render_theme(cx),
@@ -919,31 +1017,42 @@ impl Render for SettingsEditor {
             Tab::Keybinds => self.render_keybinds(cx),
         };
 
-        v_flex()
-            .gap_2()
-            .w_full()
-            .child(tabs)
-            .child(content)
+        div()
+            .id("settings-page")
+            .key_context("Overlay")
+            .track_focus(&self.focus_handle)
+            .flex()
+            .size_full()
+            .min_h(px(0.))
+            .bg(t.bg)
+            .child(rail)
             .child(
-                h_flex()
-                    .gap_2()
-                    .mt_2()
-                    .child(div().flex_1())
+                div()
+                    .id(scroll_id)
+                    .flex_1()
+                    .h_full()
+                    .min_w(px(0.))
+                    .overflow_y_scroll()
                     .child(
-                        Button::new("settings-cancel")
-                            .ghost()
-                            .label("Cancel")
-                            .on_click(cx.listener(|_, _, window, cx| {
-                                window.close_dialog(cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("settings-save")
-                            .primary()
-                            .label("Save")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.save(window, cx);
-                            })),
+                        div()
+                            .max_w(px(620.))
+                            .px(px(40.))
+                            .py(px(26.))
+                            .child(
+                                div()
+                                    .text_size(t.ui_px(17.))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(2.))
+                                    .mb(px(16.))
+                                    .text_size(t.ui_px(12.5))
+                                    .text_color(t.dim)
+                                    .child(sub),
+                            )
+                            .child(content),
                     ),
             )
     }
@@ -967,10 +1076,13 @@ fn fmt_size(s: f32) -> String {
     }
 }
 
-pub fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+/// Build the settings page's editor entity, loaded from the current
+/// settings. The workspace stores it and swaps it in for the main area.
+pub fn open(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Entity<SettingsEditor> {
     let weak = cx.weak_entity();
-    let editor = cx.new(|cx| SettingsEditor::new(weak, workspace, window, cx));
-    window.open_dialog(cx, move |dialog, _, _| {
-        dialog.w(px(600.)).title("Settings").child(editor.clone())
-    });
+    cx.new(|cx| SettingsEditor::new(weak, workspace, window, cx))
 }

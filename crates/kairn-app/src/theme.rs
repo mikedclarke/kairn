@@ -217,19 +217,35 @@ impl KairnTheme {
     }
 }
 
-/// Built-in themes offered in the picker beyond the two base modes. Each is
-/// the dark base with a different accent family; Ocean additionally swaps the
-/// base's olive-tinted surfaces for untinted greys, so only its accent carries
-/// any colour. Ids are stable (settings store them); names are shown.
-pub const BUILTIN_PRESETS: &[(&str, &str)] = &[
+/// Built-in themes offered in the picker, in display order. Menlo (the
+/// fresh-install default) is a full embedded theme spec, fonts and
+/// terminal ramp included. Sage and Sage Light are the original sage/amber
+/// base palettes; they keep the historical "dark"/"light" ids so stored
+/// settings keep resolving. The rest are the dark base with a different
+/// accent family, Ocean additionally swapping the base's olive-tinted
+/// surfaces for untinted greys, so only its accent carries any colour.
+/// Ids are stable (settings store them); names are shown.
+pub const BUILTIN_THEMES: &[(&str, &str)] = &[
+    ("menlo", "Menlo"),
     ("ocean", "Ocean"),
+    ("dark", "Sage"),
+    ("light", "Sage Light"),
     ("rose", "Rose"),
     ("forest", "Forest"),
 ];
 
+/// The Menlo preset's full spec, in the same format as `.kairn/themes`
+/// files; a preset lookup shadows any vault theme with the same id.
+const MENLO_SPEC: &str = include_str!("themes/menlo.json");
+
 /// Resolve a built-in preset id to its theme, or `None` for anything that
 /// isn't one (a base mode or a `.kairn/themes` file id).
 fn preset(id: &str) -> Option<KairnTheme> {
+    if id == "menlo" {
+        let spec: ThemeSpec =
+            serde_json::from_str(MENLO_SPEC).expect("embedded menlo theme parses");
+        return Some(KairnTheme::from_spec(&spec));
+    }
     let (accent, amber) = match id {
         "ocean" => (c(0x7fa8c9), c(0xd9a75c)),
         "rose" => (c(0xc98fa8), c(0xd9a75c)),
@@ -510,4 +526,29 @@ fn terminal_palette(spec: &ThemeTerminal, bg: (u8, u8, u8)) -> ColorPalette {
         .bright_cyan(bright_cyan.0, bright_cyan.1, bright_cyan.2)
         .bright_white(bright_white.0, bright_white.1, bright_white.2)
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn menlo_is_the_leading_theme_and_parses() {
+        assert_eq!(BUILTIN_THEMES[0], ("menlo", "Menlo"));
+        let spec: ThemeSpec =
+            serde_json::from_str(MENLO_SPEC).expect("embedded menlo theme parses");
+        assert_eq!(spec.name, "Menlo");
+        let t = KairnTheme::from_spec(&spec);
+        assert_eq!(t.mode, Mode::Dark);
+        assert_eq!(t.editor_font.as_ref().map(|f| f.as_ref()), Some("Menlo"));
+        assert_eq!(t.mono_font.as_ref(), "Menlo");
+    }
+
+    #[test]
+    fn every_builtin_theme_resolves() {
+        for (id, _) in BUILTIN_THEMES {
+            let resolves = matches!(*id, "dark" | "light") || preset(id).is_some();
+            assert!(resolves, "theme {id} did not resolve");
+        }
+    }
 }

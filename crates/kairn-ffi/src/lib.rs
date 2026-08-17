@@ -10,8 +10,11 @@
 //! Layout mirrors the pieces it bridges:
 //! - [`buffer`]  the editable [`kairn_core::NoteBuffer`] as a UniFFI object
 //! - [`parse`]   line/span classification for styling
-//! - [`tasks`]   task toggling and rescheduling
-//! - [`vault`]   the vault's daily-note naming convention
+//! - [`tasks`]   the whole-vault task scan, toggling, and rescheduling
+//! - [`vault`]   period note naming, search, conflicts, the daily template
+//! - [`timeline`] time-blocked lines for the day timeline
+//! - [`blocks`]  drag-block ranges and heading sections
+//! - [`themes`]  vault theme files and hex color parsing
 //! - [`text`]    UTF-16 <-> byte offset helpers for TextKit
 //! - [`sync`]  the sync value types the phone's background handlers consume;
 //!   the live engine object lands with the concrete transport, reusing this
@@ -25,12 +28,15 @@
 //! across the FFI (native `usize` is 64-bit on every iOS device, so the cast is
 //! lossless).
 
+pub mod blocks;
 pub mod buffer;
 pub mod merge;
 pub mod parse;
 pub mod sync;
 pub mod tasks;
 pub mod text;
+pub mod themes;
+pub mod timeline;
 pub mod vault;
 
 uniffi::setup_scaffolding!();

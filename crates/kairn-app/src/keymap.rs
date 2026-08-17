@@ -8,6 +8,10 @@ actions!(
         ToggleSidebar,
         ToggleTerminalFull,
         ToggleWriting,
+        LayoutNotes,
+        LayoutSplit,
+        LayoutTerminal,
+        LayoutWriting,
         ToggleSwitcher,
         CloseOverlay,
         ToggleThemeMode,
@@ -79,6 +83,16 @@ pub fn init(cx: &mut App) {
             format!("ctrl-{k}")
         }
     };
+    // Primary+Alt chords (labelled by `chord_alt`): Cmd+Option on macOS,
+    // Ctrl+Alt on Linux, where they are free on both the shell and the
+    // desktop for digits.
+    let pa = |k: &str| {
+        if cfg!(target_os = "macos") {
+            format!("cmd-alt-{k}")
+        } else {
+            format!("ctrl-alt-{k}")
+        }
+    };
     cx.bind_keys([
         // gpui-component's Root binds tab/shift-tab to focus cycling, which
         // consumes them before a focused terminal can forward them to the
@@ -90,6 +104,13 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(&p("\\"), ToggleSidebar, None),
         KeyBinding::new(&p("shift-enter"), ToggleTerminalFull, None),
         KeyBinding::new(&p("alt-enter"), ToggleWriting, None),
+        // Direct layout chords, numbered in the titlebar switcher's
+        // left-to-right order. Alt+digit so they can't collide with the
+        // plain-digit session chords on either platform.
+        KeyBinding::new(&pa("1"), LayoutWriting, None),
+        KeyBinding::new(&pa("2"), LayoutNotes, None),
+        KeyBinding::new(&pa("3"), LayoutSplit, None),
+        KeyBinding::new(&pa("4"), LayoutTerminal, None),
         KeyBinding::new(&p("j"), ToggleSwitcher, None),
         KeyBinding::new(&p(","), OpenSettings, None),
         KeyBinding::new(&p("shift-k"), Capture, None),
@@ -121,8 +142,21 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("right", EditorRight, Some("NoteEditor")),
         KeyBinding::new("up", EditorUp, Some("NoteEditor")),
         KeyBinding::new("down", EditorDown, Some("NoteEditor")),
-        KeyBinding::new(&p("z"), EditorUndo, Some("NoteEditor")),
-        KeyBinding::new(&p("shift-z"), EditorRedo, Some("NoteEditor")),
+        // Undo/redo live in the Workspace context, not the editor's: the
+        // workspace coordinates buffer undo with its cross-note move
+        // history, and the chord must work right after a mouse drag, when
+        // nothing keyboard-focused holds the editor context. Text inputs
+        // keep their own undo (gpui-component binds it in the deeper Input
+        // context, which wins).
+        KeyBinding::new(&p("z"), EditorUndo, Some("Workspace")),
+        // Redo: on Linux the undo chord already carries Shift
+        // (Ctrl+Shift+Z), so redo takes Ctrl+Shift+Y; `p("shift-z")` would
+        // collide with undo there.
+        KeyBinding::new(
+            if cfg!(target_os = "macos") { "cmd-shift-z" } else { "ctrl-shift-y" },
+            EditorRedo,
+            Some("Workspace"),
+        ),
         KeyBinding::new(&p("v"), EditorPaste, Some("NoteEditor")),
         KeyBinding::new(&p("c"), EditorCopy, Some("NoteEditor")),
         KeyBinding::new(&p("x"), EditorCut, Some("NoteEditor")),
@@ -189,6 +223,10 @@ pub fn keybind_list() -> Vec<(&'static str, Vec<(String, &'static str)>)> {
         (
             "Layout",
             vec![
+                (chord_alt("1"), "Writing layout"),
+                (chord_alt("2"), "Notes layout"),
+                (chord_alt("3"), "Notes + terminal layout"),
+                (chord_alt("4"), "Terminal layout"),
                 (chord_shift("⏎"), "Full-screen terminal on/off"),
                 (chord_alt("⏎"), "Writing mode on/off"),
             ],
@@ -204,8 +242,15 @@ pub fn keybind_list() -> Vec<(&'static str, Vec<(String, &'static str)>)> {
             "Notes",
             vec![
                 (chord("S"), "Save the open note now"),
-                (chord("Z"), "Undo"),
-                (chord_shift("Z"), "Redo"),
+                (chord("Z"), "Undo (edits and task moves)"),
+                (
+                    if cfg!(target_os = "macos") {
+                        chord_shift("Z")
+                    } else {
+                        "Ctrl+Shift+Y".to_string()
+                    },
+                    "Redo",
+                ),
                 (chord("C"), "Copy"),
                 (chord("X"), "Cut"),
                 (chord("V"), "Paste"),

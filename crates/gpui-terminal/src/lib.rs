@@ -344,6 +344,7 @@ pub mod event;
 pub mod input;
 mod links;
 pub mod mouse;
+pub mod pty_log;
 pub mod render;
 pub mod terminal;
 pub mod view;

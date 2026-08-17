@@ -1,0 +1,46 @@
+{
+  "name": "Menlo",
+  "mode": "dark",
+  "colors": {
+    "bg": "#1D1E1F",
+    "panel": "#262728",
+    "panel2": "#2E2F30",
+    "hover": "#343536",
+    "border": "#3A3B3C",
+    "text": "#DAE3E8",
+    "dim": "#C5C5C0",
+    "faint": "#656560",
+    "accent": "#73B3C0",
+    "amber": "#E9C062",
+    "on_amber": "#1D1E1F",
+    "red": "#CC6666",
+    "term_bg": "#1D1E1F",
+    "sel": "#73B3C033",
+    "highlight": "#A2E2FF33",
+    "heading": "#E9C062",
+    "bold": "#CC6666"
+  },
+  "fonts": {
+    "editor": "Menlo",
+    "mono": "Menlo"
+  },
+  "terminal": {
+    "background": "#1D1E1F",
+    "foreground": "#DAE3E8",
+    "cursor": "#E9C0A2",
+    "red": "#CC6666",
+    "green": "#9DC777",
+    "yellow": "#E9C062",
+    "blue": "#96CBFE",
+    "magenta": "#E9C0A2",
+    "cyan": "#73B3C0",
+    "white": "#C5C5C0",
+    "bright_red": "#E9A3A3",
+    "bright_green": "#B9DD9D",
+    "bright_yellow": "#F2D48A",
+    "bright_blue": "#B5DBFE",
+    "bright_magenta": "#F2D5BC",
+    "bright_cyan": "#9DD3DE",
+    "bright_white": "#EAF0F3"
+  }
+}

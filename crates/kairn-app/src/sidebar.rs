@@ -1,4 +1,5 @@
-use chrono::{Datelike, Days, Local, Months, NaiveDate};
+use chrono::{Datelike, Days, Local, Months, NaiveDate, Timelike};
+use gpui::AnimationExt as _;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     Context, ElementId, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
@@ -23,13 +24,70 @@ impl Workspace {
 
         // While a line drag is in flight, the day row or cell under the
         // pointer rings as the drop target (hit-tested against last-painted
-        // bounds, like the week strip).
+        // bounds, like the week strip). A carried timeline block rings the
+        // same way.
         let drop_day = self
             .note_editor
             .as_ref()
             .and_then(|e| e.read(cx).line_drag())
-            .and_then(|(_, _, position)| self.resolve_day_drop(position));
+            .and_then(|(_, _, position)| self.resolve_day_drop(position))
+            .or_else(|| {
+                self.timeline_drag
+                    .as_ref()
+                    .filter(|d| d.moved && !d.resize)
+                    .and_then(|d| self.resolve_day_drop(d.position))
+            });
         self.sidebar_bounds.borrow_mut().take();
+
+        // Timeline mode: the calendar and its tab strip stay pinned while
+        // the scroll container holds only the day timeline, so the sidebar
+        // scroll walks the day. The hidden sections' drop stores still
+        // clear, or stale bounds would keep catching drops.
+        if self.timeline_open && self.settings.show_daily {
+            self.daily_drop_bounds.borrow_mut().clear();
+            let sidebar_store = self.sidebar_bounds.clone();
+            return div()
+                .w(px(272.))
+                .flex_none()
+                .h_full()
+                .flex()
+                .flex_col()
+                .relative()
+                .bg(t.panel)
+                .border_r_1()
+                .border_color(t.border)
+                .text_size(t.ui_px(12.5))
+                .child(
+                    gpui::canvas(
+                        move |bounds, _, _| {
+                            sidebar_store.borrow_mut().replace(bounds);
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+                .child(self.render_calendar_component(t, drop_day, cx))
+                .child(
+                    div()
+                        .id("sidebar-scroll")
+                        .flex_1()
+                        .min_h(px(0.))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.sidebar_scroll)
+                        .on_scroll_wheel(cx.listener(
+                            |this, ev: &gpui::ScrollWheelEvent, _, cx| {
+                                if cfg!(target_os = "linux") && ev.delta.precise() {
+                                    this.sidebar_flick(
+                                        f32::from(ev.delta.pixel_delta(px(20.)).y),
+                                        cx,
+                                    );
+                                }
+                            },
+                        ))
+                        .child(self.render_timeline_view(t, cx)),
+                );
+        }
 
         let sidebar_store = self.sidebar_bounds.clone();
         let mut side = div()
@@ -56,7 +114,7 @@ impl Workspace {
                 .absolute()
                 .size_full(),
             )
-            .child(self.render_calendar(t, drop_day, cx));
+            .child(self.render_calendar_component(t, drop_day, cx));
 
         // Sync conflicts anywhere in the vault: without this list, a
         // conflict copy of a note that isn't open stays invisible forever.
@@ -106,52 +164,9 @@ impl Workspace {
             }
         }
 
-        // Daily: today plus the next (or previous, per settings) two days.
-        // The bounds store clears before the visibility checks so a hidden
-        // or collapsed section always clears its drop targets.
+        // The old three-day list is gone, but its drop bounds must stay
+        // cleared so a stale frame's targets can't catch a drag release.
         self.daily_drop_bounds.borrow_mut().clear();
-        if self.settings.show_daily {
-            let collapsed = self.section_collapsed("Daily");
-            side = side.child(
-                sechead(t, "sec-daily", "Daily", None, collapsed).on_click(cx.listener(
-                    |this, _, _, cx| this.toggle_section("Daily", cx),
-                )),
-            );
-            if !collapsed {
-                let forward = self.settings.daily_forward;
-                for i in 0..3u64 {
-                    let day = if forward { today + Days::new(i) } else { today - Days::new(i) };
-                    let selected = day == self.selected_day;
-                    let has_note = self.note_days.contains_key(&day);
-                    let is_drop = drop_day == Some(day);
-                    let bounds_store = self.daily_drop_bounds.clone();
-                    let mut row = nav_item(t, ("daily", i as usize))
-                        .relative()
-                        .when(selected, |d| d.bg(t.sel).text_color(t.text))
-                        .child(
-                            gpui::canvas(
-                                move |bounds, _, _| bounds_store.borrow_mut().push((day, bounds)),
-                                |_, _, _, _| {},
-                            )
-                            .absolute()
-                            .size_full(),
-                        )
-                        .when(has_note, |d| {
-                            d.child(div().w(px(7.)).h(px(7.)).flex_none().rounded_full().bg(t.amber))
-                        })
-                        .child(div().flex_1().child(day_label(day)));
-                    if day == today {
-                        row = row.child(count_label(t, "today", false));
-                    }
-                    if is_drop {
-                        row = row.bg(t.sel).text_color(t.accent).border_1().border_color(t.accent);
-                    }
-                    side = side.child(row.on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_day(day, cx);
-                    })));
-                }
-            }
-        }
 
         // Tasks: real counts from the daily-note scan; each row opens a view.
         if self.settings.show_tasks {
@@ -714,14 +729,408 @@ impl Workspace {
         }));
     }
 
+    /// The calendar and its period switcher as one unit: the mini calendar
+    /// (day grid, week picker, or month grid) with the Daily / Weekly /
+    /// Monthly tabs docked beneath it. The tabs drive the calendar, so they
+    /// belong to it rather than floating as a separate sidebar row.
+    fn render_calendar_component(
+        &self,
+        t: &KairnTheme,
+        drop_day: Option<NaiveDate>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let calendar = self.render_calendar(t, drop_day, cx);
+        if !self.settings.show_daily {
+            return calendar;
+        }
+        div()
+            .child(calendar)
+            .child(self.render_period_tabs(t, cx))
+            .into_any_element()
+    }
+
+    /// Period switcher as a mirrored browser-tab strip drawn as one hairline:
+    /// the divider runs under the calendar and dips into a chamfered
+    /// (45-degree cut) outline around the active mode, an upside-down browser
+    /// tab with no fill. Labels are centred with flex, not text alignment:
+    /// gpui drops a div's text alignment while a hover text style applies,
+    /// which made centred labels jump left on hover in every earlier version
+    /// of this strip.
+    fn render_period_tabs(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {
+        const PAD: f32 = 14.;
+        const GAP: f32 = 3.;
+        const HEIGHT: f32 = 21.;
+        const CHAMFER: f32 = 6.;
+        /// The clock tab's width: an icon-sized stub so the three period
+        /// tabs keep most of the strip.
+        const CLOCK_W: f32 = 26.;
+        let tabs: [(&str, &str, PaneView); 3] = [
+            ("period-daily", "Daily", PaneView::Day),
+            ("period-weekly", "Weekly", PaneView::Week),
+            ("period-monthly", "Monthly", PaneView::Month),
+        ];
+        // While the timeline hangs open, the outline cups its clock tab; the
+        // period tabs read as plain labels even though a day is showing. The
+        // clock sits first (index 0), next to Daily, so timeline and daily
+        // swap with one small pointer move; the labels follow at 1..3.
+        let active_idx = if self.timeline_open {
+            Some(0)
+        } else {
+            tabs.iter()
+                .position(|(_, _, view)| self.view == *view)
+                .map(|i| i + 1)
+        };
+        let line = t.border;
+        let outline = gpui::canvas(
+            |_, _, _| {},
+            move |bounds: gpui::Bounds<gpui::Pixels>, _, window, _| {
+                let l = f32::from(bounds.left());
+                let r = f32::from(bounds.right());
+                let top = f32::from(bounds.top()) + 0.5;
+                let bottom = f32::from(bounds.bottom()) - 0.5;
+                let mut path = gpui::PathBuilder::stroke(px(1.));
+                path.move_to(point(px(l), px(top)));
+                if let Some(i) = active_idx {
+                    let w = (r - l - 2. * PAD - 3. * GAP - CLOCK_W) / 3.;
+                    let x0 = if i == 0 {
+                        l + PAD
+                    } else {
+                        l + PAD + CLOCK_W + GAP + ((i - 1) as f32) * (w + GAP)
+                    };
+                    let x1 = x0 + if i == 0 { CLOCK_W } else { w };
+                    path.line_to(point(px(x0), px(top)));
+                    path.line_to(point(px(x0), px(bottom - CHAMFER)));
+                    path.line_to(point(px(x0 + CHAMFER), px(bottom)));
+                    path.line_to(point(px(x1 - CHAMFER), px(bottom)));
+                    path.line_to(point(px(x1), px(bottom - CHAMFER)));
+                    path.line_to(point(px(x1), px(top)));
+                }
+                path.line_to(point(px(r), px(top)));
+                if let Ok(path) = path.build() {
+                    window.paint_path(path, line);
+                }
+            },
+        )
+        .absolute()
+        .size_full();
+
+        let mut row = div().flex().size_full().px(px(PAD)).gap(px(GAP));
+        let hover_text = t.text;
+        row = row.child(
+            div()
+                .id("period-timeline")
+                .w(px(CLOCK_W))
+                .flex_none()
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .when_else(
+                    self.timeline_open,
+                    |d| d.text_color(t.text),
+                    |d| d.text_color(t.dim).hover(move |s| s.text_color(hover_text)),
+                )
+                .child(
+                    gpui::svg()
+                        .path("kairn-icons/clock.svg")
+                        .flex_none()
+                        .w(t.ui_px(12.))
+                        .h(t.ui_px(12.))
+                        .text_color(if self.timeline_open { t.text } else { t.dim }),
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_timeline(cx))),
+        );
+        for (id, label, view) in tabs {
+            let active = !self.timeline_open && self.view == view;
+            let hover_text = t.text;
+            row = row.child(
+                div()
+                    .id(id)
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(t.ui_px(10.5))
+                    .cursor_pointer()
+                    .when_else(
+                        active,
+                        |d| d.text_color(t.text),
+                        |d| d.text_color(t.dim).hover(move |s| s.text_color(hover_text)),
+                    )
+                    .child(label.to_string())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_timeline(cx);
+                        let today = Local::now().date_naive();
+                        match view {
+                            PaneView::Week => this.select_week(today, cx),
+                            PaneView::Month => this.select_month(today, cx),
+                            _ => this.select_day(today, cx),
+                        }
+                    })),
+            );
+        }
+        div().relative().h(px(HEIGHT)).child(outline).child(row)
+    }
+
+    /// The day timeline hanging under the calendar: 24 hour rows, the day's
+    /// time-blocked lines laid over them at their clock positions, and a
+    /// now line on today. Blocks drag to move, drag by the bottom edge to
+    /// resize, and carry onto a calendar day like any other task drag.
+    fn render_timeline_view(&self, t: &KairnTheme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        const GUTTER: f32 = 46.;
+        let min_of = |time: chrono::NaiveTime| (time.hour() * 60 + time.minute()) as i32;
+        let hour_h = px(self.timeline_hour_px());
+        let today = Local::now().date_naive() == self.selected_day;
+
+        let mut rows = div().relative().h(hour_h * 24.);
+
+        // The 24-hour canvas publishes its bounds (the y-to-time ruler) and,
+        // while a drag is live, window-level listeners keep tracking the
+        // pointer wherever it goes, the note editor's drag recipe.
+        let bounds_store = self.timeline_bounds.clone();
+        let dragging = self.timeline_drag.is_some();
+        let workspace = cx.entity();
+        rows = rows.child(
+            gpui::canvas(
+                move |bounds, _, _| {
+                    bounds_store.borrow_mut().replace(bounds);
+                },
+                move |_, _, window, _| {
+                    if !dragging {
+                        return;
+                    }
+                    window.on_mouse_event({
+                        let workspace = workspace.clone();
+                        move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                            if phase != gpui::DispatchPhase::Bubble {
+                                return;
+                            }
+                            if event.pressed_button == Some(MouseButton::Left) {
+                                workspace.update(cx, |ws, cx| {
+                                    ws.on_timeline_drag_move(event.position, cx);
+                                });
+                            }
+                        }
+                    });
+                    window.on_mouse_event({
+                        let workspace = workspace.clone();
+                        move |event: &gpui::MouseUpEvent, phase, _, cx| {
+                            if phase != gpui::DispatchPhase::Bubble
+                                || event.button != MouseButton::Left
+                            {
+                                return;
+                            }
+                            workspace.update(cx, |ws, cx| {
+                                ws.on_timeline_drag_release(event.position, cx);
+                            });
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .size_full(),
+        );
+
+        for hour in 0..24 {
+            rows = rows.child(
+                div()
+                    .absolute()
+                    .top(hour_h * hour as f32)
+                    .left(px(0.))
+                    .right(px(0.))
+                    .h(hour_h)
+                    .border_t_1()
+                    .border_color(t.border.opacity(if hour == 0 { 0. } else { 0.5 }))
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(-7.))
+                            .left(px(10.))
+                            .text_size(t.ui_px(9.))
+                            .text_color(t.faint)
+                            .font_family(t.mono_font.clone())
+                            .child(format!("{hour:02}:00")),
+                    ),
+            );
+        }
+
+        if today {
+            let now_min = min_of(Local::now().time());
+            rows = rows.child(
+                div()
+                    .absolute()
+                    .top(hour_h * (now_min as f32 / 60.) - px(0.75))
+                    .left(px(GUTTER - 5.))
+                    .right(px(0.))
+                    .h(px(1.5))
+                    .bg(t.amber)
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(-2.))
+                            .left(px(0.))
+                            .w(px(5.))
+                            .h(px(5.))
+                            .rounded_full()
+                            .bg(t.amber),
+                    ),
+            );
+        }
+
+        if self.day_timeline.is_empty() {
+            rows = rows.child(
+                div()
+                    .absolute()
+                    .top(hour_h * 9.15)
+                    .left(px(GUTTER))
+                    .right(px(10.))
+                    .text_size(t.ui_px(10.))
+                    .text_color(t.faint)
+                    .child("No timed lines yet. Give a task a time like 09:30 - 10:15 and it lands here."),
+            );
+        }
+
+        // Greedy two-lane layout so overlapping blocks sit side by side
+        // instead of covering each other.
+        let spans: Vec<(i32, i32)> = self
+            .day_timeline
+            .iter()
+            .map(|b| {
+                let s = min_of(b.start);
+                (s, b.end.map(&min_of).unwrap_or(s + 30).max(s + 15))
+            })
+            .collect();
+        let mut lane_busy_until = [i32::MIN, i32::MIN];
+        for (ix, block) in self.day_timeline.iter().enumerate() {
+            let (mut s_min, mut e_min) = spans[ix];
+            let live = match &self.timeline_drag {
+                Some(d) if d.line_idx == block.line_idx && d.moved => {
+                    let (s, e) = self.timeline_drag_times(d);
+                    s_min = min_of(s);
+                    e_min = e.map(&min_of).unwrap_or(s_min + 30).max(s_min + 15);
+                    true
+                }
+                _ => false,
+            };
+            let shared = spans
+                .iter()
+                .enumerate()
+                .any(|(j, &(s, e))| j != ix && s < spans[ix].1 && spans[ix].0 < e);
+            let lane = usize::from(spans[ix].0 < lane_busy_until[0]);
+            lane_busy_until[lane] = lane_busy_until[lane].max(spans[ix].1);
+
+            let y = hour_h * (s_min as f32 / 60.);
+            let h = (hour_h * ((e_min - s_min) as f32 / 60.)).max(px(17.));
+            let time_text = match block.end.is_some() || live {
+                true => format!(
+                    "{:02}:{:02} - {:02}:{:02}",
+                    s_min / 60,
+                    s_min % 60,
+                    e_min / 60,
+                    e_min % 60
+                ),
+                false => format!("{:02}:{:02}", s_min / 60, s_min % 60),
+            };
+            let tall = h >= px(31.);
+
+            let mut card = div()
+                .id(("timeline-block", ix))
+                .absolute()
+                .top(y)
+                .h(h)
+                .rounded(px(6.))
+                .bg(t.sel)
+                .border_1()
+                .border_color(if live { t.accent } else { t.border })
+                .px(px(7.))
+                .py(px(2.))
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .justify_center()
+                .cursor_grab()
+                .text_size(t.ui_px(10.5))
+                .text_color(t.text)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        this.timeline_grab(ix, false, ev.position, cx);
+                    }),
+                );
+            card = match (shared, lane) {
+                (false, _) => card.left(px(GUTTER)).right(px(10.)),
+                (true, 0) => card.left(px(GUTTER)).right(gpui::relative(0.52)),
+                (true, _) => card.left(gpui::relative(0.52)).right(px(10.)),
+            };
+            let label: String = if block.label.is_empty() {
+                "(untitled)".to_string()
+            } else {
+                block.label.clone()
+            };
+            card = card.child(div().whitespace_nowrap().child(label));
+            if tall {
+                card = card.child(
+                    div()
+                        .text_size(t.ui_px(9.))
+                        .text_color(if live { t.accent } else { t.dim })
+                        .font_family(t.mono_font.clone())
+                        .child(time_text),
+                );
+            }
+            // The bottom edge retimes the end instead of moving the block.
+            card = card.child(
+                div()
+                    .id(("timeline-resize", ix))
+                    .absolute()
+                    .bottom(px(0.))
+                    .left(px(0.))
+                    .right(px(0.))
+                    .h(px(7.))
+                    .cursor_row_resize()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.timeline_grab(ix, true, ev.position, cx);
+                        }),
+                    ),
+            );
+            rows = rows.child(card);
+        }
+
+        // The strip slides open from under the calendar rather than popping.
+        div()
+            .pt(px(8.))
+            .pb(px(28.))
+            .child(rows)
+            .with_animation(
+                "timeline-slide",
+                gpui::Animation::new(std::time::Duration::from_millis(170))
+                    .with_easing(gpui::ease_out_quint()),
+                |this, delta| this.mt(px((delta - 1.) * 14.)).opacity(delta),
+            )
+            .into_any_element()
+    }
+
     fn render_calendar(
         &self,
         t: &KairnTheme,
         drop_day: Option<NaiveDate>,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::AnyElement {
         self.calendar_drop_bounds.borrow_mut().clear();
         let today = Local::now().date_naive();
+        // Over a monthly note the calendar is a month picker; over a weekly
+        // note the day grid selects whole weeks; everywhere else it is the
+        // normal day calendar.
+        if self.view == PaneView::Month {
+            return self.render_month_picker(t, cx).into_any_element();
+        }
+        let week_mode = self.view == PaneView::Week;
+        let sel_monday = self.selected_day
+            - Days::new(self.selected_day.weekday().num_days_from_monday() as u64);
         let current_first = today.with_day(1).expect("valid first of month");
         let shown_first = if self.cal_offset >= 0 {
             current_first
@@ -740,7 +1149,7 @@ impl Workspace {
 
         let mut cal = div()
             .px(px(14.))
-            .pt(px(14.))
+            .pt(px(10.))
             .pb(px(2.))
             .child(
                 div()
@@ -762,7 +1171,11 @@ impl Workspace {
                             .child(title)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.cal_offset = 0;
-                                this.select_day(today, cx);
+                                if week_mode {
+                                    this.select_week(today, cx);
+                                } else {
+                                    this.select_day(today, cx);
+                                }
                             })),
                     )
                     .child(
@@ -788,6 +1201,10 @@ impl Workspace {
                 div()
                     .flex()
                     .text_size(t.ui_px(10.5))
+                    // Explicit line height so the grid's total height is
+                    // deterministic; the month picker matches it exactly to
+                    // keep the sidebar from jumping between views.
+                    .line_height(t.ui_px(15.))
                     .text_color(t.faint)
                     .children(["M", "T", "W", "T", "F", "S", "S"].map(|d| {
                         div().flex_1().py(px(2.)).text_center().child(d)
@@ -795,12 +1212,16 @@ impl Workspace {
             );
 
         for week in 0..6u64 {
-            let mut row = div().flex().text_size(t.ui_px(11.5));
+            let row_monday: NaiveDate = grid_start + Days::new(week * 7);
+            let row_selected = week_mode && row_monday == sel_monday;
+            let mut cells: Vec<gpui::AnyElement> = Vec::with_capacity(7);
             for wd in 0..7u64 {
                 let day: NaiveDate = grid_start + Days::new(week * 7 + wd);
                 let in_month = day.month() == shown_first.month();
                 let is_today = day == today;
-                let is_selected = day == self.selected_day;
+                // Week mode selects whole rows; a single lit day would fight
+                // the row highlight.
+                let is_selected = !week_mode && day == self.selected_day;
                 let has_note = self.note_days.contains_key(&day);
                 let stats = self.day_stats.get(&day).copied().unwrap_or_default();
                 let overdue_open = stats.open > 0 && day < today;
@@ -885,18 +1306,141 @@ impl Workspace {
                 };
 
                 let hover_bg = t.hover;
-                row = row.child(
-                    cell.when(!is_today && !is_selected && !is_drop, |c| {
+                let cell = cell
+                    .when(!week_mode && !is_today && !is_selected && !is_drop, |c| {
                         c.hover(move |s| s.bg(hover_bg))
                     })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_day(day, cx);
-                    })),
-                );
+                    .when(!week_mode, |c| {
+                        c.on_click(cx.listener(move |this, _, _, cx| {
+                            this.select_day(day, cx);
+                        }))
+                    });
+                cells.push(cell.into_any_element());
             }
-            cal = cal.child(row);
+            if week_mode {
+                let hover_bg = t.hover;
+                cal = cal.child(
+                    div()
+                        .id(("cal-week", week as usize))
+                        .flex()
+                        .text_size(t.ui_px(11.5))
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .when_else(
+                            row_selected,
+                            |d| d.bg(t.sel),
+                            |d| d.hover(move |s| s.bg(hover_bg)),
+                        )
+                        .children(cells)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.select_week(row_monday, cx);
+                        })),
+                );
+            } else {
+                cal = cal.child(div().flex().text_size(t.ui_px(11.5)).children(cells));
+            }
         }
-        cal
+        cal.into_any_element()
+    }
+
+    /// The mini calendar's month-picker face, shown over a monthly note: a
+    /// year of months, arrows stepping whole years.
+    fn render_month_picker(&self, t: &KairnTheme, cx: &mut Context<Self>) -> gpui::Div {
+        let today = Local::now().date_naive();
+        let shown_year = today.year() + self.cal_offset;
+        let today_hover = t.text;
+        let cal = div().px(px(14.)).pt(px(10.)).pb(px(2.)).child(
+            div()
+                .flex()
+                .justify_between()
+                .items_center()
+                .mb(px(8.))
+                .text_size(t.ui_px(12.))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(
+                    // Clicking the year jumps back to the current month's
+                    // note, mirroring the day calendar's title shortcut.
+                    div()
+                        .id("cal-today")
+                        .text_size(t.ui_px(15.))
+                        .cursor_pointer()
+                        .hover(move |s| s.text_color(today_hover))
+                        .child(shown_year.to_string())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.cal_offset = 0;
+                            this.select_month(today, cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(2.))
+                        .text_color(t.dim)
+                        .child(cal_nav(t, "cal-prev", "‹").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.cal_offset -= 1;
+                                cx.notify();
+                            },
+                        )))
+                        .child(cal_nav(t, "cal-next", "›").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.cal_offset += 1;
+                                cx.notify();
+                            },
+                        ))),
+                ),
+        );
+        // The month grid fills exactly the height of the day calendar's
+        // weekday header plus six week rows (px terms and ui-scaled terms
+        // summed separately), so switching between Daily/Weekly and Monthly
+        // never moves the period strip or the sections below it.
+        let mut grid = div()
+            .h(px(88.) + t.ui_px(93.))
+            .flex()
+            .flex_col();
+        for row_ix in 0..3u32 {
+            let mut row = div().flex().flex_1().items_center().text_size(t.ui_px(11.5));
+            for col in 0..4u32 {
+                let month = row_ix * 4 + col + 1;
+                let Some(first) = NaiveDate::from_ymd_opt(shown_year, month, 1) else {
+                    continue;
+                };
+                let is_current = shown_year == today.year() && month == today.month();
+                let is_selected = shown_year == self.selected_day.year()
+                    && month == self.selected_day.month();
+                let hover_bg = t.hover;
+                // Flex centring, not text_center: a hover restyle drops the
+                // div's text alignment in gpui, so centred text jumps left
+                // under the pointer.
+                let cell = div()
+                    .id(("cal-month", month as usize))
+                    .flex_1()
+                    .h(t.ui_px(30.))
+                    .mx(px(2.))
+                    .rounded(px(5.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .child(first.format("%b").to_string());
+                let cell = if is_current {
+                    cell.bg(t.amber)
+                        .text_color(t.on_amber)
+                        .font_weight(gpui::FontWeight::BOLD)
+                } else if is_selected {
+                    cell.bg(t.sel)
+                        .text_color(t.text)
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                } else {
+                    cell.text_color(t.dim).hover(move |s| s.bg(hover_bg))
+                };
+                row = row.child(cell.on_click(cx.listener(move |this, _, _, cx| {
+                    this.select_month(first, cx);
+                })));
+            }
+            grid = grid.child(row);
+        }
+        cal.child(grid)
     }
 }
 

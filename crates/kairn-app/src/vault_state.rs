@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{Datelike, Days, Local, NaiveDate};
+use chrono::{Datelike, Days, Local, NaiveDate, Timelike};
 use gpui::{AppContext as _, Context, Task, Window};
 use gpui_component::WindowExt;
 use kairn_core as notes;
@@ -45,6 +45,21 @@ fn relocate_line(text: &str, line_idx: usize, expected: &str) -> Option<usize> {
 /// end, which `move_block` treats as "the end of the note").
 fn line_start_offset(text: &str, line_idx: usize) -> usize {
     text.split('\n').take(line_idx).map(|l| l.len() + 1).sum::<usize>().min(text.len())
+}
+
+fn minutes_of(t: chrono::NaiveTime) -> i32 {
+    (t.hour() * 60 + t.minute()) as i32
+}
+
+/// The clock time `min` minutes into the day, clamped to the day.
+fn time_of(min: i32) -> chrono::NaiveTime {
+    let min = min.clamp(0, 23 * 60 + 59) as u32;
+    chrono::NaiveTime::from_hms_opt(min / 60, min % 60, 0).expect("clamped to a valid time")
+}
+
+/// `min` rounded to the nearest 5-minute mark.
+fn snap5(min: i32) -> i32 {
+    (min + 2).div_euclid(5) * 5
 }
 
 fn file_hash(path: &Path) -> Option<u64> {
@@ -125,9 +140,29 @@ impl Workspace {
     }
 
     pub fn select_day(&mut self, day: NaiveDate, cx: &mut Context<Self>) {
+        self.select_period(PaneView::Day, day, cx);
+    }
+
+    /// The weekly note of the week containing `day`.
+    pub fn select_week(&mut self, day: NaiveDate, cx: &mut Context<Self>) {
+        self.select_period(PaneView::Week, day, cx);
+    }
+
+    /// The monthly note of the month containing `day`.
+    pub fn select_month(&mut self, day: NaiveDate, cx: &mut Context<Self>) {
+        self.select_period(PaneView::Month, day, cx);
+    }
+
+    fn select_period(&mut self, view: PaneView, day: NaiveDate, cx: &mut Context<Self>) {
         self.flush_note_editor(cx);
+        // The mini calendar reads cal_offset in the shown view's unit
+        // (months over days and weeks, years over months), so a stale
+        // offset from another view kind would land somewhere surprising.
+        if self.view != view {
+            self.cal_offset = 0;
+        }
         self.selected_day = day;
-        self.view = PaneView::Day;
+        self.view = view;
         self.show_note_pane();
         self.reload_notes(cx);
         cx.notify();
@@ -200,6 +235,8 @@ impl Workspace {
         // with no note yet saves to its daily path on first edit.
         let path = self.doc_path.clone().or_else(|| match &self.view {
             PaneView::Day => Some(notes::daily_path(&self.notes_root, self.selected_day)),
+            PaneView::Week => Some(notes::weekly_path(&self.notes_root, self.selected_day)),
+            PaneView::Month => Some(notes::monthly_path(&self.notes_root, self.selected_day)),
             _ => None,
         });
         let Some(path) = path else {
@@ -233,8 +270,8 @@ impl Workspace {
                 }
                 NoteEditorEvent::OpenDate(date) => this.select_day(*date, cx),
                 NoteEditorEvent::OpenUrl(url) => cx.open_url(url),
-                NoteEditorEvent::BlockDropped { range, position } => {
-                    this.on_block_dropped(range.clone(), *position, cx);
+                NoteEditorEvent::BlockDropped { ranges, position } => {
+                    this.on_block_dropped(ranges.clone(), *position, cx);
                 }
                 NoteEditorEvent::DragMoved { position } => {
                     this.on_drag_moved(*position, cx);
@@ -251,7 +288,7 @@ impl Workspace {
     /// at its top, and anywhere else the drag just ends.
     pub(crate) fn on_block_dropped(
         &mut self,
-        range: std::ops::Range<usize>,
+        ranges: Vec<std::ops::Range<usize>>,
         position: gpui::Point<gpui::Pixels>,
         cx: &mut Context<Self>,
     ) {
@@ -288,9 +325,9 @@ impl Workspace {
         self.hold = HoldState::Idle;
 
         if let Some((day, heading)) = menu_choice {
-            self.move_block_to_day(range, day, heading, cx);
+            self.move_blocks_to_day(&ranges, day, heading, cx);
         } else if let Some(day) = self.resolve_day_drop(position) {
-            self.move_block_to_day(range, day, None, cx);
+            self.move_blocks_to_day(&ranges, day, None, cx);
         }
         cx.notify();
     }
@@ -438,15 +475,190 @@ impl Workspace {
         hit(&self.calendar_drop_bounds).or_else(|| hit(&self.daily_drop_bounds))
     }
 
+    // --- Sidebar day timeline ---
+
+    /// One timeline hour in pixels, scaled with the UI font size the way
+    /// `KairnTheme::ui_px` scales chrome.
+    pub(crate) fn timeline_hour_px(&self) -> f32 {
+        const HOUR: f32 = 52.;
+        let base = crate::theme::UI_BASE_SIZE;
+        HOUR * self.settings.ui_font_size.unwrap_or(base) / base
+    }
+
+    /// Open or close the sidebar timeline (the period strip's clock tab).
+    pub(crate) fn toggle_timeline(&mut self, cx: &mut Context<Self>) {
+        if self.timeline_open {
+            self.close_timeline(cx);
+            return;
+        }
+        self.timeline_open = true;
+        // The timeline reads the selected day's daily note, so it forces the
+        // day view; the reload fills `day_timeline` now that the gate is on.
+        if !matches!(self.view, PaneView::Day) {
+            self.select_period(PaneView::Day, self.selected_day, cx);
+        } else {
+            self.reload_notes(cx);
+        }
+        // Land the useful part on screen: an hour before now on today, an
+        // hour before the first block otherwise, else the working morning.
+        let start_min = if self.selected_day == Local::now().date_naive() {
+            (Local::now().time().hour() as i32 * 60 - 60).max(0)
+        } else if let Some(first) = self.day_timeline.first() {
+            (minutes_of(first.start) - 60).max(0)
+        } else {
+            7 * 60
+        };
+        let y = -(start_min as f32 / 60. * self.timeline_hour_px());
+        self.sidebar_scroll.set_offset(gpui::point(gpui::px(0.), gpui::px(y)));
+        cx.notify();
+    }
+
+    pub(crate) fn close_timeline(&mut self, cx: &mut Context<Self>) {
+        if !self.timeline_open {
+            return;
+        }
+        self.timeline_open = false;
+        self.timeline_drag = None;
+        self.sidebar_scroll.set_offset(gpui::point(gpui::px(0.), gpui::px(0.)));
+        cx.notify();
+    }
+
+    /// Pointer height as minutes from midnight on the timeline's 24-hour
+    /// canvas; `None` before the first paint.
+    fn timeline_pointer_minutes(&self, y: gpui::Pixels) -> Option<i32> {
+        let bounds = (*self.timeline_bounds.borrow())?;
+        Some((f32::from(y - bounds.top()) / self.timeline_hour_px() * 60.) as i32)
+    }
+
+    /// Start dragging a timeline block: its body to move it, its bottom
+    /// edge (`resize`) to change how long it runs.
+    pub(crate) fn timeline_grab(
+        &mut self,
+        block_ix: usize,
+        resize: bool,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(block) = self.day_timeline.get(block_ix) else { return };
+        let Some(pointer_min) = self.timeline_pointer_minutes(position.y) else { return };
+        self.timeline_drag = Some(crate::workspace::TimelineDrag {
+            line_idx: block.line_idx,
+            expected: block.line.clone(),
+            start: block.start,
+            end: block.end,
+            resize,
+            grab_offset_min: pointer_min - minutes_of(block.start),
+            origin: position,
+            position,
+            moved: false,
+        });
+        cx.notify();
+    }
+
+    /// The drag's provisional times at its current pointer position,
+    /// snapped to 5 minutes. A move keeps the block's length (and an
+    /// endless block stays endless); a resize keeps the start and drags
+    /// the end, never shorter than 15 minutes.
+    pub(crate) fn timeline_drag_times(
+        &self,
+        drag: &crate::workspace::TimelineDrag,
+    ) -> (chrono::NaiveTime, Option<chrono::NaiveTime>) {
+        const LAST: i32 = 23 * 60 + 55;
+        let Some(pointer_min) = self.timeline_pointer_minutes(drag.position.y) else {
+            return (drag.start, drag.end);
+        };
+        let start_min = minutes_of(drag.start);
+        if drag.resize {
+            let end = snap5(pointer_min).clamp(start_min + 15, LAST);
+            (drag.start, Some(time_of(end)))
+        } else {
+            let dur = drag.end.map(|e| (minutes_of(e) - start_min).max(5));
+            let start = snap5(pointer_min - drag.grab_offset_min)
+                .clamp(0, LAST - dur.unwrap_or(0));
+            (time_of(start), dur.map(|d| time_of(start + d)))
+        }
+    }
+
+    pub(crate) fn on_timeline_drag_move(
+        &mut self,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = &mut self.timeline_drag else { return };
+        drag.position = position;
+        if !drag.moved {
+            let delta = position - drag.origin;
+            if f32::from(delta.x).abs() > 4. || f32::from(delta.y).abs() > 4. {
+                drag.moved = true;
+            }
+        }
+        if drag.moved {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn on_timeline_drag_release(
+        &mut self,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut drag) = self.timeline_drag.take() else { return };
+        cx.notify();
+        if !drag.moved {
+            return;
+        }
+        drag.position = position;
+        // Carried onto a calendar day: the whole block moves to that day's
+        // note, same as dragging a line out of the editor.
+        if !drag.resize
+            && let Some(day) = self.resolve_day_drop(position)
+            && day != self.selected_day
+        {
+            let Some(text) = self.doc_text.clone() else { return };
+            let matches_grab =
+                text.lines().nth(drag.line_idx).is_some_and(|l| l == drag.expected);
+            if matches_grab {
+                let offset = line_start_offset(&text, drag.line_idx);
+                let range = notes::block_range(&text, offset);
+                self.move_blocks_to_day(&[range], day, None, cx);
+            }
+            return;
+        }
+        let (start, end) = self.timeline_drag_times(&drag);
+        if (start, end) == (drag.start, drag.end) {
+            return;
+        }
+        let Some(new_line) = notes::retime_line(&drag.expected, start, end) else { return };
+        let Some(path) = self.doc_path.clone() else { return };
+        // Pending editor keystrokes reach the file first so the rewrite
+        // lands on what's actually on screen.
+        self.flush_note_editor(cx);
+        match notes::replace_line_on_disk(&path, drag.line_idx, &drag.expected, &new_line) {
+            Ok(Some(idx)) => {
+                self.note_self_write(&path);
+                self.vault_history.push(crate::history::VaultOp::Retime {
+                    ms: crate::note_editor::now_ms(),
+                    path,
+                    line_idx: idx,
+                    before: drag.expected.clone(),
+                    after: new_line,
+                });
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("kairn: could not update {}: {e}", path.display()),
+        }
+        self.reload_notes(cx);
+    }
+
     /// Move a block out of the open note into `day`'s note: to the top, or
     /// to the end of the section named by `heading` (a hold-menu choice,
     /// `(line_idx, raw line)`), falling back to the top when the heading has
     /// vanished. The target's own day is an in-buffer move (one undo step);
     /// anything else inserts on disk first and removes from the buffer
     /// second, so a crash duplicates rather than loses.
-    fn move_block_to_day(
+    fn move_blocks_to_day(
         &mut self,
-        range: std::ops::Range<usize>,
+        ranges: &[std::ops::Range<usize>],
         day: NaiveDate,
         heading: Option<(usize, String)>,
         cx: &mut Context<Self>,
@@ -464,18 +676,24 @@ impl Workspace {
                     Some(line_start_offset(text, line))
                 })
                 .unwrap_or(0);
-            editor.update(cx, |ed, cx| ed.move_block_to(range, offset, cx));
+            editor.update(cx, |ed, cx| ed.move_blocks_to(ranges, offset, cx));
             return;
         }
 
-        let block = editor.read(cx).block_text(range.clone());
+        let block = editor.read(cx).blocks_text(ranges);
         if block.trim().is_empty() {
             return;
         }
+        let from_line_idx = editor.read(cx).first_block_line_idx(ranges);
+        let source = editor.read(cx).path.clone();
+        let mut to_line_idx = 0usize;
         let written = match heading {
             Some((idx, raw)) => {
                 match notes::insert_block_under_heading(&target, idx, &raw, &block) {
-                    Ok(Some(_)) => Ok(Some(target.clone())),
+                    Ok(Some(landed)) => {
+                        to_line_idx = landed;
+                        Ok(Some(target.clone()))
+                    }
                     // The heading (or the whole file) vanished or went
                     // ambiguous underneath the menu: land at the top rather
                     // than guessing.
@@ -499,11 +717,160 @@ impl Workspace {
         match written {
             Ok(path) => {
                 self.note_self_write(&path);
-                editor.update(cx, |ed, cx| ed.remove_block(range, cx));
+                editor.update(cx, |ed, cx| ed.remove_blocks_unrecorded(ranges, cx));
+                // Flush the removal now so the move history's disk-level
+                // inverses always see the source as it really is.
+                self.save_note_editor(cx);
+                self.vault_history.push(crate::history::VaultOp::Transfer {
+                    ms: crate::note_editor::now_ms(),
+                    from: source,
+                    to: path,
+                    block,
+                    from_line_idx,
+                    to_line_idx,
+                });
                 self.reload_notes(cx);
             }
             Err(e) => eprintln!("kairn: could not move block to {day}: {e}"),
         }
+    }
+
+    /// Take back the newest cross-note move or retime: both halves are disk
+    /// edits verified by content, so a vault that changed underneath (sync,
+    /// an agent, the other machine) makes the undo refuse quietly rather
+    /// than guess.
+    pub(crate) fn vault_undo(&mut self, cx: &mut Context<Self>) {
+        use crate::history::VaultOp;
+        let Some(op) = self.vault_history.pop_undo() else { return };
+        self.flush_note_editor(cx);
+        match op {
+            VaultOp::Transfer { ms, from, to, block, from_line_idx, to_line_idx } => {
+                match notes::remove_block_lines(&to, &block) {
+                    Ok(Some(_)) => {
+                        self.note_self_write(&to);
+                        match notes::insert_block_at_line(&from, from_line_idx, &block) {
+                            Ok(idx) => {
+                                self.note_self_write(&from);
+                                self.vault_history.push_undone(VaultOp::Transfer {
+                                    ms,
+                                    from,
+                                    to,
+                                    block,
+                                    from_line_idx: idx,
+                                    to_line_idx,
+                                });
+                            }
+                            Err(e) => {
+                                // Out of the target but not back in the
+                                // source: return it to the target rather
+                                // than losing text.
+                                eprintln!(
+                                    "kairn: undo could not restore into {}: {e}",
+                                    from.display()
+                                );
+                                let _ = notes::insert_block_at_line(&to, to_line_idx, &block);
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        eprintln!("kairn: undo skipped, the moved block changed on disk")
+                    }
+                    Err(e) => eprintln!("kairn: undo failed reading {}: {e}", to.display()),
+                }
+            }
+            VaultOp::Retime { ms, path, line_idx, before, after } => {
+                match notes::replace_line_on_disk(&path, line_idx, &after, &before) {
+                    Ok(Some(idx)) => {
+                        self.note_self_write(&path);
+                        self.vault_history.push_undone(VaultOp::Retime {
+                            ms,
+                            path,
+                            line_idx: idx,
+                            before,
+                            after,
+                        });
+                    }
+                    Ok(None) => {
+                        eprintln!("kairn: undo skipped, the line changed on disk")
+                    }
+                    Err(e) => eprintln!("kairn: undo failed on {}: {e}", path.display()),
+                }
+            }
+        }
+        self.finish_vault_op(cx);
+    }
+
+    /// Re-apply the most recently undone vault op, with the same
+    /// verification contract as [`Self::vault_undo`].
+    pub(crate) fn vault_redo(&mut self, cx: &mut Context<Self>) {
+        use crate::history::VaultOp;
+        let Some(op) = self.vault_history.pop_redo() else { return };
+        self.flush_note_editor(cx);
+        match op {
+            VaultOp::Transfer { ms, from, to, block, from_line_idx, to_line_idx } => {
+                match notes::remove_block_lines(&from, &block) {
+                    Ok(Some(idx)) => {
+                        self.note_self_write(&from);
+                        match notes::insert_block_at_line(&to, to_line_idx, &block) {
+                            Ok(landed) => {
+                                self.note_self_write(&to);
+                                self.vault_history.push_redone(VaultOp::Transfer {
+                                    ms,
+                                    from,
+                                    to,
+                                    block,
+                                    from_line_idx: idx,
+                                    to_line_idx: landed,
+                                });
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "kairn: redo could not insert into {}: {e}",
+                                    to.display()
+                                );
+                                let _ =
+                                    notes::insert_block_at_line(&from, from_line_idx, &block);
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        eprintln!("kairn: redo skipped, the moved block changed on disk")
+                    }
+                    Err(e) => eprintln!("kairn: redo failed reading {}: {e}", from.display()),
+                }
+            }
+            VaultOp::Retime { ms, path, line_idx, before, after } => {
+                match notes::replace_line_on_disk(&path, line_idx, &before, &after) {
+                    Ok(Some(idx)) => {
+                        self.note_self_write(&path);
+                        self.vault_history.push_redone(VaultOp::Retime {
+                            ms,
+                            path,
+                            line_idx: idx,
+                            before,
+                            after,
+                        });
+                    }
+                    Ok(None) => {
+                        eprintln!("kairn: redo skipped, the line changed on disk")
+                    }
+                    Err(e) => eprintln!("kairn: redo failed on {}: {e}", path.display()),
+                }
+            }
+        }
+        self.finish_vault_op(cx);
+    }
+
+    /// Shared tail of a vault-level undo/redo: fold the disk changes back
+    /// into the open editor, then drop the merge-absorption record the
+    /// reconcile just pushed; the vault history owns that change, and a
+    /// buffer undo re-reverting the merge would strand the moved text.
+    fn finish_vault_op(&mut self, cx: &mut Context<Self>) {
+        self.reload_notes(cx);
+        if let Some(editor) = &self.note_editor {
+            editor.update(cx, |ed, _| ed.drop_merge_undo());
+        }
+        cx.notify();
     }
 
     pub fn notes_expanded_contains(&self, path: &std::path::Path) -> bool {
@@ -816,6 +1183,12 @@ impl Workspace {
         }
         let path = match &self.view {
             PaneView::Day => scan.days.get(&self.selected_day).cloned(),
+            PaneView::Week => {
+                notes::period_file(&self.notes_root, &notes::weekly_stem(self.selected_day))
+            }
+            PaneView::Month => {
+                notes::period_file(&self.notes_root, &notes::monthly_stem(self.selected_day))
+            }
             PaneView::Note(p) => Some(p.clone()),
             // Only markdown library files are documents here; other kinds
             // (images, binaries) render from the view's path without a text
@@ -866,15 +1239,15 @@ impl Workspace {
             None => disk_text.clone(),
         };
         self.day_timeline = match (&self.view, &self.doc_text) {
-            (PaneView::Day, Some(text)) if self.settings.day_timeline => {
-                notes::time_blocks(text)
-            }
+            (PaneView::Day, Some(text)) if self.timeline_open => notes::time_blocks(text),
             _ => Vec::new(),
         };
         // Linked mentions for the pane's document: a day is referenced by its
         // ISO date ([[2026-08-07]] and >2026-08-07 alike), a note by its stem.
         let title = match &self.view {
             PaneView::Day => Some(self.selected_day.format("%Y-%m-%d").to_string()),
+            PaneView::Week => Some(notes::weekly_stem(self.selected_day)),
+            PaneView::Month => Some(notes::monthly_stem(self.selected_day)),
             PaneView::Note(p) => p
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -895,6 +1268,12 @@ impl Workspace {
             PaneView::Day => path
                 .clone()
                 .or_else(|| Some(notes::daily_path(&self.notes_root, self.selected_day))),
+            PaneView::Week => path
+                .clone()
+                .or_else(|| Some(notes::weekly_path(&self.notes_root, self.selected_day))),
+            PaneView::Month => path
+                .clone()
+                .or_else(|| Some(notes::monthly_path(&self.notes_root, self.selected_day))),
             _ => path.clone(),
         };
         self.conflicts = conflict_probe

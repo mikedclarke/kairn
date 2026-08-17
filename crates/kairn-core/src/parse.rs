@@ -44,6 +44,9 @@ pub enum SpanKind {
     Link,
     /// A bare http(s) URL, clickable as-is.
     Url,
+    /// A typed clock time or range (`14:00`, `2:30pm`, `09:00-10:30`):
+    /// styled like a link but never clickable.
+    Time,
     /// Raw bytes a styled line does not render: emphasis delimiters,
     /// wiki-link brackets, highlight markers, heading hashes, the
     /// `[`/`](url)` halves of a markdown link. They reveal only on the
@@ -236,6 +239,18 @@ fn inline_spans(text: &str) -> Vec<Span> {
                 continue;
             }
         }
+        // A clock time on a word boundary (not glued to a word, a longer
+        // digit run, or another time's tail) becomes its own span. URLs
+        // never reach here: the branch above consumes them whole.
+        if bytes[i].is_ascii_digit()
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b':')
+            && let Some((end, _, _)) = parse_time_token(text, i)
+        {
+            flush(&mut plain, &mut spans);
+            spans.push((SpanKind::Time, text[i..end].to_string()));
+            i = end;
+            continue;
+        }
         if at_word_start && rest.starts_with('>') && rest.len() > 1 {
             // Only the date-shaped run after `>` is the reference;
             // trailing punctuation (`>2026-08-09.`) is plain text, so
@@ -258,6 +273,96 @@ fn inline_spans(text: &str) -> Vec<Span> {
     }
     flush(&mut plain, &mut spans);
     spans
+}
+
+/// Parse a full time token at `at`: a time, optionally `-`/`–` (spaces
+/// allowed) and a second time. Returns the token's end index and the times.
+/// The caller checks the left word boundary; the right side is enforced
+/// here (`14:000` and `9:30amber` are not times).
+pub(crate) fn parse_time_token(
+    text: &str,
+    at: usize,
+) -> Option<(usize, chrono::NaiveTime, Option<chrono::NaiveTime>)> {
+    let bytes = text.as_bytes();
+    let (mut i, start) = parse_one_time(text, at)?;
+    // An optional range half: `-10:30`, ` - 10:30`, `–10:30`.
+    let rest = &text[i..];
+    let mut j = 0;
+    if rest.as_bytes().first() == Some(&b' ') {
+        j += 1;
+    }
+    let dash = if rest[j..].starts_with('-') {
+        Some(1)
+    } else if rest[j..].starts_with('–') {
+        Some('–'.len_utf8())
+    } else {
+        None
+    };
+    if let Some(dash_len) = dash {
+        let mut k = i + j + dash_len;
+        if k < bytes.len() && bytes[k] == b' ' {
+            k += 1;
+        }
+        if let Some((end_ix, end)) = parse_one_time(text, k) {
+            i = end_ix;
+            return Some((i, start, Some(end)));
+        }
+    }
+    Some((i, start, None))
+}
+
+/// Parse a single time at `at`: `H:MM`/`HH:MM`, optional am/pm (attached or
+/// after one space). Returns the index after the time and the time itself.
+/// A bare 24-hour time above 23:59 (or minutes above 59) is not a time.
+fn parse_one_time(text: &str, at: usize) -> Option<(usize, chrono::NaiveTime)> {
+    let bytes = text.as_bytes();
+    let mut i = at;
+    let digits_start = i;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    let hour_len = i - digits_start;
+    if !(1..=2).contains(&hour_len) {
+        return None;
+    }
+    if i >= bytes.len() || bytes[i] != b':' {
+        return None;
+    }
+    i += 1;
+    let min_start = i;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i - min_start != 2 {
+        return None;
+    }
+    let hour: u32 = text[digits_start..digits_start + hour_len].parse().ok()?;
+    let minute: u32 = text[min_start..min_start + 2].parse().ok()?;
+    if minute > 59 {
+        return None;
+    }
+    // am/pm, attached or after one space; consumed only when it parses.
+    let mut j = i;
+    if j < bytes.len() && bytes[j] == b' ' {
+        j += 1;
+    }
+    let suffix = text[j..].get(..2).map(str::to_ascii_lowercase);
+    let meridiem = match suffix.as_deref() {
+        Some("am") | Some("pm") if !followed_by_word(bytes, j + 2) => suffix,
+        _ => None,
+    };
+    let (hour, end_ix) = match meridiem.as_deref() {
+        Some("am") if (1..=12).contains(&hour) => (hour % 12, j + 2),
+        Some("pm") if (1..=12).contains(&hour) => (hour % 12 + 12, j + 2),
+        _ if hour <= 23 => (hour, i),
+        _ => return None,
+    };
+    chrono::NaiveTime::from_hms_opt(hour, minute, 0).map(|t| (end_ix, t))
+}
+
+/// Whether an alphanumeric continues at `at` (so `9:30amber` isn't `9:30am`).
+fn followed_by_word(bytes: &[u8], at: usize) -> bool {
+    bytes.get(at).is_some_and(|b| b.is_ascii_alphanumeric())
 }
 
 /// An emphasis run starting at `rest`, NotePlan flavour: `*bold*` and
@@ -513,6 +618,40 @@ pub fn display_char_for_raw_col(raw: &str, raw_col: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn times_become_time_spans() {
+        let Line::Task { spans, .. } = parse_line("* call simon at 14:00-15:30 #ops") else {
+            panic!("expected task");
+        };
+        assert!(spans.contains(&(SpanKind::Time, "14:00-15:30".to_string())));
+        // The rest of the line stays plain text / tag.
+        assert!(spans.contains(&(SpanKind::Text, "call simon at ".to_string())));
+
+        let Line::Text { spans } = parse_line("2:30pm review, then 9:15 am standup") else {
+            panic!("expected text");
+        };
+        let times: Vec<&str> = spans
+            .iter()
+            .filter(|(k, _)| *k == SpanKind::Time)
+            .map(|(_, s)| s.as_str())
+            .collect();
+        assert_eq!(times, ["2:30pm", "9:15 am"]);
+
+        // Not times: invalid clocks, digits glued to words, URL innards,
+        // and a second clock hanging off a consumed token's colon tail.
+        for line in ["* 25:00 nope", "* 9:99 nope", "* x14:00 glued"] {
+            let Line::Task { spans, .. } = parse_line(line) else { panic!("task") };
+            assert!(
+                spans.iter().all(|(k, _)| *k != SpanKind::Time),
+                "{line:?} should carry no time span"
+            );
+        }
+        let Line::Text { spans } = parse_line("see https://example.com/a/10:30/page") else {
+            panic!("expected text");
+        };
+        assert!(spans.iter().all(|(k, _)| *k != SpanKind::Time));
+    }
 
     fn plain(s: &str) -> Vec<Span> {
         vec![(SpanKind::Text, s.to_string())]

@@ -37,6 +37,7 @@ pub enum FfiSpanKind {
     Italic,
     Link,
     Url,
+    Time,
     Hidden,
 }
 
@@ -53,6 +54,7 @@ impl From<SpanKind> for FfiSpanKind {
             SpanKind::Italic => Self::Italic,
             SpanKind::Link => Self::Link,
             SpanKind::Url => Self::Url,
+            SpanKind::Time => Self::Time,
             SpanKind::Hidden => Self::Hidden,
         }
     }

@@ -78,19 +78,19 @@ pub struct Settings {
     /// Launch shortcuts that run on this machine, in the user's order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_apps: Vec<HostApp>,
-    /// Whether the sidebar shows the Agents activity section; hiding it
-    /// suits working fully remote over SSH, where local agent activity
-    /// stays empty.
-    #[serde(default = "default_true")]
+    /// Whether the sidebar shows the Agents activity section; hidden by
+    /// default (it stays empty until agents drive the CLI on this machine).
+    #[serde(default)]
     pub show_agents: bool,
-    /// Whether the sidebar shows the Daily section.
+    /// Whether the sidebar shows the calendar area: the mini calendar, the
+    /// timeline / Daily / Weekly / Monthly switcher, and the day timeline.
     #[serde(default = "default_true")]
     pub show_daily: bool,
-    /// Whether the sidebar shows the Tasks section.
-    #[serde(default = "default_true")]
+    /// Whether the sidebar shows the Tasks section; hidden by default.
+    #[serde(default)]
     pub show_tasks: bool,
-    /// The sidebar Daily section looks forward (today plus the next two
-    /// days) when true, back (today plus the previous two) when false.
+    /// Direction of the retired three-day sidebar list. Kept so settings
+    /// files that carry it still load; nothing reads it.
     #[serde(default = "default_true")]
     pub daily_forward: bool,
     /// Sidebar sections the user has collapsed, by their header labels.
@@ -100,9 +100,6 @@ pub struct Settings {
     /// daily notes), or "off". Unknown values read as "always".
     #[serde(default = "default_week_strip")]
     pub week_strip: String,
-    /// The timeline pill row of time-blocked lines on the daily note.
-    #[serde(default = "default_day_timeline")]
-    pub day_timeline: bool,
     /// When the daily template seeds new days: "always", "weekdays", or
     /// "off". Unknown values read as "always".
     #[serde(default = "default_template_rule")]
@@ -133,19 +130,15 @@ pub struct Settings {
 }
 
 fn default_theme() -> String {
-    "ocean".to_string()
+    "menlo".to_string()
 }
 
 fn default_true() -> bool {
     true
 }
 
-fn default_day_timeline() -> bool {
-    false
-}
-
 fn default_week_strip() -> String {
-    "off".to_string()
+    "daily".to_string()
 }
 
 fn default_template_rule() -> String {
@@ -165,20 +158,21 @@ impl Default for Settings {
             library_sort: default_library_sort(),
             ssh_hosts: Vec::new(),
             local_apps: Vec::new(),
-            show_agents: true,
+            show_agents: false,
             show_daily: true,
-            show_tasks: true,
+            show_tasks: false,
             daily_forward: true,
             sidebar_collapsed: Vec::new(),
             week_strip: default_week_strip(),
-            day_timeline: default_day_timeline(),
             daily_template_rule: default_template_rule(),
-            // Fresh-install look: Ocean theme, Noto Sans for chrome and notes
-            // (terminal keeps the auto-resolved mono), everything at 14px.
-            // Existing configs keep their own values; these only seed a new
-            // install (no settings.json yet).
+            // Fresh-install look: Menlo theme, Noto Sans chrome, everything
+            // at 14px. The editor and mono fonts stay unset so the theme
+            // drives them (Menlo brings its own); a settings value here
+            // would override every theme's fonts. Existing configs keep
+            // their own values; these only seed a new install (no
+            // settings.json yet).
             ui_font: Some("Noto Sans".to_string()),
-            editor_font: Some("Noto Sans".to_string()),
+            editor_font: None,
             mono_font: None,
             editor_font_size: Some(14.0),
             ui_font_size: Some(14.0),

@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 
 /// Create the root and its expected folders. Safe to call every launch:
 /// existing folders (e.g. a NotePlan directory) are left untouched.
@@ -31,6 +31,40 @@ pub fn daily_path(root: &Path, date: NaiveDate) -> PathBuf {
 /// optional `.txt` extension when no `.md` file does.
 pub fn daily_file(root: &Path, date: NaiveDate) -> Option<PathBuf> {
     let md = daily_path(root, date);
+    if md.exists() {
+        return Some(md);
+    }
+    let txt = md.with_extension("txt");
+    txt.exists().then_some(txt)
+}
+
+/// Canonical stem of the weekly note containing `date`: `YYYY-Wnn` on ISO
+/// weeks, so the year is the ISO week-year (a January date can belong to the
+/// previous year's last week).
+pub fn weekly_stem(date: NaiveDate) -> String {
+    let iso = date.iso_week();
+    format!("{}-W{:02}", iso.year(), iso.week())
+}
+
+/// Canonical stem of the monthly note containing `date`: `YYYY-MM`.
+pub fn monthly_stem(date: NaiveDate) -> String {
+    format!("{}-{:02}", date.year(), date.month())
+}
+
+/// The weekly note path Kairn writes to: `Calendar/YYYY-Wnn.md`.
+pub fn weekly_path(root: &Path, date: NaiveDate) -> PathBuf {
+    root.join("Calendar").join(format!("{}.md", weekly_stem(date)))
+}
+
+/// The monthly note path Kairn writes to: `Calendar/YYYY-MM.md`.
+pub fn monthly_path(root: &Path, date: NaiveDate) -> PathBuf {
+    root.join("Calendar").join(format!("{}.md", monthly_stem(date)))
+}
+
+/// The period note file that actually exists for a canonical stem, `.md`
+/// preferred over NotePlan's `.txt`.
+pub fn period_file(root: &Path, stem: &str) -> Option<PathBuf> {
+    let md = root.join("Calendar").join(format!("{stem}.md"));
     if md.exists() {
         return Some(md);
     }
@@ -616,6 +650,32 @@ mod tests {
     fn day_filenames() {
         let d = NaiveDate::from_ymd_opt(2026, 8, 6).expect("valid date");
         assert!(daily_path(Path::new("/root"), d).ends_with("Calendar/20260806.md"));
+    }
+
+    #[test]
+    fn weekly_and_monthly_stems_and_paths() {
+        let d = NaiveDate::from_ymd_opt(2026, 8, 14).expect("valid");
+        assert_eq!(weekly_stem(d), "2026-W33");
+        assert_eq!(monthly_stem(d), "2026-08");
+        assert!(weekly_path(Path::new("/root"), d).ends_with("Calendar/2026-W33.md"));
+        assert!(monthly_path(Path::new("/root"), d).ends_with("Calendar/2026-08.md"));
+        // ISO week-year: 2027-01-01 falls in 2026's last ISO week.
+        let jan = NaiveDate::from_ymd_opt(2027, 1, 1).expect("valid");
+        assert_eq!(weekly_stem(jan), "2026-W53");
+        assert_eq!(monthly_stem(jan), "2027-01");
+        // The stems round-trip through the scanner's canonicaliser.
+        assert_eq!(period_stem(&weekly_stem(d)).as_deref(), Some("2026-W33"));
+        assert_eq!(period_stem(&monthly_stem(d)).as_deref(), Some("2026-08"));
+    }
+
+    #[test]
+    fn period_file_prefers_md_over_txt() {
+        let root = ScratchRoot::new("periodfile");
+        assert_eq!(period_file(&root.0, "2026-W33"), None);
+        let txt = root.write("Calendar/2026-W33.txt", "* weekly\n");
+        assert_eq!(period_file(&root.0, "2026-W33"), Some(txt));
+        let md = root.write("Calendar/2026-W33.md", "* weekly\n");
+        assert_eq!(period_file(&root.0, "2026-W33"), Some(md));
     }
 
     #[test]

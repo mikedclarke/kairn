@@ -43,6 +43,10 @@ impl LayoutMode {
 pub enum PaneView {
     /// The selected day's daily note.
     Day,
+    /// The weekly note of the week containing the selected day.
+    Week,
+    /// The monthly note of the month containing the selected day.
+    Month,
     /// A note from the `Notes/` tree.
     Note(PathBuf),
     /// A file from a sidebar Library root: rendered by kind (markdown
@@ -65,6 +69,28 @@ pub(crate) enum HoldState {
         _timer: Task<()>,
     },
     Open(HoldMenu),
+}
+
+/// A drag on a sidebar timeline block. Times are recomputed from the
+/// pointer each frame (the block renders at the provisional slot) and the
+/// note line is rewritten only on release.
+pub(crate) struct TimelineDrag {
+    pub line_idx: usize,
+    /// The raw line at grab time, the write-back verification token.
+    pub expected: String,
+    pub start: chrono::NaiveTime,
+    pub end: Option<chrono::NaiveTime>,
+    /// Dragging the bottom edge (retime the end) rather than the body
+    /// (move the whole block).
+    pub resize: bool,
+    /// Pointer minutes-from-midnight minus block-start minutes at grab
+    /// time, so the block doesn't snap its top edge to the pointer.
+    pub grab_offset_min: i32,
+    pub origin: gpui::Point<gpui::Pixels>,
+    pub position: gpui::Point<gpui::Pixels>,
+    /// True once the pointer has travelled past the drag threshold;
+    /// releases before that are clicks, not edits.
+    pub moved: bool,
 }
 
 pub(crate) struct HoldMenu {
@@ -104,6 +130,9 @@ pub struct Workspace {
     sidebar_open: bool,
     /// The one open overlay (picker, switcher, or capture), if any.
     pub(crate) overlay: Option<Overlay>,
+    /// The settings page, replacing the whole area below the titlebar while
+    /// open. Its batch edits apply when it closes.
+    pub(crate) settings_view: Option<gpui::Entity<crate::settings_dialog::SettingsEditor>>,
     /// The single-buffer editor over the pane's document: the only editing
     /// model. The Writing layout is a focused-width view of the same
     /// editor, not a separate one. Absent when nothing here is editable
@@ -169,9 +198,22 @@ pub struct Workspace {
     /// Open/done task tallies for Monday..Sunday of the selected day's week,
     /// so the week strip can show the same indicators as the calendar.
     pub week_stats: [notes::DayTaskStats; 7],
-    /// Time-blocked lines of the selected day's note, for the timeline pill
-    /// row; empty for other views. Recomputed on reload, not per frame.
+    /// Time-blocked lines of the selected day's note, for the sidebar's
+    /// timeline view; empty for other views. Recomputed on reload, not per
+    /// frame.
     pub day_timeline: Vec<notes::TimeBlock>,
+    /// Whether the sidebar's day timeline hangs open under the calendar
+    /// (the clock tab); while open the other sidebar sections make way and
+    /// the sidebar scroll scrolls the timeline. Session state, not a
+    /// setting.
+    pub(crate) timeline_open: bool,
+    /// An in-flight drag of a timeline block: moving it to another time,
+    /// resizing its end, or carrying it onto a calendar day.
+    pub(crate) timeline_drag: Option<TimelineDrag>,
+    /// The timeline's 24-hour canvas bounds from the last paint, the ruler
+    /// that converts drag positions to clock times.
+    pub(crate) timeline_bounds:
+        std::rc::Rc<std::cell::RefCell<Option<gpui::Bounds<gpui::Pixels>>>>,
     /// Open-task counts for the Today/Open/Overdue views, from the last
     /// reload; renders read these instead of re-scanning per frame.
     pub(crate) task_counts: [usize; 3],
@@ -199,6 +241,10 @@ pub struct Workspace {
     /// Hold-for-heading state: dwelling a drag on a day target for a moment
     /// opens a menu of that day's headings to drop under.
     pub(crate) hold: HoldState,
+    /// Structural undo: cross-note moves and timeline retimes, which the
+    /// note buffer's own undo cannot represent. The undo chord orders these
+    /// against buffer steps by timestamp.
+    pub(crate) vault_history: crate::history::VaultHistory,
     /// The sidebar scroll position, tracked so synthesized momentum can
     /// keep it moving after a touchpad flick (see `sidebar_flick`).
     pub(crate) sidebar_scroll: gpui::ScrollHandle,
@@ -309,6 +355,7 @@ impl Workspace {
             layout: LayoutMode::Split,
             sidebar_open: true,
             overlay: None,
+            settings_view: None,
             note_editor: None,
             _note_editor_sub: None,
             orphaned: None,
@@ -347,10 +394,14 @@ impl Workspace {
             calendar_drop_bounds: Default::default(),
             daily_drop_bounds: Default::default(),
             sidebar_bounds: Default::default(),
+            timeline_open: false,
+            timeline_drag: None,
+            timeline_bounds: Default::default(),
             sidebar_scroll: gpui::ScrollHandle::new(),
             sidebar_flick_samples: std::collections::VecDeque::new(),
             _sidebar_kinetic_task: None,
             hold: HoldState::Idle,
+            vault_history: Default::default(),
             _activity_timer: activity_timer,
             _notes_watcher: notes_watcher,
             _notes_watch_task: notes_watch_task,
@@ -507,21 +558,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Show or hide the daily note's timeline pill row.
-    pub fn set_day_timeline(&mut self, on: bool, cx: &mut Context<Self>) {
-        if self.settings.day_timeline == on {
-            return;
-        }
-        self.settings.day_timeline = on;
-        if let Err(e) = self.settings.save() {
-            eprintln!("kairn: failed to save settings: {e}");
-        }
-        // Turning it on must fill the row for the note already on screen;
-        // off clears it (reload skips the parse entirely while disabled).
-        self.reload_notes(cx);
-        cx.notify();
-    }
-
     /// Show or hide the sidebar's Agents activity section.
     pub fn set_show_agents(&mut self, on: bool, cx: &mut Context<Self>) {
         if self.settings.show_agents == on {
@@ -552,19 +588,6 @@ impl Workspace {
             return;
         }
         self.settings.show_tasks = on;
-        if let Err(e) = self.settings.save() {
-            eprintln!("kairn: failed to save settings: {e}");
-        }
-        cx.notify();
-    }
-
-    /// Point the sidebar Daily section forward (today + next two days) or
-    /// back (today + previous two).
-    pub fn set_daily_forward(&mut self, forward: bool, cx: &mut Context<Self>) {
-        if self.settings.daily_forward == forward {
-            return;
-        }
-        self.settings.daily_forward = forward;
         if let Err(e) = self.settings.save() {
             eprintln!("kairn: failed to save settings: {e}");
         }
@@ -625,9 +648,30 @@ impl Workspace {
         self.open_settings(window, cx);
     }
 
+    /// Open the settings page, or close it (applying its edits) when it is
+    /// already up, so the settings chord toggles.
     pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_view.is_some() {
+            self.close_settings(window, cx);
+            return;
+        }
         self.overlay = None;
-        crate::settings_dialog::open(self, window, cx);
+        let editor = crate::settings_dialog::open(self, window, cx);
+        window.focus(&editor.read(cx).focus_handle());
+        self.settings_view = Some(editor);
+        cx.notify();
+    }
+
+    /// Close the settings page, applying its batch edits. The patch is
+    /// collected in the editor's context and applied here, so neither
+    /// entity re-enters the other.
+    pub(crate) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(editor) = self.settings_view.take() {
+            let patch = editor.update(cx, |editor, cx| editor.collect_patch(cx));
+            self.apply_settings(patch, window, cx);
+            window.focus(&self.focus_handle);
+            cx.notify();
+        }
     }
 
     fn on_new_local_session(
@@ -642,6 +686,49 @@ impl Workspace {
     fn on_quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
         self.flush_note_editor(cx);
         cx.quit();
+    }
+
+    /// The undo chord, owned here rather than by the editor: whichever
+    /// changed the vault most recently is what gets taken back, a buffer
+    /// step (typing, an in-note reorder) or a structural op (a block moved
+    /// to another day, a timeline retime). Text inputs bind their own undo
+    /// in a deeper context and never reach this.
+    fn on_undo(&mut self, _: &EditorUndo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_view.is_some() {
+            return;
+        }
+        let buffer_ms = self.note_editor.as_ref().and_then(|e| e.read(cx).last_undo_ms());
+        let vault_ms = self.vault_history.last_undo_ms();
+        let structural = match (buffer_ms, vault_ms) {
+            (Some(b), Some(v)) => v > b,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if structural {
+            self.vault_undo(cx);
+        } else if let Some(editor) = &self.note_editor {
+            editor.update(cx, |ed, cx| ed.undo(cx));
+        }
+    }
+
+    /// Redo mirrors undo: steps were undone newest-first across both
+    /// histories, so they re-apply oldest-first.
+    fn on_redo(&mut self, _: &EditorRedo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_view.is_some() {
+            return;
+        }
+        let buffer_ms = self.note_editor.as_ref().and_then(|e| e.read(cx).last_redo_ms());
+        let vault_ms = self.vault_history.last_redo_ms();
+        let structural = match (buffer_ms, vault_ms) {
+            (Some(b), Some(v)) => v < b,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if structural {
+            self.vault_redo(cx);
+        } else if let Some(editor) = &self.note_editor {
+            editor.update(cx, |ed, cx| ed.redo(cx));
+        }
     }
 
     fn on_activate_nth(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -691,18 +778,27 @@ impl Render for Workspace {
         }
 
         let mut body = div().flex().flex_1().min_h(px(0.));
-        // Writing is the focused layout: the note at a comfortable measure,
-        // no sidebar.
-        if self.sidebar_open && self.layout != LayoutMode::Writing {
-            body = body.child(self.render_sidebar(&t, cx));
-        } else {
-            // No sidebar this frame: its drop targets must not linger as
-            // invisible hit zones for an in-flight drag.
+        if let Some(editor) = &self.settings_view {
+            // Settings take over everything below the titlebar. The hidden
+            // panes' drop stores must not linger as invisible hit zones.
             self.sidebar_bounds.borrow_mut().take();
             self.calendar_drop_bounds.borrow_mut().clear();
             self.daily_drop_bounds.borrow_mut().clear();
+            body = body.child(editor.clone());
+        } else {
+            // Writing is the focused layout: the note at a comfortable
+            // measure, no sidebar.
+            if self.sidebar_open && self.layout != LayoutMode::Writing {
+                body = body.child(self.render_sidebar(&t, cx));
+            } else {
+                // No sidebar this frame: its drop targets must not linger as
+                // invisible hit zones for an in-flight drag.
+                self.sidebar_bounds.borrow_mut().take();
+                self.calendar_drop_bounds.borrow_mut().clear();
+                self.daily_drop_bounds.borrow_mut().clear();
+            }
+            body = body.child(self.render_main(&t, window, cx));
         }
-        body = body.child(self.render_main(&t, window, cx));
 
         div()
             .id("kairn-root")
@@ -719,12 +815,26 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_toggle_terminal_full))
             .on_action(cx.listener(Self::on_toggle_writing))
+            .on_action(cx.listener(|this, _: &LayoutNotes, w, cx| {
+                this.set_layout(LayoutMode::NotesFull, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &LayoutSplit, w, cx| {
+                this.set_layout(LayoutMode::Split, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &LayoutTerminal, w, cx| {
+                this.set_layout(LayoutMode::TerminalFull, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &LayoutWriting, w, cx| {
+                this.set_layout(LayoutMode::Writing, w, cx)
+            }))
             .on_action(cx.listener(Self::on_toggle_switcher))
             .on_action(cx.listener(Self::on_close_overlay))
             .on_action(cx.listener(Self::on_toggle_theme))
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_capture))
             .on_action(cx.listener(Self::on_save_note))
+            .on_action(cx.listener(Self::on_undo))
+            .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::on_new_local_session))
             .on_action(cx.listener(Self::on_quit))
             .on_action(cx.listener(|this, _: &Session1, w, cx| this.on_activate_nth(0, w, cx)))
@@ -739,7 +849,11 @@ impl Render for Workspace {
             .on_key_down(cx.listener(Self::on_key_down))
             .child(self.render_titlebar(&t, cx))
             .child(body)
-            .child(self.render_settings_fab(&t, cx))
+            .children(
+                self.settings_view
+                    .is_none()
+                    .then(|| self.render_settings_fab(&t, cx)),
+            )
             .children(self.render_statusbar(&t, cx))
             .children(self.render_picker(&t, window, cx))
             .children(self.render_notes_menu(&t, window, cx))
