@@ -10,42 +10,25 @@ same fact twice; no em dashes. Rewrite to this standard before releasing.
 
 ## Added
 
-<!-- New user-visible capabilities. -->
-
-A clock tab on the calendar switcher opens a day timeline in the sidebar: the day's timed tasks appear as blocks that drag to a new time, resize from the bottom edge to change length, and drop onto a calendar day to move there.
-
-Select several tasks and drag any handle inside the selection to move them all at once: within the note, onto a calendar day, or into a section via the hold menu.
-
-Undo now covers moves: Cmd+Z (Ctrl+Shift+Z on Linux) takes back a drag to another day, an in-note reorder, or a timeline retime, and Cmd+Shift+Z (Ctrl+Shift+Y on Linux) re-applies it.
-
-Every layout has a direct keyboard shortcut in switcher order: Cmd+Option+1 to 4 on macOS, Ctrl+Alt+1 to 4 on Linux.
-
-Titlebar controls show a hover tooltip naming the control with its keyboard shortcut beneath, so shortcuts are learnable from the UI.
+- Weekly (2026-W33) and monthly (2026-08) notes join dailies, with the sidebar calendar switching between a day view, a week picker, and a months grid.
+- A clock tab on the calendar switcher opens a day timeline in the sidebar, where timed tasks drag to a new time, resize to change length, and drop onto a calendar day to move there.
+- Select several tasks and drag any handle inside the selection to move them all at once: within the note, onto a calendar day, or into a section.
+- Undo covers moves: Cmd+Z (Ctrl+Shift+Z on Linux) takes back a drag to another day, an in-note reorder, or a timeline retime, and Cmd+Shift+Z (Ctrl+Shift+Y on Linux) re-applies it.
+- Typed clock times and time ranges highlight like links in the editor.
+- Themes are picked from one searchable dropdown: a new Menlo theme is the default, and the old Default look becomes the Sage and Sage Light themes.
+- Every layout has a direct keyboard shortcut in switcher order: Cmd+Option+1 to 4 on macOS, Ctrl+Alt+1 to 4 on Linux.
+- Titlebar controls show a hover tooltip naming the control and its keyboard shortcut.
 
 ## Improved
 
-<!-- Refinements to existing workflows, reliability, performance, or UX. -->
-
-The Daily, Weekly, and Monthly switcher is now a slim strip drawn as a single line under the calendar, with the active mode outlined as an upside-down tab with 45-degree cut corners.
-
-Settings is a full page instead of a popup: sections in a left rail, one scrolling content column, one stable size, and room to grow; Esc or Back returns to the app and applies your changes.
-
-The timeline clock tab sits first on the calendar switcher, next to Daily, so the two swap with one small pointer move.
-
-The titlebar search and layout switcher are one capsule at a single height, with all four layouts (Writing, Notes, Notes + Terminal, Terminal) as matching drawn icons.
-
-The titlebar search hint says what search covers (notes, days, sessions) instead of just jump.
-
-The calendar starts slightly higher in the sidebar.
-
-The month picker fills the same height as the day calendar, so switching views no longer shifts the sidebar.
-
-The timeline pill row above daily notes and its setting are retired in favour of the sidebar timeline.
+- The Daily, Weekly, and Monthly switcher is a slim strip under the calendar, with the timeline clock tab first and the active mode outlined as a tab with cut corners.
+- Settings is a full page instead of a popup: sections in a left rail, one scrolling column, one stable size; Esc or Back returns to the app and applies your changes.
+- The titlebar search and layout switcher are one capsule, and the search hint names what search covers: notes, days, and sessions.
+- The month picker fills the same height as the day calendar, so switching views no longer shifts the sidebar.
+- New installs start with the week strip shown on daily notes and the Tasks and Agents sections hidden.
+- The timeline pill row above daily notes and the daily-list direction setting are retired.
 
 ## Fixed
 
-<!-- Bugs that no longer happen. -->
-
-Calendar switcher and month picker labels no longer shift left while hovered.
-
-Week strip day cards no longer overflow the strip at larger interface sizes.
+- Calendar switcher and month picker labels no longer shift while hovered.
+- Week strip day cards no longer overflow the strip at larger interface sizes.

@@ -13,7 +13,6 @@ use gpui_component::{
 
 use gpui::SharedString;
 use kairn_core::settings::{HostApp, SshHost};
-use kairn_core::themes::ThemeEntry;
 use crate::cli_install;
 use crate::keymap::keybind_list;
 use crate::theme::KairnThemeExt as _;
@@ -41,6 +40,7 @@ impl Tab {
 }
 
 type FontSelect = Entity<SelectState<SearchableVec<String>>>;
+type ThemeSelect = Entity<SelectState<SearchableVec<String>>>;
 
 /// The sentinel first entry of every font picker: no override stored, the
 /// built-in choice applies.
@@ -99,11 +99,15 @@ pub struct SettingsEditor {
     template_body: Entity<InputState>,
     /// Pending apply rule; lands with Save like the body.
     template_rule: String,
-    /// Pending theme id ("dark"/"light" or a theme-file stem); lands with
-    /// Save, so browsing choices never repaints the app behind the dialog.
-    theme_choice: String,
-    /// Theme files found in `.kairn/themes/` at open.
-    themes: Vec<ThemeEntry>,
+    /// Picker rows as (stored id, shown name): the built-in themes then the
+    /// vault's `.kairn/themes/` files, in display order.
+    theme_items: Vec<(String, String)>,
+    /// Pending theme choice; lands with Save, so browsing choices never
+    /// repaints the app behind the page.
+    theme_select: ThemeSelect,
+    /// The id loaded from settings, kept when the select resolves nothing
+    /// (a theme configured on another machine and absent here).
+    theme_loaded: String,
     ui_font: FontSelect,
     editor_font: FontSelect,
     mono_font: FontSelect,
@@ -234,6 +238,39 @@ impl SettingsEditor {
         });
 
         let themes = kairn_core::themes::list_themes(&ws.notes_root);
+        let mut theme_items: Vec<(String, String)> = crate::theme::BUILTIN_THEMES
+            .iter()
+            .map(|(id, name)| (id.to_string(), name.to_string()))
+            .collect();
+        for t in &themes {
+            // A vault file with a built-in's id is shadowed by the built-in
+            // when the theme applies, so listing it would offer the same
+            // theme twice.
+            if crate::theme::BUILTIN_THEMES.iter().any(|(id, _)| *id == t.id) {
+                continue;
+            }
+            // A vault name colliding with an earlier entry carries its id, so
+            // the select's string values stay unambiguous.
+            let name = if theme_items.iter().any(|(_, n)| *n == t.name) {
+                format!("{} ({})", t.name, t.id)
+            } else {
+                t.name.clone()
+            };
+            theme_items.push((t.id.clone(), name));
+        }
+        let selected_theme = theme_items
+            .iter()
+            .find(|(id, _)| *id == ws.settings.theme)
+            .map(|(_, name)| name.clone());
+        let theme_select = cx.new(|cx| {
+            let names: Vec<String> = theme_items.iter().map(|(_, n)| n.clone()).collect();
+            let mut state =
+                SelectState::new(SearchableVec::new(names), None, window, cx).searchable(true);
+            if let Some(name) = &selected_theme {
+                state.set_selected_value(name, window, cx);
+            }
+            state
+        });
         // Installed families, macOS dot-prefixed system internals excluded, as
         // a set to filter the curated candidate lists against.
         let installed: std::collections::HashSet<String> = cx
@@ -297,8 +334,9 @@ impl SettingsEditor {
             template_loaded,
             template_body,
             template_rule: ws.settings.daily_template_rule.clone(),
-            theme_choice: ws.settings.theme.clone(),
-            themes,
+            theme_items,
+            theme_select,
+            theme_loaded: ws.settings.theme.clone(),
             ui_font,
             editor_font,
             mono_font,
@@ -378,7 +416,19 @@ impl SettingsEditor {
             local_apps: collect_apps(&self.local_apps, cx),
             daily_template_rule: self.template_rule.clone(),
             template_body: (body != self.template_loaded).then_some(body),
-            theme: self.theme_choice.clone(),
+            // Selected display name mapped back to its stored id; no
+            // selection keeps the loaded id rather than resetting it.
+            theme: self
+                .theme_select
+                .read(cx)
+                .selected_value()
+                .and_then(|v| {
+                    self.theme_items
+                        .iter()
+                        .find(|(_, name)| name == v)
+                        .map(|(id, _)| id.clone())
+                })
+                .unwrap_or_else(|| self.theme_loaded.clone()),
             ui_font: font_of(&self.ui_font, &self.fonts_loaded.0),
             editor_font: font_of(&self.editor_font, &self.fonts_loaded.1),
             mono_font: font_of(&self.mono_font, &self.fonts_loaded.2),
@@ -612,58 +662,7 @@ impl SettingsEditor {
             })
     }
 
-    fn render_theme(&self, cx: &mut Context<Self>) -> gpui::Div {
-        // The choice stored in settings is one id, but it reads as two
-        // rows: Appearance (the base dark/light look) and Theme (Default,
-        // the coloured presets, and the vault's custom themes). A preset or
-        // custom theme carries its own mode, so while one is active the
-        // Appearance row reflects that mode; clicking there drops back to
-        // the Default theme in the clicked mode.
-        let active_mode = match self.theme_choice.as_str() {
-            "light" => "light",
-            "dark" => "dark",
-            id => self
-                .themes
-                .iter()
-                .find(|t| t.id == id)
-                .map(|t| if t.mode == "light" { "light" } else { "dark" })
-                // The built-in presets are all dark.
-                .unwrap_or("dark"),
-        };
-        let mut mode_row = h_flex().gap_2();
-        for (id, name) in [("dark", "Dark"), ("light", "Light")] {
-            let btn = Button::new(("appearance-choice", (id == "light") as usize)).label(name);
-            let btn = if id == active_mode { btn.primary() } else { btn.outline() };
-            mode_row = mode_row.child(btn.on_click(cx.listener(move |this, _, _, cx| {
-                this.theme_choice = id.to_string();
-                cx.notify();
-            })));
-        }
-
-        let is_default = matches!(self.theme_choice.as_str(), "dark" | "light");
-        let mut choices: Vec<(String, String)> =
-            vec![("default".to_string(), "Default".to_string())];
-        choices.extend(
-            crate::theme::BUILTIN_PRESETS
-                .iter()
-                .map(|(id, name)| (id.to_string(), name.to_string())),
-        );
-        choices.extend(self.themes.iter().map(|t| (t.id.clone(), t.name.clone())));
-        let mut theme_row = h_flex().gap_2().flex_wrap();
-        for (i, (id, name)) in choices.into_iter().enumerate() {
-            let selected = if id == "default" { is_default } else { id == self.theme_choice };
-            let btn = Button::new(("theme-choice", i)).label(name);
-            let btn = if selected { btn.primary() } else { btn.outline() };
-            let active_mode = active_mode.to_string();
-            theme_row = theme_row.child(btn.on_click(cx.listener(move |this, _, _, cx| {
-                // "Default" keeps whatever mode is showing; a theme brings
-                // its own.
-                this.theme_choice =
-                    if id == "default" { active_mode.clone() } else { id.clone() };
-                cx.notify();
-            })));
-        }
-
+    fn render_theme(&self, _cx: &mut Context<Self>) -> gpui::Div {
         let label = |text: &'static str| {
             div().w(px(120.)).flex_none().text_size(px(12.5)).child(text)
         };
@@ -678,19 +677,12 @@ impl SettingsEditor {
         v_flex()
             .gap_2()
             .w_full()
-            .child(Self::section("Appearance"))
-            .child(mode_row)
-            .child(div().text_size(px(11.)).opacity(0.55).child(
-                "The base look. Themes below carry their own mode; picking \
-                 Dark or Light returns to the Default theme.",
-            ))
             .child(Self::section("Theme"))
-            .child(theme_row)
+            .child(Select::new(&self.theme_select))
             .child(div().text_size(px(11.)).opacity(0.55).child(
-                "The coloured presets are built in. For full control, custom \
-                 themes are JSON files in .kairn/themes/ inside your notes \
-                 folder; any colours, fonts, and terminal shades they leave \
-                 out fall back to the built-ins.",
+                "For full control, custom themes are JSON files in \
+                 .kairn/themes/ inside your notes folder; any colours, fonts, \
+                 and terminal shades they leave out fall back to the built-ins.",
             ))
             .child(Self::section("Fonts"))
             .child(font_row("Interface", &self.ui_font))

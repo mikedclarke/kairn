@@ -130,7 +130,7 @@ pub struct Settings {
 }
 
 fn default_theme() -> String {
-    "ocean".to_string()
+    "menlo".to_string()
 }
 
 fn default_true() -> bool {
@@ -165,12 +165,14 @@ impl Default for Settings {
             sidebar_collapsed: Vec::new(),
             week_strip: default_week_strip(),
             daily_template_rule: default_template_rule(),
-            // Fresh-install look: Ocean theme, Noto Sans for chrome and notes
-            // (terminal keeps the auto-resolved mono), everything at 14px.
-            // Existing configs keep their own values; these only seed a new
-            // install (no settings.json yet).
+            // Fresh-install look: Menlo theme, Noto Sans chrome, everything
+            // at 14px. The editor and mono fonts stay unset so the theme
+            // drives them (Menlo brings its own); a settings value here
+            // would override every theme's fonts. Existing configs keep
+            // their own values; these only seed a new install (no
+            // settings.json yet).
             ui_font: Some("Noto Sans".to_string()),
-            editor_font: Some("Noto Sans".to_string()),
+            editor_font: None,
             mono_font: None,
             editor_font_size: Some(14.0),
             ui_font_size: Some(14.0),
