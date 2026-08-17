@@ -58,8 +58,6 @@ No cloud, no accounts, no database. Just a folder of markdown.
 
 ![The terminal at full width running herdr, with two coding-agent sessions and the notes sidebar alongside](docs/screenshot-terminal.png)
 
-![The terminal at full width running herdr, with two coding-agent sessions and the notes sidebar alongside](docs/screenshot-terminal.png)
-
 ### Capture and navigation
 
 - Quick capture chord: one overlay, one field, appends to today's note
