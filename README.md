@@ -6,12 +6,12 @@
 
 Your notes and terminals in one calm, native window.
 
-Kairn is a daily-notes and tasks app with real terminal sessions. Plan the day, run the work, and capture what you learned without switching apps.
+Kairn is a notes and tasks app with real terminal sessions. Plan the day, run the work, and capture what you learned without switching apps.
 
 All plain markdown files on disk. Built in Rust on [GPUI](https://www.gpui.rs). One codebase for
 macOS and Linux. Not Electron.
 
-![Kairn: a daily note, tasks, and calendar beside herdr running a Claude Code session](docs/screenshot.png)
+![A daily note, tasks, and month calendar beside a terminal running the kairn CLI, with a live agent feed](docs/hero.png)
 
 ## Why
 
@@ -26,7 +26,7 @@ No cloud, no accounts, no database. Just a folder of markdown.
 
 ### Notes and editing
 
-- Daily notes with templates, a month calendar, a week strip, and a day timeline built from time-blocked lines (`09:00 standup`, `14:00-15:30 call`)
+- Daily, weekly, and monthly notes with templates; a month calendar, a week strip, and a day timeline built from time-blocked lines (`09:00 standup`, `14:00-15:30 call`) that you can drag to reschedule
 - One continuous markdown editor: live styling as you type, syntax markers hidden except on the cursor line, no separate edit mode
 - Wiki links, #tags, @mentions, date refs, highlights, bold/italic, markdown links, and bare URLs, all clickable; missing wiki-link targets are created on click
 - Linked mentions under every note: each line elsewhere that links to it
@@ -35,14 +35,19 @@ No cloud, no accounts, no database. Just a folder of markdown.
 - A watched notes folder: changes from outside the app appear live
 - Honest failure states: an unmounted notes folder blocks the pane rather than showing a convincing empty vault; sync conflict copies get a banner with one-click open
 
+![The sidebar calendar switching between a day grid, a week picker, and a months grid, each opening its own note](docs/calendar.gif)
+
 ### Tasks
 
 - NotePlan task syntax: `* task`, `+ checklist`, `[ ]`/`[x]`/`[>]`/`[-]`, `!`/`!!`/`!!!` priority
 - Real due dates: a `>2026-08-12` token means due that day, daily-note tasks default to their day, and dated tasks from any note join the views
 - Today / Open / Overdue views with live counts and click-through to the source note
 - Click a checkbox anywhere to complete it (writes `[x]` back to disk in the line's own style)
-- Drag any line by its handle: reorder within the note (sub-lines travel along), or drop it on a week-strip day, calendar day, or Daily row to move it into that day's note; hold over a day to file it under one of that note's headings
+- Drag any line by its handle: reorder within the note (sub-lines travel along), or drop it on a week-strip day, calendar day, or the day timeline to move it there; hold over a day to file it under one of that note's headings. Select several tasks first and they all travel together
+- Undo covers moves, in-note reorders, and timeline retimes
 - Calendar and week-strip indicators for open, done, and overdue days
+
+![Dragging a task by its handle onto another day in the week strip, moving it into that day's note](docs/tasks.gif)
 
 ### Terminal
 
@@ -50,13 +55,15 @@ No cloud, no accounts, no database. Just a folder of markdown.
 - Full-fidelity emulation on the alacritty engine: true colour, scrollback, application cursor mode, OSC 52 clipboard, bracketed paste, SGR mouse reporting (click, drag, and all three buttons, so TUI apps are fully clickable), focus reporting
 - Per-theme terminal palettes and font, live font-size zoom
 
+![The terminal at full width running the kairn CLI, with the notes sidebar alongside](docs/terminal.png)
+
 ### Agents
 
 - The `kairn` CLI is the agent surface: read, search, and append to notes, edit single lines safely, work tasks (list, add, complete, carry forward), all with `--json` output and stable exit codes designed for models reading `--help`
 - Every CLI write is logged to `.kairn/activity.jsonl` in the vault (so it syncs), and the app shows the feed live in an Agents sidebar section, with named actors via `--actor` / `$KAIRN_ACTOR`
 - Same core, same write safety: agents go through the identical never-clobber paths as the editor
 
-![The terminal at full width running herdr, with two coding-agent sessions and the notes sidebar alongside](docs/screenshot-terminal.png)
+![The kairn CLI writing to notes while the Agents sidebar and the note update the moment each command runs](docs/agents.gif)
 
 ### Capture and navigation
 
@@ -64,17 +71,21 @@ No cloud, no accounts, no database. Just a folder of markdown.
 - A jump switcher for sessions, days, and notes: fuzzy titles, full-text search with snippets, and date-shaped queries (`aug 12`, `tomorrow`, `2026-W32`)
 - Writing mode: the note at a comfortable measure, nothing else
 
-![Writing mode: a daily note centred at a comfortable measure with the week strip on top and no sidebar](docs/screenshot-writing.png)
+![The jump switcher searching notes, days, weeks, and months at once, with snippets](docs/switcher.gif)
 
 ### Theming and settings
 
-- Dark and Light built-in themes, plus custom themes as JSON files in the vault (`.kairn/themes/*.json`), overriding any subset of palette, fonts, and terminal colours; see [docs/themes.md](docs/themes.md)
+- Built-in themes (Menlo, Ocean, Sage, Sage Light, Rose, Forest) picked from a searchable dropdown, plus custom themes as JSON files in the vault (`.kairn/themes/*.json`), overriding any subset of palette, fonts, and terminal colours; see [docs/themes.md](docs/themes.md)
+- A full-page Settings screen: sections in a left rail, one scrolling column, changes applied on close
 - Searchable font pickers for interface, editor, and terminal; editor text size setting
 - Settings survive corruption: a malformed settings file is backed up and can never silently wipe your configuration
+
+![Kairn in the Sage Light theme, showing that it is not a dark-only app](docs/themes.png)
 
 ### Your files, your vault
 
 - Plain markdown on disk. No database, no lock-in, no servers, no telemetry.
+- A Library section browses folders from anywhere on disk beside your vault: markdown and code open in the editor, images inline with a gallery strip, everything else as a details card
 - NotePlan-compatible vault layout: point Kairn at an existing NotePlan directory and both apps read and write the same files (`Calendar/` for period notes, `Notes/` for everything else, `@Trash` soft delete, `@Templates/Daily.md`)
 - Local-first: sync belongs to Syncthing (or any file sync); remote machines are an SSH session away
 
