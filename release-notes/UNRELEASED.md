@@ -10,12 +10,16 @@ restating the same fact twice; no em dashes. Rewrite to this standard before rel
 
 ## Added
 
-<!-- New user-visible capabilities. -->
+- Pasting a bare web link fetches the page title and turns it into a markdown link.
 
 ## Improved
 
-<!-- Refinements to existing workflows, reliability, performance, or UX. -->
+- Regular notes open as just the document: the pane title, folder line, and divider are gone, and the note's own first heading is the title.
+- Sessions live in the titlebar: a small indicator shows how many are open, and clicking it switches, closes, or starts sessions; the sidebar section is retired.
+- The week strip lines up with the note's centred width in the Writing layout instead of stretching across the window.
+- Dash lists show a round bullet dot instead of a grey dash.
 
 ## Fixed
 
-<!-- Bugs that no longer happen. -->
+- Wrapped lines no longer strand a closing bracket or trailing punctuation at the start of the next line.
+- Enter at the start of a heading, quote, or indented line moves the whole line down instead of splitting off its markdown prefix.
