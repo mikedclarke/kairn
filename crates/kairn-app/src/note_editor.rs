@@ -2549,26 +2549,23 @@ impl Element for NoteEditorElement {
                     );
                 }
                 Glyph::Bullet => {
+                    // A round bullet dot, like every other markdown editor's
+                    // list marker; a quad rather than a shaped `•` so it
+                    // centres identically on every platform.
                     let scale = t.editor_size / theme::EDITOR_BASE_SIZE;
-                    let dash = window.text_system().shape_line(
-                        SharedString::from("–"),
-                        px(13. * scale),
-                        &[TextRun {
-                            len: "–".len(),
-                            font: window.text_style().font(),
-                            color: t.faint,
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                        }],
-                        None,
+                    let d = px(5. * scale);
+                    let mut dot = fill(
+                        Bounds::new(
+                            point(
+                                glyph_x + px(2. * scale),
+                                text_origin.y + (slot.entry.line_height - d) / 2.,
+                            ),
+                            size(d, d),
+                        ),
+                        t.dim,
                     );
-                    let _ = dash.paint(
-                        point(glyph_x, text_origin.y),
-                        slot.entry.line_height,
-                        window,
-                        cx,
-                    );
+                    dot.corner_radii = Corners::all(d / 2.);
+                    window.paint_quad(dot);
                 }
                 Glyph::QuoteBar => {
                     window.paint_quad(fill(
