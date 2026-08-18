@@ -1,8 +1,9 @@
 //! Window chrome: the custom titlebar and the statusbar.
 
 use gpui::{
-    App, Context, Hsla, InteractiveElement, IntoElement, ParentElement, PathBuilder,
-    StatefulInteractiveElement, Styled, div, point, prelude::FluentBuilder as _, px,
+    App, Context, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, PathBuilder, StatefulInteractiveElement, Styled, div, point,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::{TitleBar, h_flex};
 
@@ -79,9 +80,53 @@ impl Workspace {
                     .child(self.layout_mode_button(t, "mode-term", LayoutMode::TerminalFull, cx)),
             );
 
+        // The sessions indicator: how many are open, lit while any is busy.
+        // Clicking drops the sessions menu (switch, close, start new). The
+        // sessions list lives here rather than in the sidebar.
+        let busy_any = self.sessions.iter().any(|s| s.busy);
+        let count = self.sessions.len();
+        let sessions_btn = h_flex()
+            .id("sessions-btn")
+            .h(px(CAPSULE_H))
+            .px(px(11.))
+            .gap(px(7.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(t.border)
+            .bg(t.bg)
+            .text_size(t.ui_px(12.))
+            .text_color(t.dim)
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover_bg))
+            .tooltip(hover_hint("Sessions", None))
+            .child(
+                div()
+                    .w(px(7.))
+                    .h(px(7.))
+                    .flex_none()
+                    .rounded_full()
+                    .when_else(
+                        busy_any,
+                        |d| d.bg(t.accent),
+                        |d| d.border_1().border_color(t.faint),
+                    ),
+            )
+            .child(count.to_string())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_sessions_menu(
+                        point(ev.position.x, ev.position.y + px(10.)),
+                        window,
+                        cx,
+                    );
+                }),
+            );
+
         TitleBar::new()
             .child(h_flex().h_full().items_center().child(sidebar_btn))
-            .child(h_flex().pr(px(8.)).child(capsule))
+            .child(h_flex().pr(px(8.)).gap(px(8.)).child(capsule).child(sessions_btn))
     }
 
     /// One cell of the layout switcher: its glyph (drawn, so every cell keeps

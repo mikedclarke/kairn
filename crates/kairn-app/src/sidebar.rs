@@ -8,7 +8,7 @@ use gpui::{
 use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
 
 use crate::theme::KairnTheme;
-use crate::workspace::{PaneView, TaskQuery, Workspace, chord};
+use crate::workspace::{PaneView, TaskQuery, Workspace};
 
 /// The file manager by its platform name, for context-menu labels.
 pub(crate) const REVEAL_LABEL: &str = if cfg!(target_os = "macos") {
@@ -19,7 +19,6 @@ pub(crate) const REVEAL_LABEL: &str = if cfg!(target_os = "macos") {
 
 impl Workspace {
     pub fn render_sidebar(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {
-        let session_count = self.sessions.len();
         let today = Local::now().date_naive();
 
         // While a line drag is in flight, the day row or cell under the
@@ -492,85 +491,8 @@ impl Workspace {
             }
         }
 
-        // Sessions: the real list.
-        let collapsed = self.section_collapsed("Sessions");
-        side = side.child(
-            sechead(t, "sec-sessions", "Sessions", Some(session_count.to_string()), collapsed)
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_section("Sessions", cx)))
-                .child(sechead_plus(t, "sessions-plus").on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                        cx.stop_propagation();
-                        this.open_picker(
-                            point(ev.position.x, ev.position.y + px(8.)),
-                            window,
-                            cx,
-                        );
-                    }),
-                )),
-        );
-        if !collapsed {
-            for (i, session) in self.sessions.iter().enumerate() {
-                let busy = session.busy;
-                let active = i == self.active_session;
-                let dot = div()
-                    .w(px(7.))
-                    .h(px(7.))
-                    .flex_none()
-                    .rounded_full()
-                    .when_else(
-                        busy,
-                        |d| d.bg(t.accent),
-                        |d| d.border_1().border_color(t.faint),
-                    );
-
-                let mut row = nav_item(t, ("session", i))
-                    .when(active, |d| d.bg(t.sel).text_color(t.text))
-                    .child(dot)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .child(session.label()),
-                    );
-                if session.kind.is_remote() {
-                    row = row.child(
-                        div()
-                            .text_size(t.ui_px(9.5))
-                            .border_1()
-                            .border_color(t.border)
-                            .rounded(px(3.))
-                            .px(px(4.))
-                            .text_color(t.faint)
-                            .child("SSH"),
-                    );
-                }
-                if i < 9 {
-                    row = row.child(
-                        div()
-                            .font_family(t.mono_font.clone())
-                            .text_size(t.ui_px(10.5))
-                            .text_color(t.faint)
-                            .child(chord(&(i + 1).to_string())),
-                    );
-                }
-                let ws = cx.weak_entity();
-                side = side.child(
-                    row.on_click(cx.listener(move |this, _, window, cx| {
-                        this.activate_session(i, window, cx);
-                    }))
-                    .context_menu(move |menu, _, _| {
-                        let ws = ws.clone();
-                        menu.item(PopupMenuItem::new("Close session").on_click(move |_, _, cx| {
-                            let _ = ws.update(cx, |this, _| this.close_session(i));
-                        }))
-                    }),
-                );
-            }
-        }
+        // Sessions live in the titlebar (the indicator and its dropdown),
+        // not in the sidebar.
 
         // Agents: recent CLI writes from the vault's activity log, quiet
         // read-only rows. The empty state stays honest when there are none.

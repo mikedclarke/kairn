@@ -856,6 +856,7 @@ impl Render for Workspace {
             )
             .children(self.render_statusbar(&t, cx))
             .children(self.render_picker(&t, window, cx))
+            .children(self.render_sessions_menu(&t, window, cx))
             .children(self.render_notes_menu(&t, window, cx))
             .children(self.render_switcher(&t, cx))
             .children(self.render_capture(&t, cx))

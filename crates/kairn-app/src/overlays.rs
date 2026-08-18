@@ -29,6 +29,8 @@ use crate::workspace::{LayoutMode, Workspace};
 pub enum Overlay {
     /// The new-session menu, anchored near the click.
     Picker { pos: Point<Pixels> },
+    /// The titlebar sessions dropdown: switch, close, or start sessions.
+    Sessions { pos: Point<Pixels> },
     /// The Notes section's add menu (note or folder at the top level),
     /// anchored near the click.
     NotesMenu { pos: Point<Pixels> },
@@ -93,6 +95,17 @@ impl Workspace {
         // The picker has no input of its own to take focus, so focus the
         // overlay layer itself: Escape then dispatches through the
         // backdrop's key context.
+        self.overlay_focus.focus(window);
+        cx.notify();
+    }
+
+    pub fn open_sessions_menu(
+        &mut self,
+        pos: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.overlay = Some(Overlay::Sessions { pos });
         self.overlay_focus.focus(window);
         cx.notify();
     }
@@ -516,6 +529,149 @@ impl Workspace {
                 // Escape closes: the same key context as every other
                 // overlay backdrop, with the overlay focus tracked so the
                 // binding has a dispatch path.
+                .track_focus(&self.overlay_focus)
+                .key_context("Overlay")
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        this.close_overlays(window, cx);
+                    }),
+                )
+                .child(menu),
+        )
+    }
+
+    /// The titlebar sessions dropdown: every open session (click to switch,
+    /// ✕ to close), then the way into a new one.
+    pub(crate) fn render_sessions_menu(
+        &self,
+        t: &KairnTheme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let Some(Overlay::Sessions { pos }) = &self.overlay else {
+            return None;
+        };
+        let pos = *pos;
+
+        // Anchored under a control at the window's right edge: clamp inside.
+        const MENU_W: f32 = 300.;
+        let est_height = px((self.sessions.len().max(1) as f32 + 1.) * 30.0 + 22.0);
+        let viewport = window.viewport_size();
+        let left = pos.x.min(viewport.width - px(MENU_W + 8.)).max(px(8.));
+        let top = pos.y.min(viewport.height - est_height - px(8.)).max(px(0.));
+
+        let mut menu = div()
+            .absolute()
+            .left(left)
+            .top(top)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .w(px(MENU_W))
+            .p(px(5.))
+            .rounded(px(9.))
+            .border_1()
+            .border_color(t.border)
+            .bg(t.panel2)
+            .shadow_lg()
+            .text_size(px(12.5));
+
+        if self.sessions.is_empty() {
+            menu = menu.child(
+                div()
+                    .px(px(10.))
+                    .py(px(6.))
+                    .text_color(t.faint)
+                    .child("No open sessions"),
+            );
+        }
+        for (i, session) in self.sessions.iter().enumerate() {
+            let busy = session.busy;
+            let active = i == self.active_session;
+            let dot = div()
+                .w(px(7.))
+                .h(px(7.))
+                .flex_none()
+                .rounded_full()
+                .when_else(
+                    busy,
+                    |d| d.bg(t.accent),
+                    |d| d.border_1().border_color(t.faint),
+                );
+            let mut row = picker_item(t, ("sessions-menu-row", i), cx)
+                .when(active, |d| d.bg(t.sel))
+                .child(dot)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(session.label()),
+                );
+            if session.kind.is_remote() {
+                row = row.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(9.5))
+                        .border_1()
+                        .border_color(t.border)
+                        .rounded(px(3.))
+                        .px(px(4.))
+                        .text_color(t.faint)
+                        .child("SSH"),
+                );
+            }
+            if i < 9 {
+                row = row.child(
+                    div()
+                        .flex_none()
+                        .font_family(t.mono_font.clone())
+                        .text_size(px(10.5))
+                        .text_color(t.faint)
+                        .child(chord(&(i + 1).to_string())),
+                );
+            }
+            let hover_text = t.text;
+            row = row.child(
+                div()
+                    .id(("sessions-menu-close", i))
+                    .flex_none()
+                    .px(px(4.))
+                    .rounded(px(4.))
+                    .text_color(t.faint)
+                    .cursor_pointer()
+                    .hover(move |s| s.text_color(hover_text))
+                    .child("✕")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.close_session(i);
+                    })),
+            );
+            menu = menu.child(row.on_click(cx.listener(move |this, _, window, cx| {
+                this.activate_session(i, window, cx);
+                this.close_overlays(window, cx);
+            })));
+        }
+
+        // The picker replaces this menu in place: anchored at the menu's
+        // clamped corner, not the raw click position, so it stays inside
+        // the window too.
+        let picker_pos = gpui::point(left, top);
+        menu = menu.child(picker_rule(t)).child(
+            picker_item(t, "sessions-menu-new", cx)
+                .text_color(t.dim)
+                .child("New session…")
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_picker(picker_pos, window, cx);
+                })),
+        );
+
+        Some(
+            div()
+                .id("sessions-backdrop")
+                .absolute()
+                .inset_0()
                 .track_focus(&self.overlay_focus)
                 .key_context("Overlay")
                 .on_mouse_down(
