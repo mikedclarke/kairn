@@ -224,7 +224,7 @@ impl Workspace {
             // mentions) follows it; unset inherits the UI font.
             .when_some(t.editor_font.clone(), |d, f| d.font_family(f));
         if strip_on {
-            pane = pane.child(self.render_week_strip(t, cx));
+            pane = pane.child(self.render_week_strip(t, writing, cx));
         } else {
             // No strip, no drop targets: stale cell bounds from a previous
             // frame must not catch a task drag released up there.
@@ -245,7 +245,12 @@ impl Workspace {
         )
     }
 
-    fn render_week_strip(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_week_strip(
+        &self,
+        t: &KairnTheme,
+        writing: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let today = Local::now().date_naive();
         let selected = self.selected_day;
         let monday = selected - Days::new(selected.weekday().num_days_from_monday() as u64);
@@ -268,22 +273,20 @@ impl Workspace {
         self.week_strip_bounds.borrow_mut().clear();
 
         // The strip's content sits inside the note's own side padding (38px,
-        // see `note_frame`), so on wide screens the days start and end where
-        // the note text does instead of stretching wall to wall.
+        // see `note_frame`) and, in the Writing layout, inside the note's
+        // centred 720px measure, so the days always start and end where the
+        // note text does instead of stretching wall to wall.
         // The day cards' height scales with the UI font, so the strip must
         // too: a fixed 48px let the amber selected pill poke past the strip
         // at larger UI sizes. Fixed padding terms plus ui-scaled text terms,
         // with the cards' line heights pinned below.
-        let mut strip = div()
-            .h(px(16.) + t.ui_px(34.))
-            .flex_none()
-            .flex()
+        let mut strip = h_flex()
+            .w_full()
+            .h_full()
             .items_center()
             .gap(px(4.))
             .px(px(38.))
-            .bg(t.panel)
-            .border_b_1()
-            .border_color(t.border)
+            .when(writing, |d| d.max_w(px(720.)))
             .child(
                 week_nav(t, "week-prev", "‹").on_click(cx.listener(move |this, _, _, cx| {
                     this.select_day(this.selected_day - Days::new(7), cx);
@@ -371,11 +374,21 @@ impl Workspace {
             );
         }
 
-        strip.child(
+        let strip = strip.child(
             week_nav(t, "week-next", "›").on_click(cx.listener(move |this, _, _, cx| {
                 this.select_day(this.selected_day + Days::new(7), cx);
             })),
-        )
+        );
+
+        div()
+            .h(px(16.) + t.ui_px(34.))
+            .flex_none()
+            .flex()
+            .justify_center()
+            .bg(t.panel)
+            .border_b_1()
+            .border_color(t.border)
+            .child(strip)
     }
 
     fn render_note(
