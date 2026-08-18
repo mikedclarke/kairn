@@ -237,7 +237,8 @@ impl NoteBuffer {
 
         // Never split inside a list marker or task bracket: the earliest
         // split point is the start of the line's content.
-        let col = (offset - line_start).max(content_start_col(&line)).min(line.len());
+        let content_col = content_start_col(&line).min(line.len());
+        let col = (offset - line_start).max(content_col).min(line.len());
         let split_at = line_start + floor_boundary(&line, col);
         let head = &self.text[line_start..split_at];
         let tail_empty = split_at == line_end;
@@ -246,6 +247,21 @@ impl NoteBuffer {
         if tail_empty && !head.is_empty() && head == prefix {
             // Enter on a bare marker: the list is over; the marker clears.
             return self.edit_with_kind(line_start..line_end, "", offset, now_ms, GroupKind::Other);
+        }
+        if offset <= line_start + content_col && !tail_empty && !head.is_empty() && head != prefix
+        {
+            // Enter at (or before) the visible start of a line whose prefix a
+            // continuation would not recreate (heading hashes, the quote
+            // marker, bare indentation): the whole line moves down intact,
+            // like any editor at a line start, instead of stranding the
+            // prefix above. The cursor stays at the content it sat on.
+            self.edit_with_kind(line_start..line_start, "\n", offset, now_ms, GroupKind::Other);
+            // The returned cursor tracks the moved content, not the insert
+            // point; keep the undo record's redo cursor in step with it.
+            if let Some(g) = self.undo.last_mut() {
+                g.cursor_after = offset + 1;
+            }
+            return offset + 1;
         }
         let insert = format!("\n{prefix}");
         self.edit_with_kind(split_at..split_at, &insert, offset, now_ms, GroupKind::Other)
@@ -648,6 +664,42 @@ mod tests {
         let c = b.split_line(5, 2000);
         assert_eq!(b.text(), "* buy\n*  milk");
         assert_eq!(c, 8);
+    }
+
+    #[test]
+    fn split_line_at_heading_start_moves_the_whole_line() {
+        let mut b = NoteBuffer::new("## Title\nbody");
+        // Cursor at the heading's visible start (after the hashes): the
+        // heading moves down intact instead of stranding "## " above.
+        let c = b.split_line(3, 1000);
+        assert_eq!(b.text(), "\n## Title\nbody");
+        assert_eq!(c, 4);
+        b.undo();
+        assert_eq!(b.text(), "## Title\nbody");
+    }
+
+    #[test]
+    fn split_line_mid_heading_still_splits() {
+        let mut b = NoteBuffer::new("## Title");
+        let c = b.split_line(5, 1000);
+        assert_eq!(b.text(), "## Ti\ntle");
+        assert_eq!(c, 6);
+    }
+
+    #[test]
+    fn split_line_at_end_of_bare_heading_opens_a_line_below() {
+        let mut b = NoteBuffer::new("## ");
+        let c = b.split_line(3, 1000);
+        assert_eq!(b.text(), "## \n");
+        assert_eq!(c, 4);
+    }
+
+    #[test]
+    fn split_line_at_quote_start_moves_the_whole_line() {
+        let mut b = NoteBuffer::new("> quoted");
+        let c = b.split_line(2, 1000);
+        assert_eq!(b.text(), "\n> quoted");
+        assert_eq!(c, 3);
     }
 
     #[test]
