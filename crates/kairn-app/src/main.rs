@@ -2,6 +2,7 @@ mod chrome;
 mod cli_install;
 mod history;
 mod keymap;
+mod link_title;
 mod name_dialog;
 mod note_editor;
 mod overlays;
