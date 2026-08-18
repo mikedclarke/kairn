@@ -479,7 +479,22 @@ impl Workspace {
             _ => None,
         };
 
-        let mut note = note_frame(t, writing, masthead, badge, subline);
+        // Regular notes and library markdown open as just the document: the
+        // file's own `# title` line is the title (editing it still renames
+        // the file), so a pane masthead on top would read as a double title.
+        // Day/week/month views keep their masthead (their files carry no
+        // title line), as do non-markdown library files (the metadata card
+        // needs a name).
+        let bare = match &self.view {
+            PaneView::Note(_) => true,
+            PaneView::Library(path) => file_kind(path) == FileKind::Markdown,
+            _ => false,
+        };
+        let mut note = if bare {
+            note_frame_bare(writing)
+        } else {
+            note_frame(t, writing, masthead, badge, subline)
+        };
         if let Some(banner) = self.render_orphan_banner(t, cx) {
             note = note.child(banner);
         }
@@ -1022,6 +1037,17 @@ fn note_frame(
                 .child(subline),
         )
         .child(div().my(px(8.)).h(px(1.)).bg(t.border))
+}
+
+/// The pane scaffold without the masthead: padding and measure only, for
+/// documents whose own `# title` line is the title.
+fn note_frame_bare(writing: bool) -> gpui::Div {
+    div()
+        .px(px(38.))
+        .pt(px(18.))
+        .pb(px(26.))
+        .line_height(relative(1.58))
+        .when(writing, |d| d.max_w(px(720.)).mx_auto().pt(px(44.)))
 }
 
 /// Bytes as a short human figure: whole KB/MB below ten, one decimal above.
