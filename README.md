@@ -29,6 +29,7 @@ No cloud, no accounts, no database. Just a folder of markdown.
 - Daily, weekly, and monthly notes with templates; a month calendar, a week strip, and a day timeline built from time-blocked lines (`09:00 standup`, `14:00-15:30 call`) that you can drag to reschedule
 - One continuous markdown editor: live styling as you type, syntax markers hidden except on the cursor line, no separate edit mode
 - Wiki links, #tags, @mentions, date refs, highlights, bold/italic, markdown links, and bare URLs, all clickable; missing wiki-link targets are created on click
+- Paste a bare web link and it fetches the page title in the background, turning the URL into a `[title](url)` markdown link
 - Linked mentions under every note: each line elsewhere that links to it
 - Full editing: selection, clipboard, undo/redo, IME, list continuation, drag handles to reorder lines
 - Autosave with atomic, never-clobber writes: every save three-way merges against the file on disk, so external edits (agents, sync, other editors) are never lost, and genuine collisions surface in a banner instead of silently dropping text
