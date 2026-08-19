@@ -948,6 +948,73 @@ impl NoteEditor {
         self.cursor = self.buffer.edit(range, &text, self.cursor, now_ms());
         self.buffer.break_undo_group();
         self.after_edit(cx);
+
+        // A paste that is exactly one bare URL upgrades to a markdown link
+        // once its page title arrives; the raw URL stays if the fetch fails
+        // or the text has moved on. Its own undo step, so ⌘Z restores the
+        // bare URL.
+        if let Some(url) = crate::link_title::pasted_url(&text) {
+            let url = url.to_string();
+            let insert_start = self.cursor - text.len();
+            let url_start = insert_start + text.find(url.as_str()).unwrap_or(0);
+            let fetch_url = url.clone();
+            cx.spawn(async move |this, cx| {
+                let title = cx
+                    .background_executor()
+                    .spawn(async move { crate::link_title::fetch_title(&fetch_url) })
+                    .await;
+                let Some(title) = title else { return };
+                let _ = this.update(cx, |ed, cx| {
+                    ed.apply_link_title(url_start, &url, &title, cx);
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// Swap the pasted URL at `start` for `[title](url)`, but only if the
+    /// document still holds exactly that URL there (edits since the paste
+    /// shift or change it, and then the raw URL simply stays) and it isn't
+    /// already inside markdown link syntax.
+    fn apply_link_title(&mut self, start: usize, url: &str, title: &str, cx: &mut Context<Self>) {
+        // Mid-composition, mid-drag, or mid-select, the byte offsets below
+        // are about to move; skip rather than corrupt (the raw URL stays).
+        if self.ime_marked.is_some() || self.line_drag.is_some() || self.selecting {
+            return;
+        }
+        let end = start + url.len();
+        if self.text().get(start..end) != Some(url) {
+            return;
+        }
+        if self.text()[..start].ends_with('(') {
+            return;
+        }
+        let md = format!("[{title}]({url})");
+        let grew = md.len() - url.len();
+        let cursor = self.cursor;
+        self.buffer.break_undo_group();
+        self.buffer.edit(start..end, &md, cursor, now_ms());
+        self.buffer.break_undo_group();
+        // The caret stays with what it was on: past the URL it shifts by the
+        // growth, inside it (unlikely) it lands after the link.
+        self.cursor = if cursor >= end {
+            cursor + grew
+        } else if cursor > start {
+            start + md.len()
+        } else {
+            cursor
+        };
+        self.selection_anchor = self.selection_anchor.map(|a| {
+            if a >= end {
+                a + grew
+            } else if a > start {
+                start + md.len()
+            } else {
+                a
+            }
+        });
+        self.schedule_autosave(cx);
+        cx.notify();
     }
 
     /// Follow a link target: the shared path behind a left-click on a link
@@ -2549,26 +2616,23 @@ impl Element for NoteEditorElement {
                     );
                 }
                 Glyph::Bullet => {
+                    // A round bullet dot, like every other markdown editor's
+                    // list marker; a quad rather than a shaped `•` so it
+                    // centres identically on every platform.
                     let scale = t.editor_size / theme::EDITOR_BASE_SIZE;
-                    let dash = window.text_system().shape_line(
-                        SharedString::from("–"),
-                        px(13. * scale),
-                        &[TextRun {
-                            len: "–".len(),
-                            font: window.text_style().font(),
-                            color: t.faint,
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                        }],
-                        None,
+                    let d = px(5. * scale);
+                    let mut dot = fill(
+                        Bounds::new(
+                            point(
+                                glyph_x + px(2. * scale),
+                                text_origin.y + (slot.entry.line_height - d) / 2.,
+                            ),
+                            size(d, d),
+                        ),
+                        t.dim,
                     );
-                    let _ = dash.paint(
-                        point(glyph_x, text_origin.y),
-                        slot.entry.line_height,
-                        window,
-                        cx,
-                    );
+                    dot.corner_radii = Corners::all(d / 2.);
+                    window.paint_quad(dot);
                 }
                 Glyph::QuoteBar => {
                     window.paint_quad(fill(

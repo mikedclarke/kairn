@@ -17,7 +17,7 @@ default-members = ["crates/kairn-app"]
 # One version for the app, core, and CLI: bump it here when cutting a release
 # (see docs/RELEASING.md). The vendored gpui-terminal fork keeps its own.
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/mikedclarke/kairn"
@@ -36,5 +36,9 @@ opt-level = 2
 # gpui-component vendored at 0.5.1 (crates.io has no newer release) to fix the
 # text-input scroll bug that blanked overflowing dialog inputs; see
 # vendor/gpui-component/KAIRN-CHANGES.md.
+# gpui vendored at 0.2.2 to fix line wrapping breaking before closing
+# punctuation (a trailing `)` wrapped alone onto the next line); see
+# vendor/gpui/KAIRN-CHANGES.md.
 [patch.crates-io]
 gpui-component = { path = "vendor/gpui-component" }
+gpui = { path = "vendor/gpui" }
