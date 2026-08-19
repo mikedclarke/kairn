@@ -5,6 +5,24 @@ in [release-notes/UNRELEASED.md](release-notes/UNRELEASED.md) as they are built 
 here when a version ships. The release process is described in
 [docs/RELEASING.md](docs/RELEASING.md).
 
+## 0.3.1 (2026-08-19)
+
+### Added
+
+- Pasting a bare web link fetches the page title and turns it into a markdown link.
+
+### Improved
+
+- Regular notes open as just the document, with the note's first heading as its title.
+- Terminal sessions move to the titlebar, replacing the sidebar section.
+- The week strip lines up with the note's centred width in the Writing layout instead of stretching across the window.
+- Dash lists show a round bullet dot instead of a grey dash.
+
+### Fixed
+
+- Wrapped lines no longer strand a closing bracket or trailing punctuation at the start of the next line.
+- Enter at the start of a heading, quote, or indented line moves the whole line down instead of splitting off its markdown prefix.
+
 ## 0.3.0 (2026-08-17)
 
 ### Added
