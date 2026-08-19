@@ -1,13 +1,16 @@
 //! The engine facade the host drives (spec §14). One `SyncEngine` per vault:
 //! `sync_now()` runs a blocking cycle, `start()`/`stop()` own a background
-//! thread that runs the cycle on a filesystem-watcher wake (desktop) and on a
+//! thread that runs the cycle on a filesystem-watcher wake (desktop), on a
+//! remote wake from the server's freshness WebSocket (spec §12), and on a
 //! 30-minute safety timer, and `status()` reports the latest state.
 //!
-//! The same object serves both platforms: the desktop app calls `start()`; iOS
-//! calls `sync_now()` from its foreground and background-fetch/push handlers
-//! (there is no persistent watcher there, so the watcher simply isn't built).
-//! The shapes here are UniFFI-friendly (plain config in, plain report out, an
-//! event callback) so the iOS bridge can wrap them without reshaping the engine.
+//! The same object serves both platforms: hosts call `start()` while they can
+//! keep a worker alive (desktop always; iOS while foregrounded) and
+//! `sync_now()` from moments that demand a cycle (app-foreground,
+//! background-fetch/push handlers). The watcher is desktop-only; the remote
+//! wake runs everywhere a server URL is configured. The shapes here are
+//! UniFFI-friendly (plain config in, plain report out, an event callback) so
+//! the iOS bridge can wrap them without reshaping the engine.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +25,21 @@ use crate::state::StateStore;
 use crate::transport::Transport;
 use crate::types::{CycleReport, SyncConfig, SyncEvent, SyncStatus};
 use crate::vaultio::VaultIo;
+
+/// Where the freshness wake socket connects and how it authenticates (spec
+/// §12). Mirrors the transport's identity. Defined here, not in the wake
+/// module, so hosts can carry one in [`EngineConfig`] whether or not the
+/// `http` feature (which brings the actual listener) is compiled in.
+#[derive(Clone)]
+pub struct RemoteWakeConfig {
+    /// The server origin, e.g. `http://100.121.119.52:8787`. Plain HTTP on
+    /// purpose, the same terms as the HTTP transport.
+    pub server_url: String,
+    pub vault_id: String,
+    /// The device bearer token; the wake route sits behind the same auth as
+    /// the rest of the API.
+    pub token: String,
+}
 
 /// The safety-net full cycle interval when nothing wakes the engine sooner
 /// (spec §7). The watcher and explicit `sync_now()` handle the common case.
@@ -43,6 +61,12 @@ pub struct EngineConfig {
     pub vault_id: Option<String>,
     /// Let a cycle push an unbounded number of deletes (see [`SyncConfig`]).
     pub allow_bulk_delete: bool,
+    /// Listen on the server's freshness WebSocket while the worker runs, so a
+    /// remote edit triggers a cycle in seconds instead of on the safety timer
+    /// (spec §12). `None` (and engines over a fake transport) rely on the
+    /// watcher and timer alone; without the `http` feature the value is
+    /// carried but no listener is built.
+    pub remote_wake: Option<RemoteWakeConfig>,
 }
 
 /// The mutable half, guarded so a cycle never overlaps itself. A cycle is
@@ -84,9 +108,12 @@ pub struct SyncEngine {
     shared: Arc<Shared>,
     worker: Mutex<Option<Worker>>,
     vault_root: PathBuf,
-    /// The worker waits on the condvar; the watcher sets `pending` and notifies
-    /// it to run sooner, and `stop()` sets `stop` and notifies it to exit.
+    /// The worker waits on the condvar; the watcher and the remote wake set
+    /// `pending` and notify it to run sooner, and `stop()` sets `stop` and
+    /// notifies it to exit.
     wake: Arc<(Mutex<WakeState>, Condvar)>,
+    /// Where the remote wake listener connects, if configured.
+    remote_wake: Option<RemoteWakeConfig>,
 }
 
 impl SyncEngine {
@@ -108,6 +135,7 @@ impl SyncEngine {
             config.vault_id.as_deref(),
         )?;
         let vault = VaultIo::new(&config.vault_root, &config.device_label);
+        let remote_wake = config.remote_wake.clone();
         Ok(Self {
             shared: Arc::new(Shared {
                 inner: Mutex::new(Inner {
@@ -125,6 +153,7 @@ impl SyncEngine {
             worker: Mutex::new(None),
             vault_root: config.vault_root,
             wake: Arc::new((Mutex::new(WakeState::default()), Condvar::new())),
+            remote_wake,
         })
     }
 
@@ -143,8 +172,8 @@ impl SyncEngine {
     }
 
     /// Start the background worker: an immediate cycle, then cycles on watcher
-    /// wakes (desktop) and the safety timer. Idempotent — a second call while
-    /// running does nothing.
+    /// wakes (desktop), remote wakes from the server's freshness socket, and
+    /// the safety timer. Idempotent — a second call while running does nothing.
     pub fn start(&self) {
         let mut w = self.worker.lock().unwrap();
         if w.is_some() {
@@ -155,7 +184,8 @@ impl SyncEngine {
         let shared = self.shared.clone();
         let wake = self.wake.clone();
         let root = self.vault_root.clone();
-        let handle = std::thread::spawn(move || worker_loop(shared, wake, root));
+        let remote = self.remote_wake.clone();
+        let handle = std::thread::spawn(move || worker_loop(shared, wake, root, remote));
         *w = Some(Worker { handle });
         self.shared.status.lock().unwrap().running = true;
     }
@@ -223,13 +253,33 @@ fn run_once(shared: &Shared) -> Result<CycleReport> {
     result
 }
 
-fn worker_loop(shared: Arc<Shared>, wake: Arc<(Mutex<WakeState>, Condvar)>, root: PathBuf) {
+fn worker_loop(
+    shared: Arc<Shared>,
+    wake: Arc<(Mutex<WakeState>, Condvar)>,
+    root: PathBuf,
+    remote: Option<RemoteWakeConfig>,
+) {
     // The watcher lives for the thread's lifetime and is dropped (unwatched)
     // when the loop exits. On iOS it is never built (no persistent watcher).
     #[cfg(not(target_os = "ios"))]
     let _watcher = make_watcher(&root, wake.clone());
     #[cfg(target_os = "ios")]
     let _ = &root;
+
+    // The remote wake listener nudges the worker exactly the way the watcher
+    // does, and dies with the loop the same way. Without the `http` feature
+    // there is no listener to build.
+    #[cfg(feature = "http")]
+    let _remote_wake = remote.map(|config| {
+        let wake = wake.clone();
+        crate::wake::RemoteWake::spawn(config, move || {
+            let (lock, cvar) = &*wake;
+            lock.lock().unwrap().pending = true;
+            cvar.notify_all();
+        })
+    });
+    #[cfg(not(feature = "http"))]
+    let _ = remote;
 
     loop {
         let _ = run_once(&shared);
@@ -324,6 +374,7 @@ mod tests {
                     server_url: Some("http://mini:8787".into()),
                     vault_id: Some("default".into()),
                     allow_bulk_delete: false,
+                    remote_wake: None,
                 },
                 Box::new(server.client(label)),
                 Box::new(|_e| {}),
@@ -408,6 +459,84 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(err.contains("already running"), "{err}");
+    }
+
+    /// A journal-advance frame on the freshness socket wakes the worker into
+    /// a cycle (spec §12): the remote-wake path end to end, over a real
+    /// WebSocket handshake, without waiting out the safety timer.
+    #[cfg(feature = "http")]
+    #[test]
+    fn a_remote_wake_frame_triggers_a_cycle() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // A one-connection wake server: accept, wait for the go signal, send
+        // one journal-advance frame, hold the socket open.
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let server_thread = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            go_rx.recv().unwrap();
+            ws.send(tungstenite::Message::Text("{\"seq\":1}".into()))
+                .unwrap();
+            let _ = ws.read(); // stay open until the client hangs up
+        });
+
+        let server = FakeServer::new();
+        let fx = Fixture::new("wake");
+        let cycles = Arc::new(AtomicU64::new(0));
+        let counted = cycles.clone();
+        let engine = SyncEngine::new(
+            EngineConfig {
+                vault_root: fx.root.clone(),
+                state_db: fx.state_db.clone(),
+                device_label: "MAC".into(),
+                server_url: Some("http://mini:8787".into()),
+                vault_id: Some("default".into()),
+                allow_bulk_delete: false,
+                remote_wake: Some(RemoteWakeConfig {
+                    server_url: format!("http://127.0.0.1:{port}"),
+                    vault_id: "default".into(),
+                    token: "tok".into(),
+                }),
+            },
+            Box::new(server.client("mac")),
+            Box::new(move |e| {
+                if matches!(e, crate::types::SyncEvent::CycleFinished(_)) {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                }
+            }),
+        )
+        .unwrap();
+
+        engine.start();
+        // Wait out the worker's immediate first cycle.
+        for _ in 0..200 {
+            if cycles.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let before = cycles.load(Ordering::SeqCst);
+        assert!(before >= 1, "no initial cycle ran");
+
+        // Fire the wake frame; a fresh cycle should follow well inside the
+        // safety interval.
+        go_tx.send(()).unwrap();
+        let mut woke = false;
+        for _ in 0..200 {
+            if cycles.load(Ordering::SeqCst) > before {
+                woke = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(woke, "the wake frame did not trigger a cycle");
+
+        engine.stop();
+        server_thread.join().unwrap();
     }
 
     #[test]
