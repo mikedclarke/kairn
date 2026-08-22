@@ -12,6 +12,9 @@ restating the same fact twice; no em dashes. Rewrite to this standard before rel
 
 <!-- New user-visible capabilities. -->
 
+- Library folders and files can be created and deleted from the sidebar's right-click menus, with deletes going to the system trash.
+- Symlinked folders inside a library browse, edit, and search like real folders, marked with a link icon.
+
 ## Improved
 
 <!-- Refinements to existing workflows, reliability, performance, or UX. -->

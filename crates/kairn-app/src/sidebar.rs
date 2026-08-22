@@ -376,11 +376,38 @@ impl Workspace {
                             this.toggle_library_folder(toggle.clone(), cx);
                         }))
                         .context_menu(move |menu, _, _| {
+                            let new_file = menu_root.clone();
+                            let new_folder = menu_root.clone();
                             let reveal = menu_root.clone();
                             let copy = menu_root.clone();
                             let remove = menu_root.clone();
+                            let ws_file = ws.clone();
+                            let ws_folder = ws.clone();
                             let ws = ws.clone();
-                            menu.item(PopupMenuItem::new(REVEAL_LABEL).on_click(
+                            menu.item(PopupMenuItem::new("New file…").on_click(
+                                move |_, window, cx| {
+                                    let _ = ws_file.update(cx, |this, cx| {
+                                        this.prompt_new_library_file(
+                                            new_file.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                },
+                            ))
+                            .item(PopupMenuItem::new("New folder…").on_click(
+                                move |_, window, cx| {
+                                    let _ = ws_folder.update(cx, |this, cx| {
+                                        this.prompt_new_library_folder(
+                                            new_folder.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                },
+                            ))
+                            .separator()
+                            .item(PopupMenuItem::new(REVEAL_LABEL).on_click(
                                 move |_, _, cx| {
                                     cx.reveal_path(&reveal);
                                 },
@@ -410,6 +437,7 @@ impl Workspace {
                         .py(px(3.))
                         .gap(px(6.));
                     let menu_path = entry.path.clone();
+                    let ws = cx.weak_entity();
                     if entry.is_dir {
                         let open = self.library_expanded.contains(&entry.path);
                         side = side.child(
@@ -421,15 +449,44 @@ impl Workspace {
                                     .text_color(t.dim)
                                     .child(if open { "▾" } else { "▸" }),
                             )
-                            .child(folder_icon(t, open))
+                            .child(library_folder_icon(t, open, entry.is_symlink))
                             .child(div().flex_1().child(entry.name.clone()))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.toggle_library_folder(path.clone(), cx);
                             }))
                             .context_menu(move |menu, _, _| {
+                                let new_file = menu_path.clone();
+                                let new_folder = menu_path.clone();
                                 let reveal = menu_path.clone();
                                 let copy = menu_path.clone();
-                                menu.item(PopupMenuItem::new(REVEAL_LABEL).on_click(
+                                let trash = menu_path.clone();
+                                let ws_file = ws.clone();
+                                let ws_folder = ws.clone();
+                                let ws_trash = ws.clone();
+                                menu.item(PopupMenuItem::new("New file…").on_click(
+                                    move |_, window, cx| {
+                                        let _ = ws_file.update(cx, |this, cx| {
+                                            this.prompt_new_library_file(
+                                                new_file.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    },
+                                ))
+                                .item(PopupMenuItem::new("New folder…").on_click(
+                                    move |_, window, cx| {
+                                        let _ = ws_folder.update(cx, |this, cx| {
+                                            this.prompt_new_library_folder(
+                                                new_folder.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    },
+                                ))
+                                .separator()
+                                .item(PopupMenuItem::new(REVEAL_LABEL).on_click(
                                     move |_, _, cx| {
                                         cx.reveal_path(&reveal);
                                     },
@@ -439,6 +496,14 @@ impl Workspace {
                                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(
                                             copy.display().to_string(),
                                         ));
+                                    },
+                                ))
+                                .separator()
+                                .item(PopupMenuItem::new("Move to Trash").on_click(
+                                    move |_, window, cx| {
+                                        let _ = ws_trash.update(cx, |this, cx| {
+                                            this.trash_library_path(&trash, window, cx);
+                                        });
                                     },
                                 ))
                             }),
@@ -465,6 +530,8 @@ impl Workspace {
                                     let open_with = menu_path.clone();
                                     let reveal = menu_path.clone();
                                     let copy = menu_path.clone();
+                                    let trash = menu_path.clone();
+                                    let ws_trash = ws.clone();
                                     menu.item(
                                         PopupMenuItem::new("Open in default app").on_click(
                                             move |_, _, cx| {
@@ -482,6 +549,14 @@ impl Workspace {
                                             cx.write_to_clipboard(gpui::ClipboardItem::new_string(
                                                 copy.display().to_string(),
                                             ));
+                                        },
+                                    ))
+                                    .separator()
+                                    .item(PopupMenuItem::new("Move to Trash").on_click(
+                                        move |_, window, cx| {
+                                            let _ = ws_trash.update(cx, |this, cx| {
+                                                this.trash_library_path(&trash, window, cx);
+                                            });
                                         },
                                     ))
                                 }),
@@ -1447,6 +1522,16 @@ fn svg_icon(t: &KairnTheme, path: &'static str, color: gpui::Hsla) -> gpui::AnyE
 fn folder_icon(t: &KairnTheme, open: bool) -> gpui::AnyElement {
     let path = if open { "kairn-icons/folder-open.svg" } else { "kairn-icons/folder.svg" };
     svg_icon(t, path, t.faint)
+}
+
+/// The folder mark for Library rows: symlinked folders (followed like real
+/// ones) carry the arrow variant so the indirection reads at a glance.
+fn library_folder_icon(t: &KairnTheme, open: bool, symlink: bool) -> gpui::AnyElement {
+    if symlink {
+        svg_icon(t, "kairn-icons/folder-symlink.svg", t.faint)
+    } else {
+        folder_icon(t, open)
+    }
 }
 
 /// The document mark for Notes rows (always markdown).

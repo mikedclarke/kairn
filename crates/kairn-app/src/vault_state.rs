@@ -119,6 +119,23 @@ fn library_event_relevant(event: &notify::Event, self_writes: &SelfWrites) -> bo
         })
 }
 
+/// OS-trash shim for library deletes. macOS must use the NSFileManager
+/// method: the crate's Finder (AppleScript) default would raise an
+/// Automation permission prompt. Linux follows the freedesktop trash spec.
+fn os_trash(path: &Path) -> Result<(), trash::Error> {
+    #[cfg(target_os = "macos")]
+    {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        let mut ctx = trash::TrashContext::default();
+        ctx.set_delete_method(DeleteMethod::NsFileManager);
+        ctx.delete(path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        trash::delete(path)
+    }
+}
+
 impl Workspace {
     /// Record a write this instance just made, so the watcher event it
     /// triggers doesn't cost a second full reload.
@@ -1124,6 +1141,93 @@ impl Workspace {
             self.view = PaneView::Day;
         }
         self.rearm_library_watchers(cx);
+        self.reload_notes(cx);
+        cx.notify();
+    }
+
+    /// New-file prompt for a library root or folder: an empty file
+    /// (markdown when the name carries no extension), opened once created
+    /// so typing can start immediately.
+    pub fn prompt_new_library_file(
+        &mut self,
+        dir: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        crate::name_dialog::open(
+            "New file",
+            "Create",
+            None,
+            window,
+            cx,
+            move |ws, name, window, cx| match notes::create_library_file(&dir, name) {
+                Ok(path) => {
+                    ws.note_self_write(&path);
+                    ws.library_expanded.insert(dir.clone());
+                    ws.open_library_file(path, window, cx);
+                }
+                Err(e) => {
+                    window.push_notification(format!("Could not create file: {e}"), cx)
+                }
+            },
+        );
+    }
+
+    /// New-folder prompt for a library root or folder; the parent and the
+    /// new folder open expanded so the create visibly landed.
+    pub fn prompt_new_library_folder(
+        &mut self,
+        dir: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        crate::name_dialog::open(
+            "New folder",
+            "Create",
+            None,
+            window,
+            cx,
+            move |ws, name, window, cx| match notes::create_folder_in(&dir, name) {
+                Ok(path) => {
+                    ws.library_expanded.insert(dir.clone());
+                    ws.library_expanded.insert(path);
+                    ws.reload_library_trees();
+                    cx.notify();
+                }
+                Err(e) => {
+                    window.push_notification(format!("Could not create folder: {e}"), cx)
+                }
+            },
+        );
+    }
+
+    /// Move a library file or folder to the OS trash — recoverable, never a
+    /// hard delete (libraries live outside the vault, so `Notes/@Trash`
+    /// doesn't apply). Pending edits are flushed first so they travel with
+    /// the file; a document that lived under the deleted path drops back to
+    /// the day view.
+    pub fn trash_library_path(
+        &mut self,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.flush_note_editor(cx);
+        self.save_library_text(cx);
+        match os_trash(path) {
+            Ok(()) => {
+                // Dropped, not synced out: a save after the delete would
+                // resurrect the file.
+                if self.library_text.as_ref().is_some_and(|ed| ed.path.starts_with(path)) {
+                    self.library_text = None;
+                }
+                self.library_expanded.retain(|p| !p.starts_with(path));
+                if matches!(&self.view, PaneView::Library(p) if p.starts_with(path)) {
+                    self.view = PaneView::Day;
+                }
+            }
+            Err(e) => window.push_notification(format!("Could not delete: {e}"), cx),
+        }
         self.reload_notes(cx);
         cx.notify();
     }
