@@ -12,7 +12,8 @@ restating the same fact twice; no em dashes. Rewrite to this standard before rel
 
 <!-- New user-visible capabilities. -->
 
-- Library folders and files can be created and deleted from the sidebar's right-click menus, with deletes going to the system trash.
+- Library folders and files can be created, renamed, and deleted from the sidebar's right-click menus, with deletes going to the system trash.
+- New library markdown files start with their title heading instead of opening as a blank, seemingly dead pane.
 - Symlinked folders inside a library browse, edit, and search like real folders, marked with a link icon.
 
 ## Improved

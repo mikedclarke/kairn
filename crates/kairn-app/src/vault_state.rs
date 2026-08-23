@@ -1201,6 +1201,82 @@ impl Workspace {
         );
     }
 
+    /// Rename prompt for a library file or folder: a one-field dialog
+    /// prefilled with the current name, extension included — library names
+    /// keep it (a bare new name keeps the old extension).
+    pub fn prompt_rename_library_path(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let initial = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        crate::name_dialog::open(
+            "Rename",
+            "Rename",
+            Some(initial),
+            window,
+            cx,
+            move |ws, name, window, cx| ws.rename_library_path(&path, name, window, cx),
+        );
+    }
+
+    /// Rename a library file or folder on disk. Pending edits are flushed
+    /// first so they travel with the file; the open document and any
+    /// expanded folders under the old path follow the rename.
+    pub fn rename_library_path(
+        &mut self,
+        path: &Path,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.flush_note_editor(cx);
+        self.save_library_text(cx);
+        match notes::rename_library_path(path, name) {
+            Ok(new_path) => {
+                let moved: Vec<PathBuf> = self
+                    .library_expanded
+                    .iter()
+                    .filter(|p| p.starts_with(path))
+                    .cloned()
+                    .collect();
+                for old in moved {
+                    self.library_expanded.remove(&old);
+                    if let Ok(rel) = old.strip_prefix(path) {
+                        self.library_expanded.insert(new_path.join(rel));
+                    }
+                }
+                // Dropped, not synced out: its edits are already saved and
+                // its path no longer exists; reopening rebuilds it.
+                if self.library_text.as_ref().is_some_and(|ed| ed.path.starts_with(path)) {
+                    self.library_text = None;
+                }
+                let followed = match &self.view {
+                    PaneView::Library(p) => p.strip_prefix(path).ok().map(|rel| {
+                        if rel.as_os_str().is_empty() {
+                            new_path.clone()
+                        } else {
+                            new_path.join(rel)
+                        }
+                    }),
+                    _ => None,
+                };
+                if let Some(view_path) = followed {
+                    self.open_library_file(view_path, window, cx);
+                    return;
+                }
+            }
+            Err(e) => window.push_notification(format!("Could not rename: {e}"), cx),
+        }
+        self.reload_notes(cx);
+        cx.notify();
+    }
+
     /// Move a library file or folder to the OS trash — recoverable, never a
     /// hard delete (libraries live outside the vault, so `Notes/@Trash`
     /// doesn't apply). Pending edits are flushed first so they travel with

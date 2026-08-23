@@ -459,9 +459,11 @@ impl Workspace {
                                 let new_folder = menu_path.clone();
                                 let reveal = menu_path.clone();
                                 let copy = menu_path.clone();
+                                let rename = menu_path.clone();
                                 let trash = menu_path.clone();
                                 let ws_file = ws.clone();
                                 let ws_folder = ws.clone();
+                                let ws_rename = ws.clone();
                                 let ws_trash = ws.clone();
                                 menu.item(PopupMenuItem::new("New file…").on_click(
                                     move |_, window, cx| {
@@ -499,6 +501,17 @@ impl Workspace {
                                     },
                                 ))
                                 .separator()
+                                .item(PopupMenuItem::new("Rename…").on_click(
+                                    move |_, window, cx| {
+                                        let _ = ws_rename.update(cx, |this, cx| {
+                                            this.prompt_rename_library_path(
+                                                rename.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    },
+                                ))
                                 .item(PopupMenuItem::new("Move to Trash").on_click(
                                     move |_, window, cx| {
                                         let _ = ws_trash.update(cx, |this, cx| {
@@ -530,7 +543,9 @@ impl Workspace {
                                     let open_with = menu_path.clone();
                                     let reveal = menu_path.clone();
                                     let copy = menu_path.clone();
+                                    let rename = menu_path.clone();
                                     let trash = menu_path.clone();
+                                    let ws_rename = ws.clone();
                                     let ws_trash = ws.clone();
                                     menu.item(
                                         PopupMenuItem::new("Open in default app").on_click(
@@ -552,6 +567,17 @@ impl Workspace {
                                         },
                                     ))
                                     .separator()
+                                    .item(PopupMenuItem::new("Rename…").on_click(
+                                        move |_, window, cx| {
+                                            let _ = ws_rename.update(cx, |this, cx| {
+                                                this.prompt_rename_library_path(
+                                                    rename.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        },
+                                    ))
                                     .item(PopupMenuItem::new("Move to Trash").on_click(
                                         move |_, window, cx| {
                                             let _ = ws_trash.update(cx, |this, cx| {

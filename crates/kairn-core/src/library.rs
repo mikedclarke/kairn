@@ -241,11 +241,8 @@ pub fn library_images(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Create an empty file named by the user inside a library folder. Unlike
-/// note names, library names keep their extension; one is required to pick
-/// the file's kind, so a bare name becomes markdown (`.md`). Never
-/// overwrites. Returns the new path.
-pub fn create_library_file(dir: &Path, name: &str) -> io::Result<PathBuf> {
+/// Reject names that can't safely name a file in a library folder.
+fn checked_library_name(name: &str) -> io::Result<&str> {
     let name = name.trim();
     let bad = name.is_empty()
         || name.starts_with('.')
@@ -256,6 +253,17 @@ pub fn create_library_file(dir: &Path, name: &str) -> io::Result<PathBuf> {
             "file names can't be empty or start with '.', and can't contain slashes",
         ));
     }
+    Ok(name)
+}
+
+/// Create a file named by the user inside a library folder. Unlike note
+/// names, library names keep their extension; one is required to pick the
+/// file's kind, so a bare name becomes markdown (`.md`). Markdown starts
+/// with its title heading (the notes convention) so the editor opens on a
+/// visible, editable document rather than a blank pane; every other kind
+/// starts empty. Never overwrites. Returns the new path.
+pub fn create_library_file(dir: &Path, name: &str) -> io::Result<PathBuf> {
+    let name = checked_library_name(name)?;
     let file_name = if Path::new(name).extension().is_some() {
         name.to_string()
     } else {
@@ -268,8 +276,44 @@ pub fn create_library_file(dir: &Path, name: &str) -> io::Result<PathBuf> {
             format!("\"{file_name}\" already exists here"),
         ));
     }
-    fs::File::create_new(&path)?;
+    let content = match file_kind(&path) {
+        FileKind::Markdown => {
+            let stem = Path::new(&file_name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&file_name);
+            format!("# {stem}\n")
+        }
+        _ => String::new(),
+    };
+    use std::io::Write as _;
+    fs::File::create_new(&path)?.write_all(content.as_bytes())?;
     Ok(path)
+}
+
+/// Rename a library file or folder in place. The typed name is used as-is
+/// when it carries an extension; a bare name on a file keeps the old
+/// extension (renaming `report.pdf` to `final` gives `final.pdf`). Never
+/// overwrites. Returns the new path.
+pub fn rename_library_path(path: &Path, name: &str) -> io::Result<PathBuf> {
+    let name = checked_library_name(name)?;
+    let keep_ext = !path.is_dir() && Path::new(name).extension().is_none();
+    let file_name = match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) if keep_ext => format!("{name}.{ext}"),
+        _ => name.to_string(),
+    };
+    let dest = path.with_file_name(&file_name);
+    if dest == path {
+        return Ok(dest);
+    }
+    if dest.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("\"{file_name}\" already exists here"),
+        ));
+    }
+    fs::rename(path, &dest)?;
+    Ok(dest)
 }
 
 /// Files larger than this never get a body scan: a library can hold logs
@@ -456,8 +500,13 @@ mod tests {
     #[test]
     fn create_library_file_defaults_extension_and_refuses_overwrite() {
         let root = ScratchRoot::new("librarycreate");
+        // Bare name becomes markdown; markdown is seeded with its title
+        // heading so the editor never opens on an invisible empty document.
         let plain = create_library_file(&root.0, "notes").expect("create");
         assert_eq!(plain.file_name().and_then(|n| n.to_str()), Some("notes.md"));
+        assert_eq!(fs::read_to_string(&plain).expect("read"), "# notes\n");
+        let explicit = create_library_file(&root.0, "plan.md").expect("create");
+        assert_eq!(fs::read_to_string(&explicit).expect("read"), "# plan\n");
         let kept = create_library_file(&root.0, "style.css").expect("create");
         assert_eq!(kept.file_name().and_then(|n| n.to_str()), Some("style.css"));
         assert_eq!(fs::read_to_string(&kept).expect("read"), "");
@@ -468,6 +517,32 @@ mod tests {
             let err = create_library_file(&root.0, bad).expect_err("bad name");
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         }
+    }
+
+    #[test]
+    fn rename_library_path_keeps_extension_and_refuses_overwrite() {
+        let root = ScratchRoot::new("libraryrename");
+        root.write("report.pdf", "x");
+        root.write("draft.md", "# draft\n");
+        root.write("assets/pic.png", "x");
+
+        // A bare name keeps the file's extension; an explicit one changes it.
+        let renamed = rename_library_path(&root.0.join("report.pdf"), "final").expect("rename");
+        assert_eq!(renamed.file_name().and_then(|n| n.to_str()), Some("final.pdf"));
+        let retyped = rename_library_path(&renamed, "final.txt").expect("rename");
+        assert_eq!(retyped.file_name().and_then(|n| n.to_str()), Some("final.txt"));
+        assert!(!renamed.exists() && retyped.exists());
+
+        // Folders rename plainly, dots and all.
+        let dir = rename_library_path(&root.0.join("assets"), "img v0.2").expect("rename dir");
+        assert!(dir.is_dir() && dir.join("pic.png").exists());
+        assert_eq!(dir.file_name().and_then(|n| n.to_str()), Some("img v0.2"));
+
+        // Never overwrites; a same-name rename is a quiet no-op.
+        let err = rename_library_path(&retyped, "draft.md").expect_err("collision");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        let same = rename_library_path(&retyped, "final.txt").expect("no-op");
+        assert_eq!(same, retyped);
     }
 
     #[test]
