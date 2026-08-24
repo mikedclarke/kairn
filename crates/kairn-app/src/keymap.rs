@@ -196,6 +196,24 @@ pub fn init(cx: &mut App) {
     letter(&mut keys, "c", EditorCopy, Some("NoteEditor"));
     letter(&mut keys, "x", EditorCut, Some("NoteEditor"));
     letter(&mut keys, "a", EditorSelectAll, Some("NoteEditor"));
+    // On Linux the note editor also accepts the standard text-field clipboard
+    // chords. This is what a Super chord actually arrives as: compositors like
+    // Omarchy intercept Super+C/V/X and inject a Ctrl-based chord into the
+    // focused window (Ctrl+C/V/X for a normal window, Ctrl+Insert / Shift+Insert
+    // for a terminal-tagged one) — the app never sees Super, only the injection.
+    // Binding every form makes copy/paste work however the compositor delivers
+    // it, and matches every other Linux text field. Editor context only, so
+    // these never shadow the terminal's own Ctrl+C (SIGINT) / Ctrl+V.
+    if !cfg!(target_os = "macos") {
+        keys.extend([
+            KeyBinding::new("ctrl-c", EditorCopy, Some("NoteEditor")),
+            KeyBinding::new("ctrl-insert", EditorCopy, Some("NoteEditor")),
+            KeyBinding::new("ctrl-v", EditorPaste, Some("NoteEditor")),
+            KeyBinding::new("shift-insert", EditorPaste, Some("NoteEditor")),
+            KeyBinding::new("ctrl-x", EditorCut, Some("NoteEditor")),
+            KeyBinding::new("ctrl-a", EditorSelectAll, Some("NoteEditor")),
+        ]);
+    }
     cx.bind_keys(keys);
     // Word, line, and document motions on each platform's native text
     // chords: Option/Cmd arrows on macOS, Ctrl arrows and Home/End on Linux.
