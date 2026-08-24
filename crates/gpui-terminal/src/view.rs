@@ -795,15 +795,16 @@ impl TerminalView {
             return; // Event consumed by handler
         }
 
-        // Paste chord: cmd+V on macOS, ctrl+shift+V elsewhere, shift+insert
-        // everywhere. keystroke_to_bytes ignores platform-modified keys, so
-        // paste has to be handled before it.
+        // Paste chord: the platform key + V (Cmd+V on macOS, Super+V on Linux),
+        // plus Ctrl+Shift+V on Linux and Shift+Insert everywhere.
+        // keystroke_to_bytes ignores platform-modified keys, so paste has to be
+        // handled before it.
         let ks = &event.keystroke;
-        let is_paste = if cfg!(target_os = "macos") {
-            ks.modifiers.platform && !ks.modifiers.control && !ks.modifiers.alt && ks.key == "v"
-        } else {
-            ks.modifiers.control && ks.modifiers.shift && ks.key == "v"
-        } || (ks.modifiers.shift && ks.key == "insert");
+        let platform_v =
+            ks.modifiers.platform && !ks.modifiers.control && !ks.modifiers.alt && ks.key == "v";
+        let ctrl_shift_v =
+            !cfg!(target_os = "macos") && ks.modifiers.control && ks.modifiers.shift && ks.key == "v";
+        let is_paste = platform_v || ctrl_shift_v || (ks.modifiers.shift && ks.key == "insert");
         if is_paste {
             if let Some(text) = _cx.read_from_clipboard().and_then(|item| item.text()) {
                 self.paste_text(&text);
