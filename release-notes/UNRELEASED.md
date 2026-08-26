@@ -12,14 +12,18 @@ restating the same fact twice; no em dashes. Rewrite to this standard before rel
 
 <!-- New user-visible capabilities. -->
 
-- Library folders and files can be created, renamed, and deleted from the sidebar's right-click menus, with deletes going to the system trash.
-- New library markdown files start with their title heading instead of opening as a blank, seemingly dead pane.
-- Symlinked folders inside a library browse, edit, and search like real folders, marked with a link icon.
-
 ## Improved
 
 <!-- Refinements to existing workflows, reliability, performance, or UX. -->
 
+- Library files and folders can now be created, renamed, and deleted from the sidebar's right-click menus, with deletes going to the system trash.
+- New markdown files open with a title heading instead of a blank pane.
+- Symlinked folders browse, edit, and search like real folders, marked with a link icon.
+- Edits made on another device now appear live instead of only after reopening the app.
+- On Linux, letter shortcuts use Super as the primary modifier, with Ctrl+Shift as a fallback.
+
 ## Fixed
 
 <!-- Bugs that no longer happen. -->
+
+- On Linux, copy, paste, cut, and select-all work in the note editor under compositors such as Omarchy.
