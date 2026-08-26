@@ -65,20 +65,44 @@ actions!(
     ]
 );
 
+/// Bind a letter primary chord. Cmd on macOS. On Linux, Super (the Windows
+/// key) is the primary, matching macOS Cmd and the "Super acts like Cmd"
+/// convention Omarchy and similar setups adopt; Ctrl+Shift stays bound as a
+/// fallback for desktops (stock GNOME/KDE) that reserve Super for the
+/// compositor. Plain Ctrl+letter is never usable here: those are shell control
+/// characters in a focused terminal (Ctrl+J accept-line, Ctrl+N next-history,
+/// Ctrl+Q XON resume). `tail` is a bare letter (`"c"`) or a shifted letter
+/// (`"shift-k"`); the Ctrl+Shift fallback matches the pre-Super chord exactly.
+fn letter<A: gpui::Action + Clone>(
+    keys: &mut Vec<KeyBinding>,
+    tail: &str,
+    action: A,
+    context: Option<&'static str>,
+) {
+    if cfg!(target_os = "macos") {
+        keys.push(KeyBinding::new(&format!("cmd-{tail}"), action, context));
+    } else {
+        let fallback = if tail.starts_with("shift-") {
+            format!("ctrl-{tail}")
+        } else {
+            format!("ctrl-shift-{tail}")
+        };
+        keys.push(KeyBinding::new(&format!("super-{tail}"), action.clone(), context));
+        keys.push(KeyBinding::new(&fallback, action, context));
+    }
+}
+
 pub fn init(cx: &mut App) {
-    // Primary chords: Cmd on macOS, Ctrl on Linux. On Linux, plain Ctrl+letter
-    // combos are shell control characters (Ctrl+J accept-line, Ctrl+N
-    // next-history, Ctrl+Q XON resume) and bindings win over the terminal, so
-    // letter chords take Ctrl+Shift instead (the GNOME Terminal / VS Code
-    // convention). Digits and punctuation stay plain Ctrl: the terminal emits
-    // nothing for them, and shifted punctuation resolves to a different key
-    // per layout (Ctrl+Shift+\ arrives as ctrl-|), so it can't be bound
-    // reliably.
+    // Non-letter primary chords: Cmd on macOS, Ctrl on Linux. Digits and
+    // punctuation stay plain Ctrl on Linux: the terminal emits nothing for
+    // them, and shifted punctuation resolves to a different key per layout
+    // (Ctrl+Shift+\ arrives as ctrl-|), so it can't be bound reliably. Letter
+    // chords go through `letter()` instead. Digits deliberately stay Ctrl, not
+    // Super: Super+1..9 is workspace switching on most Linux compositors
+    // (Hyprland/Omarchy included).
     let p = |k: &str| {
         if cfg!(target_os = "macos") {
             format!("cmd-{k}")
-        } else if k.len() == 1 && k.chars().next().unwrap().is_ascii_alphabetic() {
-            format!("ctrl-shift-{k}")
         } else {
             format!("ctrl-{k}")
         }
@@ -93,7 +117,7 @@ pub fn init(cx: &mut App) {
             format!("ctrl-alt-{k}")
         }
     };
-    cx.bind_keys([
+    let mut keys = vec![
         // gpui-component's Root binds tab/shift-tab to focus cycling, which
         // consumes them before a focused terminal can forward them to the
         // PTY (Tab completion, backtab \x1b[Z). A NoAction binding in the
@@ -111,12 +135,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(&pa("2"), LayoutNotes, None),
         KeyBinding::new(&pa("3"), LayoutSplit, None),
         KeyBinding::new(&pa("4"), LayoutTerminal, None),
-        KeyBinding::new(&p("j"), ToggleSwitcher, None),
         KeyBinding::new(&p(","), OpenSettings, None),
-        KeyBinding::new(&p("shift-k"), Capture, None),
-        KeyBinding::new(&p("s"), SaveNote, None),
-        KeyBinding::new(&p("n"), NewLocalSession, None),
-        KeyBinding::new(&p("q"), Quit, None),
         KeyBinding::new(&p("1"), Session1, None),
         KeyBinding::new(&p("2"), Session2, None),
         KeyBinding::new(&p("3"), Session3, None),
@@ -142,25 +161,6 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("right", EditorRight, Some("NoteEditor")),
         KeyBinding::new("up", EditorUp, Some("NoteEditor")),
         KeyBinding::new("down", EditorDown, Some("NoteEditor")),
-        // Undo/redo live in the Workspace context, not the editor's: the
-        // workspace coordinates buffer undo with its cross-note move
-        // history, and the chord must work right after a mouse drag, when
-        // nothing keyboard-focused holds the editor context. Text inputs
-        // keep their own undo (gpui-component binds it in the deeper Input
-        // context, which wins).
-        KeyBinding::new(&p("z"), EditorUndo, Some("Workspace")),
-        // Redo: on Linux the undo chord already carries Shift
-        // (Ctrl+Shift+Z), so redo takes Ctrl+Shift+Y; `p("shift-z")` would
-        // collide with undo there.
-        KeyBinding::new(
-            if cfg!(target_os = "macos") { "cmd-shift-z" } else { "ctrl-shift-y" },
-            EditorRedo,
-            Some("Workspace"),
-        ),
-        KeyBinding::new(&p("v"), EditorPaste, Some("NoteEditor")),
-        KeyBinding::new(&p("c"), EditorCopy, Some("NoteEditor")),
-        KeyBinding::new(&p("x"), EditorCut, Some("NoteEditor")),
-        KeyBinding::new(&p("a"), EditorSelectAll, Some("NoteEditor")),
         KeyBinding::new("shift-left", EditorSelectLeft, Some("NoteEditor")),
         KeyBinding::new("shift-right", EditorSelectRight, Some("NoteEditor")),
         KeyBinding::new("shift-up", EditorSelectUp, Some("NoteEditor")),
@@ -170,7 +170,51 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("end", EditorLineEnd, Some("NoteEditor")),
         KeyBinding::new("shift-home", EditorSelectLineStart, Some("NoteEditor")),
         KeyBinding::new("shift-end", EditorSelectLineEnd, Some("NoteEditor")),
-    ]);
+    ];
+    // Letter primary chords (see `letter` for the Super/Ctrl+Shift split).
+    letter(&mut keys, "j", ToggleSwitcher, None);
+    letter(&mut keys, "shift-k", Capture, None);
+    letter(&mut keys, "s", SaveNote, None);
+    letter(&mut keys, "n", NewLocalSession, None);
+    letter(&mut keys, "q", Quit, None);
+    // Undo/redo live in the Workspace context, not the editor's: the workspace
+    // coordinates buffer undo with its cross-note move history, and the chord
+    // must work right after a mouse drag, when nothing keyboard-focused holds
+    // the editor context. Text inputs keep their own undo (gpui-component binds
+    // it in the deeper Input context, which wins).
+    letter(&mut keys, "z", EditorUndo, Some("Workspace"));
+    // Redo is Shift + the undo chord: Super+Shift+Z / Cmd+Shift+Z. On Linux the
+    // undo *fallback* is already Ctrl+Shift+Z, so redo's fallback takes
+    // Ctrl+Shift+Y to avoid colliding with it.
+    if cfg!(target_os = "macos") {
+        keys.push(KeyBinding::new("cmd-shift-z", EditorRedo, Some("Workspace")));
+    } else {
+        keys.push(KeyBinding::new("super-shift-z", EditorRedo, Some("Workspace")));
+        keys.push(KeyBinding::new("ctrl-shift-y", EditorRedo, Some("Workspace")));
+    }
+    letter(&mut keys, "v", EditorPaste, Some("NoteEditor"));
+    letter(&mut keys, "c", EditorCopy, Some("NoteEditor"));
+    letter(&mut keys, "x", EditorCut, Some("NoteEditor"));
+    letter(&mut keys, "a", EditorSelectAll, Some("NoteEditor"));
+    // On Linux the note editor also accepts the standard text-field clipboard
+    // chords. This is what a Super chord actually arrives as: compositors like
+    // Omarchy intercept Super+C/V/X and inject a Ctrl-based chord into the
+    // focused window (Ctrl+C/V/X for a normal window, Ctrl+Insert / Shift+Insert
+    // for a terminal-tagged one) — the app never sees Super, only the injection.
+    // Binding every form makes copy/paste work however the compositor delivers
+    // it, and matches every other Linux text field. Editor context only, so
+    // these never shadow the terminal's own Ctrl+C (SIGINT) / Ctrl+V.
+    if !cfg!(target_os = "macos") {
+        keys.extend([
+            KeyBinding::new("ctrl-c", EditorCopy, Some("NoteEditor")),
+            KeyBinding::new("ctrl-insert", EditorCopy, Some("NoteEditor")),
+            KeyBinding::new("ctrl-v", EditorPaste, Some("NoteEditor")),
+            KeyBinding::new("shift-insert", EditorPaste, Some("NoteEditor")),
+            KeyBinding::new("ctrl-x", EditorCut, Some("NoteEditor")),
+            KeyBinding::new("ctrl-a", EditorSelectAll, Some("NoteEditor")),
+        ]);
+    }
+    cx.bind_keys(keys);
     // Word, line, and document motions on each platform's native text
     // chords: Option/Cmd arrows on macOS, Ctrl arrows and Home/End on Linux.
     if cfg!(target_os = "macos") {
@@ -247,7 +291,7 @@ pub fn keybind_list() -> Vec<(&'static str, Vec<(String, &'static str)>)> {
                     if cfg!(target_os = "macos") {
                         chord_shift("Z")
                     } else {
-                        "Ctrl+Shift+Y".to_string()
+                        "Super+Shift+Z".to_string()
                     },
                     "Redo",
                 ),
@@ -283,24 +327,34 @@ pub fn keybind_list() -> Vec<(&'static str, Vec<(String, &'static str)>)> {
 
 // Every keybinding hint in the app goes through the chord family below, so
 // labels stay platform-correct: mac glyphs on macOS, plain modifier words on
-// Linux (where letter chords ride Ctrl+Shift, matching `init`).
+// Linux. Letter chords ride Super (the primary, matching `init`); digits,
+// punctuation, and Enter combos stay on Ctrl / Ctrl+Shift. The Ctrl+Shift
+// fallback that `init` also binds for letters is intentionally not labelled.
 
-/// Primary chord: `⌘J` / `Ctrl+Shift+J`, `⌘1` / `Ctrl+1`.
+/// Whether `key` is a single letter (Super chord) rather than a digit,
+/// punctuation, or a named key like `⏎` (Ctrl chord).
+fn is_letter(key: &str) -> bool {
+    key.chars().count() == 1 && key.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+}
+
+/// Primary chord: `⌘J` / `Super+J` (letters), `⌘1` / `Ctrl+1` (digits).
 pub fn chord(key: &str) -> String {
     if cfg!(target_os = "macos") {
         format!("⌘{key}")
-    } else if key.chars().count() == 1 && key.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
-    {
-        format!("Ctrl+Shift+{}", key.to_uppercase())
+    } else if is_letter(key) {
+        format!("Super+{}", key.to_uppercase())
     } else {
         format!("Ctrl+{}", linux_key(key))
     }
 }
 
-/// Primary+Shift chord: `⇧⌘⏎` / `Ctrl+Shift+Enter`.
+/// Primary+Shift chord: `⇧⌘K` / `Super+Shift+K` (letters), `⇧⌘⏎` /
+/// `Ctrl+Shift+Enter` (other keys).
 pub fn chord_shift(key: &str) -> String {
     if cfg!(target_os = "macos") {
         format!("⇧⌘{key}")
+    } else if is_letter(key) {
+        format!("Super+Shift+{}", key.to_uppercase())
     } else {
         format!("Ctrl+Shift+{}", linux_key(key))
     }

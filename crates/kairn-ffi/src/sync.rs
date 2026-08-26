@@ -160,7 +160,7 @@ impl FfiSyncEngine {
         device_label: String,
         listener: Box<dyn SyncEventListener>,
     ) -> Result<Arc<Self>, SyncError> {
-        let transport = HttpTransport::new(server_url.clone(), vault_id.clone(), token);
+        let transport = HttpTransport::new(server_url.clone(), vault_id.clone(), token.clone());
         let on_event: Box<dyn Fn(SyncEvent) + Send + Sync> =
             Box::new(move |e: SyncEvent| listener.on_event(e.into()));
         let inner = SyncEngine::new(
@@ -168,12 +168,20 @@ impl FfiSyncEngine {
                 vault_root: vault_root.into(),
                 state_db: state_db.into(),
                 device_label,
-                server_url: Some(server_url),
-                vault_id: Some(vault_id),
+                server_url: Some(server_url.clone()),
+                vault_id: Some(vault_id.clone()),
                 // The phone never bulk-deletes: a vault that suddenly reads as
                 // empty there is a container that failed to mount, not an
                 // intention (spec §15.2).
                 allow_bulk_delete: false,
+                // While `start()` runs (the phone keeps the worker alive in
+                // the foreground), the server's freshness socket turns another
+                // device's edit into a cycle within seconds (spec §12).
+                remote_wake: Some(kairn_sync::RemoteWakeConfig {
+                    server_url,
+                    vault_id,
+                    token,
+                }),
             },
             Box::new(transport),
             on_event,
@@ -196,10 +204,13 @@ impl FfiSyncEngine {
             .map_err(SyncError::engine)
     }
 
-    /// Start the background worker (an immediate cycle, then a safety-timer
-    /// cadence). Idempotent. The phone typically drives cycles explicitly
-    /// instead, but this exists for parity with desktop. Returns immediately;
-    /// the cycles run on the engine's own thread.
+    /// Start the background worker: an immediate cycle, then cycles whenever
+    /// the server's freshness socket reports another device's edit (spec §12),
+    /// with a safety-timer fallback. Idempotent. The phone calls this while it
+    /// is in the foreground so remote edits appear live, and still drives
+    /// `sync_now()` at the moments that demand a cycle (app-foreground,
+    /// background-fetch/push). Returns immediately; the cycles run on the
+    /// engine's own thread.
     pub fn start(&self) {
         self.inner.start();
     }

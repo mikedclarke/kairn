@@ -109,6 +109,9 @@ fn main() -> Result<()> {
             server_url: Some(args.server.clone()),
             vault_id: Some(args.vault.clone()),
             allow_bulk_delete: args.allow_bulk_delete,
+            // The bridge drives its own sync_now() poll loop below rather than
+            // the engine's worker, so the freshness socket has nothing to wake.
+            remote_wake: None,
         },
         Box::new(transport),
         Box::new(on_event),

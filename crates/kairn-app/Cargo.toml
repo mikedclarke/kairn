@@ -32,6 +32,11 @@ serde_json = "1"
 # Fetching a pasted URL's page title (paste-as-markdown-link). Blocking and
 # runtime-free, called on the background executor only.
 ureq = "2"
+# Library deletes go to the OS trash (recoverable, matching the vault's
+# @Trash posture for notes). On macOS the NSFileManager method is selected
+# at the call site: the crate's Finder default would raise an Automation
+# permission prompt.
+trash = "5"
 
 # cargo-packager: bundles the app for distribution (.app/.dmg on macOS,
 # .deb/.AppImage on Linux). macOS signing + notarization live in

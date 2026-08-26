@@ -29,6 +29,7 @@ No cloud, no accounts, no database. Just a folder of markdown.
 - Daily, weekly, and monthly notes with templates; a month calendar, a week strip, and a day timeline built from time-blocked lines (`09:00 standup`, `14:00-15:30 call`) that you can drag to reschedule
 - One continuous markdown editor: live styling as you type, syntax markers hidden except on the cursor line, no separate edit mode
 - Wiki links, #tags, @mentions, date refs, highlights, bold/italic, markdown links, and bare URLs, all clickable; missing wiki-link targets are created on click
+- Paste a bare web link and it fetches the page title in the background, turning the URL into a `[title](url)` markdown link
 - Linked mentions under every note: each line elsewhere that links to it
 - Full editing: selection, clipboard, undo/redo, IME, list continuation, drag handles to reorder lines
 - Autosave with atomic, never-clobber writes: every save three-way merges against the file on disk, so external edits (agents, sync, other editors) are never lost, and genuine collisions surface in a banner instead of silently dropping text
@@ -85,9 +86,10 @@ No cloud, no accounts, no database. Just a folder of markdown.
 ### Your files, your vault
 
 - Plain markdown on disk. No database, no lock-in, no servers, no telemetry.
-- A Library section browses folders from anywhere on disk beside your vault: markdown and code open in the editor, images inline with a gallery strip, everything else as a details card
+- A Library section browses and edits folders from anywhere on disk beside your vault: create, rename, and delete files and folders; markdown and code open in the editor, images inline with a gallery strip, everything else as a details card
 - NotePlan-compatible vault layout: point Kairn at an existing NotePlan directory and both apps read and write the same files (`Calendar/` for period notes, `Notes/` for everything else, `@Trash` soft delete, `@Templates/Daily.md`)
 - Local-first: sync belongs to Syncthing (or any file sync); remote machines are an SSH session away
+- Kairn on your phone: a mobile app in private testing that carries the whole desktop across, from the notes vault and Library to live sync, capture, and SSH terminal sessions. Full parity is the goal; not yet publicly available.
 
 ## The `kairn` CLI
 

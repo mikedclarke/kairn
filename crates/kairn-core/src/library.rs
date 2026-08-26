@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::vault::{SearchHit, contains_insensitive, fuzzy_score};
@@ -43,6 +44,9 @@ pub struct LibraryEntry {
     /// holds `report.pdf` next to `report.md`; stems would collide).
     pub name: String,
     pub is_dir: bool,
+    /// A symlink (followed for `is_dir`): symlinked folders browse like
+    /// any other folder but carry a distinct icon.
+    pub is_symlink: bool,
     pub depth: usize,
 }
 
@@ -59,13 +63,11 @@ pub fn library_ignored_name(name: &str) -> bool {
         )
 }
 
-/// Depth backstop matching the vault walks; symlinked directories are never
-/// descended into (same cycle guard as `Notes/`).
+/// Depth backstop matching the vault walks. Unlike `Notes/`, symlinked
+/// directories are followed (a library often points into synced or shared
+/// trees); the search walk breaks link cycles with a canonical-path visited
+/// set, and this backstop bounds the tree either way.
 const MAX_TREE_DEPTH: usize = 24;
-
-fn is_real_dir(entry: &fs::DirEntry) -> bool {
-    entry.file_type().is_ok_and(|t| t.is_dir())
-}
 
 /// How a library level orders its files. Folders always sort by name:
 /// they are navigation, and reshuffling them as contents change would
@@ -105,6 +107,7 @@ fn push_level(
     let Ok(entries) = fs::read_dir(dir) else { return };
     struct Item {
         not_dir: bool,
+        symlink: bool,
         lower: String,
         modified: std::time::SystemTime,
         path: PathBuf,
@@ -118,12 +121,32 @@ fn push_level(
         if library_ignored_name(&name) {
             continue;
         }
-        let is_dir = is_real_dir(&entry);
-        let modified = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        items.push(Item { not_dir: !is_dir, lower: name.to_lowercase(), modified, path });
+        let symlink = entry.file_type().is_ok_and(|t| t.is_symlink());
+        // Symlinks classify by their target (a broken link lists as a
+        // plain file); everything else stays on the cheap DirEntry calls.
+        let (is_dir, modified) = if symlink {
+            let meta = fs::metadata(&path);
+            (
+                meta.as_ref().is_ok_and(|m| m.is_dir()),
+                meta.and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            )
+        } else {
+            (
+                entry.file_type().is_ok_and(|t| t.is_dir()),
+                entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            )
+        };
+        items.push(Item {
+            not_dir: !is_dir,
+            symlink,
+            lower: name.to_lowercase(),
+            modified,
+            path,
+        });
     }
     items.sort_by(|a, b| {
         a.not_dir.cmp(&b.not_dir).then_with(|| match (a.not_dir, sort) {
@@ -141,7 +164,13 @@ fn push_level(
             .and_then(|n| n.to_str())
             .unwrap_or_default()
             .to_string();
-        rows.push(LibraryEntry { path: path.clone(), name, is_dir, depth });
+        rows.push(LibraryEntry {
+            path: path.clone(),
+            name,
+            is_dir,
+            is_symlink: item.symlink,
+            depth,
+        });
         if is_dir && expanded.contains(&path) {
             push_level(&path, depth + 1, expanded, sort, rows);
         }
@@ -149,15 +178,33 @@ fn push_level(
 }
 
 /// Every file under a library root (ignores applied), for search: `(path,
-/// kind)` in tree order. Bounded by the same depth backstop as the tree.
+/// kind)` in tree order. Symlinked folders are searched like real ones;
+/// the visited set of canonical paths breaks link cycles, and the depth
+/// backstop bounds the walk like the tree's.
 fn library_files(root: &Path, out: &mut Vec<(PathBuf, FileKind)>) {
-    fn walk(dir: &Path, depth: usize, out: &mut Vec<(PathBuf, FileKind)>) {
+    fn walk(
+        dir: &Path,
+        depth: usize,
+        visited: &mut HashSet<PathBuf>,
+        out: &mut Vec<(PathBuf, FileKind)>,
+    ) {
         if depth > MAX_TREE_DEPTH {
             return;
         }
+        if let Ok(canon) = dir.canonicalize()
+            && !visited.insert(canon)
+        {
+            return;
+        }
         let Ok(entries) = fs::read_dir(dir) else { return };
-        let mut items: Vec<(PathBuf, bool)> =
-            entries.flatten().map(|e| (e.path(), is_real_dir(&e))).collect();
+        let mut items: Vec<(PathBuf, bool)> = entries
+            .flatten()
+            .map(|e| {
+                let path = e.path();
+                let is_dir = fs::metadata(&path).is_ok_and(|m| m.is_dir());
+                (path, is_dir)
+            })
+            .collect();
         items.sort();
         for (path, is_dir) in items {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
@@ -165,13 +212,13 @@ fn library_files(root: &Path, out: &mut Vec<(PathBuf, FileKind)>) {
                 continue;
             }
             if is_dir {
-                walk(&path, depth + 1, out);
+                walk(&path, depth + 1, visited, out);
             } else {
                 out.push((path.clone(), file_kind(&path)));
             }
         }
     }
-    walk(root, 0, out);
+    walk(root, 0, &mut HashSet::new(), out);
 }
 
 /// Every image directly inside `dir` (ignores applied), sorted by name:
@@ -192,6 +239,81 @@ pub fn library_images(dir: &Path) -> Vec<PathBuf> {
         .collect();
     out.sort();
     out
+}
+
+/// Reject names that can't safely name a file in a library folder.
+fn checked_library_name(name: &str) -> io::Result<&str> {
+    let name = name.trim();
+    let bad = name.is_empty()
+        || name.starts_with('.')
+        || name.contains(['/', '\\']);
+    if bad {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file names can't be empty or start with '.', and can't contain slashes",
+        ));
+    }
+    Ok(name)
+}
+
+/// Create a file named by the user inside a library folder. Unlike note
+/// names, library names keep their extension; one is required to pick the
+/// file's kind, so a bare name becomes markdown (`.md`). Markdown starts
+/// with its title heading (the notes convention) so the editor opens on a
+/// visible, editable document rather than a blank pane; every other kind
+/// starts empty. Never overwrites. Returns the new path.
+pub fn create_library_file(dir: &Path, name: &str) -> io::Result<PathBuf> {
+    let name = checked_library_name(name)?;
+    let file_name = if Path::new(name).extension().is_some() {
+        name.to_string()
+    } else {
+        format!("{name}.md")
+    };
+    let path = dir.join(&file_name);
+    if path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("\"{file_name}\" already exists here"),
+        ));
+    }
+    let content = match file_kind(&path) {
+        FileKind::Markdown => {
+            let stem = Path::new(&file_name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&file_name);
+            format!("# {stem}\n")
+        }
+        _ => String::new(),
+    };
+    use std::io::Write as _;
+    fs::File::create_new(&path)?.write_all(content.as_bytes())?;
+    Ok(path)
+}
+
+/// Rename a library file or folder in place. The typed name is used as-is
+/// when it carries an extension; a bare name on a file keeps the old
+/// extension (renaming `report.pdf` to `final` gives `final.pdf`). Never
+/// overwrites. Returns the new path.
+pub fn rename_library_path(path: &Path, name: &str) -> io::Result<PathBuf> {
+    let name = checked_library_name(name)?;
+    let keep_ext = !path.is_dir() && Path::new(name).extension().is_none();
+    let file_name = match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) if keep_ext => format!("{name}.{ext}"),
+        _ => name.to_string(),
+    };
+    let dest = path.with_file_name(&file_name);
+    if dest == path {
+        return Ok(dest);
+    }
+    if dest.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("\"{file_name}\" already exists here"),
+        ));
+    }
+    fs::rename(path, &dest)?;
+    Ok(dest)
 }
 
 /// Files larger than this never get a body scan: a library can hold logs
@@ -337,6 +459,90 @@ mod tests {
         fs::write(root.0.join("older.md"), "updated\n").expect("touch");
         assert_eq!(names(LibrarySort::Modified), ["alpha", "zeta", "older.md", "newer.md"]);
         assert_eq!(names(LibrarySort::Name), ["alpha", "zeta", "newer.md", "older.md"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_folders_browse_and_search_like_real_ones() {
+        let root = ScratchRoot::new("librarysymlink");
+        let outside = ScratchRoot::new("librarysymlinktarget");
+        outside.write("linked/doc.md", "alpha inside the link\n");
+        std::os::unix::fs::symlink(outside.0.join("linked"), root.0.join("shared"))
+            .expect("symlink dir");
+        std::os::unix::fs::symlink(root.0.join("missing"), root.0.join("broken"))
+            .expect("symlink broken");
+
+        // Collapsed: the link is a folder row, flagged, not a file.
+        let rows = library_tree(&root.0, &HashSet::new(), LibrarySort::Name);
+        let shared = rows.iter().find(|r| r.name == "shared").expect("shared row");
+        assert!(shared.is_dir && shared.is_symlink);
+        let broken = rows.iter().find(|r| r.name == "broken").expect("broken row");
+        assert!(!broken.is_dir && broken.is_symlink);
+
+        // Expanding descends through the link.
+        let expanded: HashSet<PathBuf> = [root.0.join("shared")].into();
+        let rows = library_tree(&root.0, &expanded, LibrarySort::Name);
+        let doc = rows.iter().find(|r| r.name == "doc.md").expect("doc row");
+        assert_eq!(doc.depth, 1);
+        assert!(doc.path.starts_with(root.0.join("shared")));
+
+        // Search reaches into the link; a link cycle doesn't hang or dupe.
+        std::os::unix::fs::symlink(&outside.0, outside.0.join("linked/cycle"))
+            .expect("symlink cycle");
+        let hits = search_library(&[root.0.clone()], "alpha", 10);
+        assert_eq!(
+            hits.iter().filter(|h| h.name == "doc.md").count(),
+            1,
+            "one hit through the link, no cycle duplicates"
+        );
+    }
+
+    #[test]
+    fn create_library_file_defaults_extension_and_refuses_overwrite() {
+        let root = ScratchRoot::new("librarycreate");
+        // Bare name becomes markdown; markdown is seeded with its title
+        // heading so the editor never opens on an invisible empty document.
+        let plain = create_library_file(&root.0, "notes").expect("create");
+        assert_eq!(plain.file_name().and_then(|n| n.to_str()), Some("notes.md"));
+        assert_eq!(fs::read_to_string(&plain).expect("read"), "# notes\n");
+        let explicit = create_library_file(&root.0, "plan.md").expect("create");
+        assert_eq!(fs::read_to_string(&explicit).expect("read"), "# plan\n");
+        let kept = create_library_file(&root.0, "style.css").expect("create");
+        assert_eq!(kept.file_name().and_then(|n| n.to_str()), Some("style.css"));
+        assert_eq!(fs::read_to_string(&kept).expect("read"), "");
+
+        let err = create_library_file(&root.0, "notes").expect_err("collision");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        for bad in ["", "  ", ".hidden", "a/b", "a\\b"] {
+            let err = create_library_file(&root.0, bad).expect_err("bad name");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn rename_library_path_keeps_extension_and_refuses_overwrite() {
+        let root = ScratchRoot::new("libraryrename");
+        root.write("report.pdf", "x");
+        root.write("draft.md", "# draft\n");
+        root.write("assets/pic.png", "x");
+
+        // A bare name keeps the file's extension; an explicit one changes it.
+        let renamed = rename_library_path(&root.0.join("report.pdf"), "final").expect("rename");
+        assert_eq!(renamed.file_name().and_then(|n| n.to_str()), Some("final.pdf"));
+        let retyped = rename_library_path(&renamed, "final.txt").expect("rename");
+        assert_eq!(retyped.file_name().and_then(|n| n.to_str()), Some("final.txt"));
+        assert!(!renamed.exists() && retyped.exists());
+
+        // Folders rename plainly, dots and all.
+        let dir = rename_library_path(&root.0.join("assets"), "img v0.2").expect("rename dir");
+        assert!(dir.is_dir() && dir.join("pic.png").exists());
+        assert_eq!(dir.file_name().and_then(|n| n.to_str()), Some("img v0.2"));
+
+        // Never overwrites; a same-name rename is a quiet no-op.
+        let err = rename_library_path(&retyped, "draft.md").expect_err("collision");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        let same = rename_library_path(&retyped, "final.txt").expect("no-op");
+        assert_eq!(same, retyped);
     }
 
     #[test]

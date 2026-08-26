@@ -25,8 +25,10 @@ pub mod state;
 pub mod transport;
 pub mod types;
 pub mod vaultio;
+#[cfg(feature = "http")]
+mod wake;
 
-pub use engine::{EngineConfig, SyncEngine};
+pub use engine::{EngineConfig, RemoteWakeConfig, SyncEngine};
 
 /// The in-memory server model: always built for the crate's own tests, and
 /// exposed under `testkit` so the real server crate can reuse it as an oracle.
