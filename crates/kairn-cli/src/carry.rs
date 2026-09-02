@@ -1,5 +1,5 @@
 //! Planning for `kairn carry`: which open tasks leave which past daily
-//! notes, which `**group**` headers travel with them, and what the
+//! notes, which `**group**` (or `*group*`) headers travel with them, and what the
 //! destination note gains. Everything here is pure text logic so the whole
 //! plan is testable; main.rs applies it with kairn-core's never-clobber
 //! writes.
@@ -17,10 +17,23 @@ pub struct Move {
 }
 
 /// A line that groups the tasks under it without being a heading:
-/// bold text and nothing else, NotePlan's task-group idiom.
+/// bold or italic text and nothing else, NotePlan's task-group idiom.
+/// `**Clients**`, `*Clients*` (NotePlan-flavour bold, which the editor
+/// renders as bold too), `__Clients__` and `_Clients_` all count; a task
+/// line (`* ...`) never does, and neither does prose that merely starts
+/// and ends with a styled span (`*a* and *b*`).
 pub fn is_group_header(line: &str) -> bool {
     let t = line.trim();
-    t.len() > 4 && t.starts_with("**") && t.ends_with("**")
+    for mark in ["**", "__", "*", "_"] {
+        if t.len() > 2 * mark.len() && t.starts_with(mark) && t.ends_with(mark) {
+            let inner = &t[mark.len()..t.len() - mark.len()];
+            let ch = mark.chars().next().expect("marker");
+            return !inner.starts_with(char::is_whitespace)
+                && !inner.ends_with(char::is_whitespace)
+                && !inner.contains(ch);
+        }
+    }
+    false
 }
 
 /// The `**group**` header the task at `task_idx` sits under: the nearest
@@ -134,6 +147,32 @@ mod tests {
         assert_eq!(group_header(&lines, 6).as_deref(), Some("**Clients**"));
         // The blank line does.
         assert_eq!(group_header(&lines, 8), None);
+    }
+
+    #[test]
+    fn italic_and_underscore_headers_count_too() {
+        // 2026-09-02: a `*Gerrards Pending Sessions*` header was left behind
+        // by the carry while its tasks moved, because only `**bold**` counted.
+        assert!(is_group_header("**Clients**"));
+        assert!(is_group_header("*Gerrards Pending Sessions*"));
+        assert!(is_group_header("__Admin__"));
+        assert!(is_group_header("_Admin_"));
+        assert!(is_group_header("  *Indented*  "));
+        // Tasks and bullets are never headers, whatever they end in.
+        assert!(!is_group_header("* task"));
+        assert!(!is_group_header("* [ ] fix the *bold* thing*"));
+        assert!(!is_group_header("- bullet*"));
+        // Styled prose is not a header, and neither is an empty marker pair.
+        assert!(!is_group_header("*a* and *b*"));
+        assert!(!is_group_header("**"));
+        assert!(!is_group_header("*"));
+        assert!(!is_group_header("* *"));
+        let lines = vec!["*Gerrards Pending Sessions*", "* one", "* two"];
+        assert_eq!(
+            group_header(&lines, 2).as_deref(),
+            Some("*Gerrards Pending Sessions*")
+        );
+        assert!(header_now_empty(&["*Gerrards Pending Sessions*", ""], 0));
     }
 
     #[test]

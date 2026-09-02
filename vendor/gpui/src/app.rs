@@ -1249,6 +1249,17 @@ impl App {
                 }
 
                 if self.pending_effects.is_empty() {
+                    // `Self::notify` cannot reach a window that is mid-update, because the window
+                    // is taken out of `self.windows` for the duration, so sweep for dirty windows
+                    // once the effects are drained. A backend whose frame loop parks would
+                    // otherwise stay parked.
+                    for window in self.windows.values() {
+                        if let Some(window) = window.as_deref()
+                            && window.invalidator.is_dirty()
+                        {
+                            window.platform_window.request_redraw();
+                        }
+                    }
                     break;
                 }
             }
@@ -1323,6 +1334,7 @@ impl App {
             if let Some(window) = window.as_deref_mut() {
                 window.refreshing = true;
                 window.invalidator.set_dirty(true);
+                window.platform_window.request_redraw();
             }
         }
     }
@@ -2044,8 +2056,12 @@ impl App {
                     .push_back(Effect::Notify { emitter: entity_id });
             }
         } else {
-            for invalidator in window_invalidators.values() {
-                invalidator.invalidate_view(entity_id, self);
+            for (window_id, invalidator) in window_invalidators.iter() {
+                if invalidator.invalidate_view(entity_id, self)
+                    && let Some(Some(window)) = self.windows.get(*window_id)
+                {
+                    window.platform_window.request_redraw();
+                }
             }
         }
 

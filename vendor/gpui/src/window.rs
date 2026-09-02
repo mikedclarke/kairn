@@ -44,7 +44,7 @@ use std::{
     ops::{DerefMut, Range},
     rc::Rc,
     sync::{
-        Arc, Weak,
+        Arc, OnceLock, Weak,
         atomic::{AtomicUsize, Ordering::SeqCst},
     },
     time::{Duration, Instant},
@@ -926,6 +926,57 @@ fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> Bounds<Pixels>
         })
 }
 
+fn frame_stats_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("GPUI_FRAME_STATS").is_ok_and(|value| !value.is_empty()))
+}
+
+/// Per-second counters for the frame loop, printed when `GPUI_FRAME_STATS` is set.
+struct FrameStats {
+    since: Instant,
+    ticks: usize,
+    draws: usize,
+    draw_total: Duration,
+    draw_max: Duration,
+}
+
+impl FrameStats {
+    fn new() -> Self {
+        FrameStats {
+            since: Instant::now(),
+            ticks: 0,
+            draws: 0,
+            draw_total: Duration::ZERO,
+            draw_max: Duration::ZERO,
+        }
+    }
+
+    fn record_draw(&mut self, elapsed: Duration) {
+        self.draws += 1;
+        self.draw_total += elapsed;
+        self.draw_max = self.draw_max.max(elapsed);
+    }
+
+    fn report(&mut self) {
+        if self.since.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        let draw_avg_ms = if self.draws == 0 {
+            0.0
+        } else {
+            self.draw_total.as_secs_f64() * 1000.0 / self.draws as f64
+        };
+        eprintln!(
+            "gpui frame stats: ticks={} draws={} draw_avg_ms={:.1} draw_max_ms={:.1}",
+            self.ticks,
+            self.draws,
+            draw_avg_ms,
+            self.draw_max.as_secs_f64() * 1000.0
+        );
+        *self = FrameStats::new();
+    }
+}
+
 impl Window {
     pub(crate) fn new(
         handle: AnyWindowHandle,
@@ -1022,7 +1073,13 @@ impl Window {
             let needs_present = needs_present.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
             let last_input_timestamp = last_input_timestamp.clone();
+            let mut frame_stats = FrameStats::new();
             move |request_frame_options| {
+                let stats_enabled = frame_stats_enabled();
+                if stats_enabled {
+                    frame_stats.ticks += 1;
+                }
+
                 let next_frame_callbacks = next_frame_callbacks.take();
                 if !next_frame_callbacks.is_empty() {
                     handle
@@ -1042,6 +1099,7 @@ impl Window {
                         && last_input_timestamp.get().elapsed() < Duration::from_secs(1));
 
                 if invalidator.is_dirty() || request_frame_options.force_render {
+                    let draw_started = stats_enabled.then(Instant::now);
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
@@ -1051,7 +1109,10 @@ impl Window {
                                 arena_clear_needed.clear();
                             })
                             .log_err();
-                    })
+                    });
+                    if let Some(draw_started) = draw_started {
+                        frame_stats.record_draw(draw_started.elapsed());
+                    }
                 } else if needs_present {
                     handle
                         .update(&mut cx, |_, window, _| window.present())
@@ -1063,6 +1124,10 @@ impl Window {
                         window.complete_frame();
                     })
                     .log_err();
+
+                if stats_enabled {
+                    frame_stats.report();
+                }
             }
         }));
         platform_window.on_resize(Box::new({
@@ -1368,6 +1433,7 @@ impl Window {
         if self.invalidator.not_drawing() {
             self.refreshing = true;
             self.invalidator.set_dirty(true);
+            self.platform_window.request_redraw();
         }
     }
 
@@ -1643,6 +1709,7 @@ impl Window {
     /// Schedule the given closure to be run directly after the current frame is rendered.
     pub fn on_next_frame(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
         RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
+        self.platform_window.request_redraw();
     }
 
     /// Schedule a frame to be drawn on the next animation frame.

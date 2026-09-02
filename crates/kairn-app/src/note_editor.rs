@@ -14,14 +14,14 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, Corners, DispatchPhase, Edges, Element, ElementId,
     ElementInputHandler, Entity, EventEmitter, FocusHandle, Focusable, FontStyle, FontWeight,
     GlobalElementId, Hsla, InteractiveElement as _, IntoElement, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point, Render,
-    ScrollHandle, SharedString, StrikethroughStyle, Style, Styled as _, Task, TextRun,
+    ScrollHandle, SharedString, Size, StrikethroughStyle, Style, Styled as _, Task, TextRun,
     UTF16Selection, UnderlineStyle, Window, WrappedLine, div, fill, point, px, size,
 };
 use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
@@ -42,6 +42,9 @@ use crate::theme::{self, KairnTheme, KairnThemeExt as _};
 const AUTOSAVE_MS: u64 = 800;
 const CURSOR_WIDTH: Pixels = px(2.);
 const BLINK_MS: u64 = 550;
+/// Idle time after which the caret stops blinking and sits solid, so a note
+/// left alone stops asking for two redraws a second.
+const BLINK_IDLE_MS: u64 = 10_000;
 /// Pointer travel before a glyph press becomes a line drag, not a click.
 const DRAG_THRESHOLD: Pixels = px(3.);
 /// The handle gutter left of every line, at the base editor size: the grab
@@ -107,6 +110,12 @@ pub struct NoteEditor {
     /// Layout of the last frame, shared with the element and the IME
     /// handler. Content-relative y positions plus the element's bounds.
     layout: Rc<RefCell<Option<EditorLayout>>>,
+    /// The inputs the stored layout was built from: an equal key on the next
+    /// pass means the slot list still stands and nothing is reshaped.
+    layout_key: Option<LayoutKey>,
+    /// The last size measured at a real width, handed back for the layout
+    /// engine's intrinsic-size probes so they never reshape the note.
+    last_measure: Cell<Option<Size<Pixels>>>,
     cache: RefCell<ShapeCache>,
 }
 
@@ -116,6 +125,63 @@ pub(crate) struct EditorLayout {
     /// `indent` already includes it.
     pub gutter: Pixels,
     pub slots: Vec<LineSlot>,
+    /// Total height of the slots, the measured layout's answer.
+    pub content_height: Pixels,
+}
+
+/// Everything the slot list is built from. A pass whose key matches the one
+/// the stored layout was built with reuses that layout untouched.
+#[derive(Clone, PartialEq)]
+struct LayoutKey {
+    revision: u64,
+    width: Pixels,
+    /// Only the cursor's line start matters: that line is the one shaped
+    /// with its raw markdown revealed.
+    cursor_line: usize,
+    hovered_link: Option<(usize, Range<usize>)>,
+    ime_marked: Option<Range<usize>>,
+    theme: ThemeKey,
+}
+
+/// The theme fields the note's shaping reads. Nothing else in the theme
+/// reaches a slot, so a change elsewhere must not throw the layout away.
+#[derive(Clone, PartialEq)]
+struct ThemeKey {
+    mode: theme::Mode,
+    editor_size: f32,
+    /// The family the note pane sets over the editor, and the UI family it
+    /// falls back to when unset.
+    editor_font: Option<SharedString>,
+    ui_font: Option<SharedString>,
+    text: Hsla,
+    dim: Hsla,
+    faint: Hsla,
+    accent: Hsla,
+    amber: Hsla,
+    red: Hsla,
+    highlight: Hsla,
+    heading: Hsla,
+    bold: Hsla,
+}
+
+impl ThemeKey {
+    fn of(t: &KairnTheme) -> Self {
+        Self {
+            mode: t.mode,
+            editor_size: t.editor_size,
+            editor_font: t.editor_font.clone(),
+            ui_font: t.ui_font.clone(),
+            text: t.text,
+            dim: t.dim,
+            faint: t.faint,
+            accent: t.accent,
+            amber: t.amber,
+            red: t.red,
+            highlight: t.highlight,
+            heading: t.heading,
+            bold: t.bold,
+        }
+    }
 }
 
 /// One raw line of the document, laid out.
@@ -293,6 +359,8 @@ impl NoteEditor {
             _autosave: None,
             follow_cursor: Cell::new(false),
             layout: Rc::new(RefCell::new(None)),
+            layout_key: None,
+            last_measure: Cell::new(None),
             cache: RefCell::new(ShapeCache::default()),
         }
     }
@@ -436,11 +504,21 @@ impl NoteEditor {
         self.blink_visible = true;
         self.blink_epoch += 1;
         let epoch = self.blink_epoch;
+        let started = Instant::now();
         self._blink_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_millis(BLINK_MS)).await;
                 let ok = this.update(cx, |ed, cx| {
                     if ed.blink_epoch != epoch {
+                        return false;
+                    }
+                    if started.elapsed() >= Duration::from_millis(BLINK_IDLE_MS) {
+                        // The caret is left solid, so the last frame it needs
+                        // is the one that stops it mid-hide.
+                        if !ed.blink_visible {
+                            ed.blink_visible = true;
+                            cx.notify();
+                        }
                         return false;
                     }
                     if ed.focused {
@@ -1555,11 +1633,28 @@ impl NoteEditor {
 
     // --- layout ------------------------------------------------------------
 
-    /// Shape every line at `width` and rebuild the slot list. Returns the
-    /// content height. Called from the element's measured layout, so the
-    /// shaping cache keeps a keystroke from re-shaping the whole note.
+    /// Shape every line at `width` and rebuild the slot list, or reuse the
+    /// last one when nothing it depends on has moved. Returns the content
+    /// height. Called from the element's measured layout, which runs on
+    /// every frame, so an unchanged note must cost one key comparison.
     fn layout_for_width(&mut self, width: Pixels, window: &mut Window, cx: &mut App) -> Pixels {
         let t = cx.kairn().clone();
+        let key = LayoutKey {
+            revision: self.buffer.revision(),
+            width,
+            cursor_line: self.line_range_at(self.cursor).start,
+            hovered_link: self.hovered_link.clone(),
+            ime_marked: self.ime_marked.clone(),
+            theme: ThemeKey::of(&t),
+        };
+        if self.layout_key.as_ref() == Some(&key) {
+            let height = self.layout.borrow().as_ref().map(|l| l.content_height);
+            if let Some(height) = height {
+                self.last_measure.set(Some(size(width, height)));
+                return height;
+            }
+        }
+
         let dark = matches!(t.mode, theme::Mode::Dark);
         {
             let mut cache = self.cache.borrow_mut();
@@ -1569,12 +1664,11 @@ impl NoteEditor {
                 cache.dark = dark;
             }
         }
-        let text = self.buffer.text().to_string();
         let cursor_line = self.line_range_at(self.cursor);
         let mut slots = Vec::new();
         let mut y = px(0.);
         let mut start = 0usize;
-        for raw in text.split('\n') {
+        for raw in self.buffer.text().split('\n') {
             let active = start == cursor_line.start;
             let hover = self
                 .hovered_link
@@ -1586,10 +1680,12 @@ impl NoteEditor {
             y += height;
             start += raw.len() + 1;
         }
+        self.layout_key = Some(key);
+        self.last_measure.set(Some(size(width, y)));
         let mut layout = self.layout.borrow_mut();
         let bounds = layout.as_ref().map(|l| l.bounds).unwrap_or_default();
         let gutter = px(HANDLE_GUTTER * (t.editor_size / theme::EDITOR_BASE_SIZE));
-        *layout = Some(EditorLayout { bounds, gutter, slots });
+        *layout = Some(EditorLayout { bounds, gutter, slots, content_height: y });
         y
     }
 
@@ -2370,10 +2466,23 @@ impl Element for NoteEditorElement {
         let layout_id = window.request_measured_layout(
             Style::default(),
             move |known, available, window, cx| {
-                let width = known.width.unwrap_or(match available.width {
-                    gpui::AvailableSpace::Definite(w) => w,
-                    _ => px(640.),
+                let definite = known.width.or(match available.width {
+                    gpui::AvailableSpace::Definite(w) => Some(w),
+                    _ => None,
                 });
+                // An intrinsic-size probe (min-content, max-content) carries
+                // no width to shape against, and the layout engine runs
+                // several per frame. Shaping at a guessed width would rebuild
+                // the slot list and throw the width-keyed shape cache away on
+                // every one, so a probe answers with the last real
+                // measurement instead.
+                let width = match definite {
+                    Some(w) => w,
+                    None => match editor.read(cx).last_measure.get() {
+                        Some(measured) => return measured,
+                        None => px(640.),
+                    },
+                };
                 let height =
                     editor.update(cx, |ed, cx| ed.layout_for_width(width, window, cx));
                 size(width, height)
@@ -2403,7 +2512,9 @@ impl Element for NoteEditorElement {
             if let Some(layout) = ed.layout.borrow_mut().as_mut() {
                 layout.bounds = bounds;
             }
-            let focused = ed.focus_handle.is_focused(window);
+            // A background window's caret sits solid: blinking it would keep
+            // waking the app while the user is somewhere else.
+            let focused = ed.focus_handle.is_focused(window) && window.is_window_active();
             ed.sync_focus(focused, cx);
             if ed.follow_cursor.take() {
                 ed.follow_cursor_now();

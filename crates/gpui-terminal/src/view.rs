@@ -61,6 +61,14 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
+
+/// Shortest gap between repaints driven by PTY output. A streaming
+/// application can deliver hundreds of chunks a second, and every repaint is
+/// a full window rebuild in gpui; coalescing bounds that to a display-rate
+/// share while focused and a lighter one while another view has focus.
+const REPAINT_FOCUSED: Duration = Duration::from_millis(33);
+const REPAINT_UNFOCUSED: Duration = Duration::from_millis(100);
 
 /// Configuration for terminal creation and runtime updates.
 ///
@@ -451,6 +459,15 @@ pub struct TerminalView {
     /// Focus listeners that forward focus in/out to applications that request
     /// reporting (CSI ?1004); registered on first render, when a Window exists
     focus_subscriptions: Vec<Subscription>,
+
+    /// Focus as of the last render, which picks the repaint interval (the
+    /// reader task has no Window to ask)
+    focused_at_render: bool,
+
+    /// When PTY output last repainted, and the deferred repaint waiting for
+    /// the interval to elapse, if one is pending
+    last_repaint: Instant,
+    _repaint_task: Option<Task<()>>,
 }
 
 impl TerminalView {
@@ -561,7 +578,7 @@ impl TerminalView {
                         // Process bytes and notify the view
                         let result = this.update(cx, |view: &mut Self, cx: &mut Context<Self>| {
                             view.state.process_bytes(&bytes);
-                            cx.notify();
+                            view.request_repaint(cx);
                         });
                         if result.is_err() {
                             // View was dropped, exit
@@ -604,6 +621,35 @@ impl TerminalView {
             last_mouse_position: None,
             url_regex: RegexSearch::new(URL_REGEX).expect("URL_REGEX compiles"),
             focus_subscriptions: Vec::new(),
+            focused_at_render: false,
+            last_repaint: Instant::now(),
+            _repaint_task: None,
+        }
+    }
+
+    /// Repaint for new PTY output: at once after a quiet spell, otherwise
+    /// once the repaint interval has elapsed since the last one. Chunks that
+    /// land while a deferred repaint is pending ride along with it.
+    fn request_repaint(&mut self, cx: &mut Context<Self>) {
+        let interval = if self.focused_at_render {
+            REPAINT_FOCUSED
+        } else {
+            REPAINT_UNFOCUSED
+        };
+        let elapsed = self.last_repaint.elapsed();
+        if elapsed >= interval {
+            self.last_repaint = Instant::now();
+            cx.notify();
+        } else if self._repaint_task.is_none() {
+            let wait = interval - elapsed;
+            self._repaint_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                let _ = this.update(cx, |view, cx| {
+                    view._repaint_task = None;
+                    view.last_repaint = Instant::now();
+                    cx.notify();
+                });
+            }));
         }
     }
 
@@ -1214,6 +1260,7 @@ impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Process any pending events
         self.process_events(window, cx);
+        self.focused_at_render = self.focus_handle.is_focused(window);
 
         // Register focus forwarding once a Window exists (construction has no
         // Window). Applications opt in with CSI ?1004; the mode check happens

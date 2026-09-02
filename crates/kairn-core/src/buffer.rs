@@ -57,6 +57,10 @@ pub struct NoteBuffer {
     /// and content arriving on disk replaces the seed instead of merging
     /// with it.
     seeded: bool,
+    /// Bumped by every change to `text` and by nothing else, so a caller
+    /// caching work derived from the text can compare one integer instead
+    /// of the document.
+    revision: u64,
     undo: Vec<UndoGroup>,
     redo: Vec<UndoGroup>,
 }
@@ -64,7 +68,14 @@ pub struct NoteBuffer {
 impl NoteBuffer {
     pub fn new(text: impl Into<String>) -> Self {
         let text = text.into();
-        Self { baseline: text.clone(), text, seeded: false, undo: Vec::new(), redo: Vec::new() }
+        Self {
+            baseline: text.clone(),
+            text,
+            seeded: false,
+            revision: 0,
+            undo: Vec::new(),
+            redo: Vec::new(),
+        }
     }
 
     /// A buffer opened over a blank (or absent) file with `seed` rendered in
@@ -77,6 +88,7 @@ impl NoteBuffer {
             baseline: disk.into(),
             text: seed.into(),
             seeded: true,
+            revision: 0,
             undo: Vec::new(),
             redo: Vec::new(),
         }
@@ -88,6 +100,11 @@ impl NoteBuffer {
 
     pub fn baseline(&self) -> &str {
         &self.baseline
+    }
+
+    /// How many times the text has changed since the buffer was opened.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Whether the buffer holds edits the baseline (last known disk state)
@@ -132,6 +149,7 @@ impl NoteBuffer {
         // The first real edit makes the seed the user's own content.
         self.seeded = false;
         self.text.replace_range(start..end, insert);
+        self.revision += 1;
         let cursor_after = start + insert.len();
         self.redo.clear();
 
@@ -206,6 +224,7 @@ impl NoteBuffer {
             let end = op.at + op.inserted.len();
             self.text.replace_range(op.at..end, &op.removed);
         }
+        self.revision += 1;
         let cursor = floor_boundary(&self.text, g.cursor_before);
         self.redo.push(g);
         Some(cursor)
@@ -219,6 +238,7 @@ impl NoteBuffer {
             let end = op.at + op.removed.len();
             self.text.replace_range(op.at..end, &op.inserted);
         }
+        self.revision += 1;
         let cursor = floor_boundary(&self.text, g.cursor_after);
         self.undo.push(g);
         Some(cursor)
@@ -521,6 +541,7 @@ impl NoteBuffer {
             self.baseline = disk.to_string();
             if !disk.trim().is_empty() {
                 self.text = disk.to_string();
+                self.revision += 1;
                 self.seeded = false;
                 self.undo.clear();
                 self.redo.clear();
@@ -530,6 +551,7 @@ impl NoteBuffer {
         let merged = merge3(&self.baseline, disk, &self.text);
         if merged.text != self.text {
             let old = std::mem::replace(&mut self.text, merged.text);
+            self.revision += 1;
             self.redo.clear();
             self.undo.push(UndoGroup {
                 ops: vec![EditOp { at: 0, removed: old, inserted: self.text.clone() }],
@@ -996,6 +1018,26 @@ mod tests {
         assert_eq!(b.text(), "## Tasks\n");
         assert_eq!(b.baseline(), "\n");
         assert!(!b.is_dirty());
+    }
+
+    #[test]
+    fn revision_counts_text_changes_only() {
+        let mut b = NoteBuffer::new("a\n");
+        assert_eq!(b.revision(), 0);
+        b.edit(2..2, "b", 2, 1000);
+        assert_eq!(b.revision(), 1);
+        // Reads and a successful save leave the text alone.
+        assert_eq!(b.text(), "a\nb");
+        b.mark_saved();
+        assert_eq!(b.revision(), 1);
+        // An edit that replaces nothing with nothing is not a change.
+        b.edit(1..1, "", 1, 1100);
+        assert_eq!(b.revision(), 1);
+        assert_eq!(b.undo(), Some(2));
+        assert_eq!(b.revision(), 2);
+        // Nothing left to undo, nothing to bump.
+        assert_eq!(b.undo(), None);
+        assert_eq!(b.revision(), 2);
     }
 
     #[test]
