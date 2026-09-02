@@ -2,8 +2,9 @@ use chrono::{Datelike, Days, Local, Months, NaiveDate, Timelike};
 use gpui::AnimationExt as _;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Context, ElementId, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, div, point, px,
+    AppContext, Context, ElementId, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div, point,
+    px,
 };
 use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
 
@@ -203,8 +204,19 @@ impl Workspace {
         let collapsed = self.section_collapsed("Notes");
         let notes_dir = self.notes_root.join("Notes");
         let ws = cx.weak_entity();
+        // The header doubles as the top-level drop target: a note dragged
+        // onto it moves back up to Notes/ root.
+        let notes_root_dest = notes_dir.clone();
+        let notes_head = note_drop_zone(
+            sechead(t, "sec-notes", "Notes", None, collapsed),
+            notes_dir.clone(),
+            t,
+        )
+        .on_drop(cx.listener(move |this, drag: &NoteDrag, window, cx| {
+            this.move_note_to(drag.path.clone(), notes_root_dest.clone(), window, cx);
+        }));
         side = side.child(
-            sechead(t, "sec-notes", "Notes", None, collapsed)
+            notes_head
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_section("Notes", cx)))
                 .context_menu(move |menu, _, _| {
                     let ws = ws.clone();
@@ -246,6 +258,18 @@ impl Workspace {
                 let menu_path = entry.path.clone();
                 if entry.is_dir {
                     let open = self.notes_expanded_contains(&entry.path);
+                    // Regular folders travel and receive; NotePlan's @-special
+                    // folders (Trash, Templates, Archive) stay put.
+                    if !entry.special {
+                        row =
+                            note_drag_source(row, entry.path.clone(), entry.name.clone().into(), t);
+                        let drop_dest = entry.path.clone();
+                        row = note_drop_zone(row, entry.path.clone(), t).on_drop(cx.listener(
+                            move |this, drag: &NoteDrag, window, cx| {
+                                this.move_note_to(drag.path.clone(), drop_dest.clone(), window, cx);
+                            },
+                        ));
+                    }
                     row = row
                         .child(
                             div()
@@ -276,6 +300,10 @@ impl Workspace {
                     }));
                 } else {
                     let selected = self.view == PaneView::Note(entry.path.clone());
+                    if !entry.special {
+                        row =
+                            note_drag_source(row, entry.path.clone(), entry.name.clone().into(), t);
+                    }
                     row = row
                         .when(selected, |d| d.bg(t.sel).text_color(t.text))
                         .child(div().w(t.ui_px(14.)).flex_none())
@@ -350,8 +378,15 @@ impl Workspace {
                 let toggle = root.clone();
                 let menu_root = root.clone();
                 let ws = cx.weak_entity();
+                // A root can't be dragged (it is a mount point, not a file),
+                // but it receives drops to move an item up to the top level.
+                let drop_dest = root.clone();
+                let root_row = library_drop_zone(nav_item(t, ("lib-root", ri)), root.clone(), t)
+                    .on_drop(cx.listener(move |this, drag: &LibraryDrag, window, cx| {
+                        this.move_library_path(drag.path.clone(), drop_dest.clone(), window, cx);
+                    }));
                 side = side.child(
-                    nav_item(t, ("lib-root", ri))
+                    root_row
                         .py(px(3.))
                         .gap(px(6.))
                         .child(
@@ -440,6 +475,25 @@ impl Workspace {
                     let ws = cx.weak_entity();
                     if entry.is_dir {
                         let open = self.library_expanded.contains(&entry.path);
+                        // A library folder both travels (a drag source) and
+                        // receives (a drop target for files or subfolders).
+                        let row = library_drag_source(
+                            row,
+                            entry.path.clone(),
+                            entry.name.clone().into(),
+                            t,
+                        );
+                        let drop_dest = entry.path.clone();
+                        let row = library_drop_zone(row, entry.path.clone(), t).on_drop(
+                            cx.listener(move |this, drag: &LibraryDrag, window, cx| {
+                                this.move_library_path(
+                                    drag.path.clone(),
+                                    drop_dest.clone(),
+                                    window,
+                                    cx,
+                                );
+                            }),
+                        );
                         side = side.child(
                             row.child(
                                 div()
@@ -523,6 +577,12 @@ impl Workspace {
                         );
                     } else {
                         let selected = self.view == PaneView::Library(entry.path.clone());
+                        let row = library_drag_source(
+                            row,
+                            entry.path.clone(),
+                            entry.name.clone().into(),
+                            t,
+                        );
                         side = side.child(
                             row.when(selected, |d| d.bg(t.sel).text_color(t.text))
                                 .child(div().w(t.ui_px(14.)).flex_none())
@@ -1630,4 +1690,113 @@ fn cal_nav(t: &KairnTheme, id: &'static str, glyph: &'static str) -> gpui::State
         .cursor_pointer()
         .hover(move |s| s.text_color(hover_text))
         .child(glyph)
+}
+
+// --- Tree drag-and-drop: move a note or library item into another folder ---
+//
+// Kept as two distinct payload types (not one shared type) so a drag stays
+// within its own tree: a Notes-tree drag never highlights or drops on a
+// Library folder, and the reverse, since `drag_over`/`on_drop`/`can_drop`
+// dispatch by payload type. Both use GPUI's native drag machinery, which
+// renders the trailing preview and follows the pointer for us.
+
+/// A note or notes-folder being dragged in the Notes tree.
+#[derive(Clone)]
+pub(crate) struct NoteDrag {
+    pub path: std::path::PathBuf,
+}
+
+/// A file or folder being dragged in a Library root.
+#[derive(Clone)]
+pub(crate) struct LibraryDrag {
+    pub path: std::path::PathBuf,
+}
+
+/// The small card that trails the cursor during a tree drag, so the move
+/// reads as physically picking the item up.
+struct TreeDragPreview {
+    label: SharedString,
+    theme: KairnTheme,
+}
+
+impl Render for TreeDragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let t = &self.theme;
+        div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .px(px(10.))
+            .py(px(5.))
+            .rounded(px(7.))
+            .bg(t.panel)
+            .border_1()
+            .border_color(t.border)
+            .shadow_md()
+            .text_size(t.ui_px(12.))
+            .text_color(t.dim)
+            .child(self.label.clone())
+    }
+}
+
+/// Make a Notes-tree row draggable, trailing a labelled preview card.
+fn note_drag_source(
+    row: gpui::Stateful<gpui::Div>,
+    path: std::path::PathBuf,
+    label: SharedString,
+    t: &KairnTheme,
+) -> gpui::Stateful<gpui::Div> {
+    let theme = t.clone();
+    row.on_drag(NoteDrag { path }, move |_, _, _, cx| {
+        cx.stop_propagation();
+        let (label, theme) = (label.clone(), theme.clone());
+        cx.new(move |_| TreeDragPreview { label, theme })
+    })
+}
+
+/// Make a Library row draggable, trailing a labelled preview card.
+fn library_drag_source(
+    row: gpui::Stateful<gpui::Div>,
+    path: std::path::PathBuf,
+    label: SharedString,
+    t: &KairnTheme,
+) -> gpui::Stateful<gpui::Div> {
+    let theme = t.clone();
+    row.on_drag(LibraryDrag { path }, move |_, _, _, cx| {
+        cx.stop_propagation();
+        let (label, theme) = (label.clone(), theme.clone());
+        cx.new(move |_| TreeDragPreview { label, theme })
+    })
+}
+
+/// A folder tint for the Notes drop target: only a valid destination lights
+/// up (GPUI gates the style behind `can_drop`), previewing where the item
+/// will land. The caller adds `.on_drop(...)` with the move itself.
+fn note_drop_zone(
+    row: gpui::Stateful<gpui::Div>,
+    dest: std::path::PathBuf,
+    t: &KairnTheme,
+) -> gpui::Stateful<gpui::Div> {
+    let accent = t.accent;
+    row.can_drop(move |drag, _, _| {
+        drag.downcast_ref::<NoteDrag>()
+            .is_some_and(|n| Workspace::can_move_into(&n.path, &dest))
+    })
+    .drag_over::<NoteDrag>(move |style, _, _, _| style.bg(accent.opacity(0.18)).text_color(accent))
+}
+
+/// The Library counterpart of [`note_drop_zone`].
+fn library_drop_zone(
+    row: gpui::Stateful<gpui::Div>,
+    dest: std::path::PathBuf,
+    t: &KairnTheme,
+) -> gpui::Stateful<gpui::Div> {
+    let accent = t.accent;
+    row.can_drop(move |drag, _, _| {
+        drag.downcast_ref::<LibraryDrag>()
+            .is_some_and(|l| Workspace::can_move_into(&l.path, &dest))
+    })
+    .drag_over::<LibraryDrag>(move |style, _, _, _| {
+        style.bg(accent.opacity(0.18)).text_color(accent)
+    })
 }

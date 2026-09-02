@@ -12,6 +12,8 @@ restating the same fact twice; no em dashes. Rewrite to this standard before rel
 
 <!-- New user-visible capabilities. -->
 
+- Drag a note or library file onto another folder in the sidebar to move it, with the destination highlighted while you hover and the move covered by undo.
+
 ## Improved
 
 <!-- Refinements to existing workflows, reliability, performance, or UX. -->

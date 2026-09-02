@@ -693,7 +693,7 @@ impl Workspace {
     /// step (typing, an in-note reorder) or a structural op (a block moved
     /// to another day, a timeline retime). Text inputs bind their own undo
     /// in a deeper context and never reach this.
-    fn on_undo(&mut self, _: &EditorUndo, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_undo(&mut self, _: &EditorUndo, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings_view.is_some() {
             return;
         }
@@ -705,7 +705,7 @@ impl Workspace {
             _ => false,
         };
         if structural {
-            self.vault_undo(cx);
+            self.vault_undo(window, cx);
         } else if let Some(editor) = &self.note_editor {
             editor.update(cx, |ed, cx| ed.undo(cx));
         }
@@ -713,7 +713,7 @@ impl Workspace {
 
     /// Redo mirrors undo: steps were undone newest-first across both
     /// histories, so they re-apply oldest-first.
-    fn on_redo(&mut self, _: &EditorRedo, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_redo(&mut self, _: &EditorRedo, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings_view.is_some() {
             return;
         }
@@ -725,7 +725,7 @@ impl Workspace {
             _ => false,
         };
         if structural {
-            self.vault_redo(cx);
+            self.vault_redo(window, cx);
         } else if let Some(editor) = &self.note_editor {
             editor.update(cx, |ed, cx| ed.redo(cx));
         }

@@ -208,6 +208,36 @@ pub fn rename_note(path: &Path, new_stem: &str) -> io::Result<PathBuf> {
     Ok(dest)
 }
 
+/// Move a note or notes-folder into `dest_dir`, keeping its name (the
+/// Notes tree's drag-to-a-folder). A note keeps its filename, so its title
+/// and every wiki link to it stay valid. Refuses to move a folder into
+/// itself or a descendant, refuses to overwrite an existing name, and
+/// treats a move into the item's own folder as a no-op. Returns the new
+/// path.
+pub fn move_note(path: &Path, dest_dir: &Path) -> io::Result<PathBuf> {
+    let Some(file_name) = path.file_name() else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "nothing to move"));
+    };
+    let dest = dest_dir.join(file_name);
+    if dest == path {
+        return Ok(dest);
+    }
+    if path.is_dir() && dest_dir.starts_with(path) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "can't move a folder into itself",
+        ));
+    }
+    if dest.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("\"{}\" already exists here", file_name.to_string_lossy()),
+        ));
+    }
+    fs::rename(path, &dest)?;
+    Ok(dest)
+}
+
 /// Create a note named by the user inside `dir`, seeded with a title
 /// heading. An existing note of that name is left untouched and returned
 /// as-is (same posture as wiki-link creation). Returns the note's path.
@@ -1063,6 +1093,37 @@ mod tests {
         }
         // Renaming to the same name is a quiet no-op.
         assert_eq!(rename_note(&dest, "New").expect("noop"), dest);
+    }
+
+    #[test]
+    fn move_note_relocates_and_guards() {
+        let root = ScratchRoot::new("movenote");
+        let notes_dir = root.0.join("Notes");
+        let note = root.write("Notes/Ideas.md", "# Ideas\n");
+        let sub = root.0.join("Notes/Project");
+        fs::create_dir_all(&sub).expect("mkdir");
+
+        // A plain move keeps the filename (so the title and wiki links hold).
+        let dest = move_note(&note, &sub).expect("move");
+        assert_eq!(dest, sub.join("Ideas.md"));
+        assert!(!note.exists());
+        assert_eq!(fs::read_to_string(&dest).expect("read"), "# Ideas\n");
+
+        // A name already taken at the target is refused; nothing moves.
+        let clash = root.write("Notes/Ideas.md", "# Other\n");
+        assert!(move_note(&clash, &sub).is_err());
+        assert!(clash.exists());
+        assert_eq!(fs::read_to_string(&dest).expect("read"), "# Ideas\n");
+
+        // A folder can't be moved inside itself or a descendant.
+        let parent = root.0.join("Notes/A");
+        let child = root.0.join("Notes/A/B");
+        fs::create_dir_all(&child).expect("mkdir");
+        assert!(move_note(&parent, &child).is_err());
+        assert!(parent.exists());
+
+        // A move into the item's own folder is a quiet no-op.
+        assert_eq!(move_note(&clash, &notes_dir).expect("noop"), clash);
     }
 
     #[test]

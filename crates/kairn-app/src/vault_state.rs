@@ -756,7 +756,7 @@ impl Workspace {
     /// edits verified by content, so a vault that changed underneath (sync,
     /// an agent, the other machine) makes the undo refuse quietly rather
     /// than guess.
-    pub(crate) fn vault_undo(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn vault_undo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use crate::history::VaultOp;
         let Some(op) = self.vault_history.pop_undo() else { return };
         self.flush_note_editor(cx);
@@ -813,13 +813,42 @@ impl Workspace {
                     Err(e) => eprintln!("kairn: undo failed on {}: {e}", path.display()),
                 }
             }
+            VaultOp::PathMove { ms, src, dest, library } => {
+                // Return the item from where it landed to where it started;
+                // both ends verified so an undo after a further move refuses
+                // rather than clobbering. Tree moves finalize their own
+                // tree/view fix-up, not the note-oriented finish below.
+                if dest.exists() && !src.exists() {
+                    match std::fs::rename(&dest, &src) {
+                        Ok(()) => {
+                            self.vault_history.push_undone(VaultOp::PathMove {
+                                ms,
+                                src: src.clone(),
+                                dest: dest.clone(),
+                                library,
+                            });
+                            if library {
+                                self.relocate_library_path(&dest, &src, window, cx);
+                            } else {
+                                self.relocate_note_path(&dest, &src, cx);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("kairn: undo failed moving {}: {e}", dest.display())
+                        }
+                    }
+                } else {
+                    eprintln!("kairn: undo skipped, the moved item changed on disk");
+                }
+                return;
+            }
         }
         self.finish_vault_op(cx);
     }
 
     /// Re-apply the most recently undone vault op, with the same
     /// verification contract as [`Self::vault_undo`].
-    pub(crate) fn vault_redo(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn vault_redo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use crate::history::VaultOp;
         let Some(op) = self.vault_history.pop_redo() else { return };
         self.flush_note_editor(cx);
@@ -873,6 +902,33 @@ impl Workspace {
                     }
                     Err(e) => eprintln!("kairn: redo failed on {}: {e}", path.display()),
                 }
+            }
+            VaultOp::PathMove { ms, src, dest, library } => {
+                // Re-apply the move src -> dest, same verification contract as
+                // the undo above; finalizes its own tree/view fix-up.
+                if src.exists() && !dest.exists() {
+                    match std::fs::rename(&src, &dest) {
+                        Ok(()) => {
+                            self.vault_history.push_redone(VaultOp::PathMove {
+                                ms,
+                                src: src.clone(),
+                                dest: dest.clone(),
+                                library,
+                            });
+                            if library {
+                                self.relocate_library_path(&src, &dest, window, cx);
+                            } else {
+                                self.relocate_note_path(&src, &dest, cx);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("kairn: redo failed moving {}: {e}", src.display())
+                        }
+                    }
+                } else {
+                    eprintln!("kairn: redo skipped, the moved item changed on disk");
+                }
+                return;
             }
         }
         self.finish_vault_op(cx);
@@ -1238,40 +1294,113 @@ impl Workspace {
         self.flush_note_editor(cx);
         self.save_library_text(cx);
         match notes::rename_library_path(path, name) {
-            Ok(new_path) => {
-                let moved: Vec<PathBuf> = self
-                    .library_expanded
-                    .iter()
-                    .filter(|p| p.starts_with(path))
-                    .cloned()
-                    .collect();
-                for old in moved {
-                    self.library_expanded.remove(&old);
-                    if let Ok(rel) = old.strip_prefix(path) {
-                        self.library_expanded.insert(new_path.join(rel));
-                    }
-                }
-                // Dropped, not synced out: its edits are already saved and
-                // its path no longer exists; reopening rebuilds it.
-                if self.library_text.as_ref().is_some_and(|ed| ed.path.starts_with(path)) {
-                    self.library_text = None;
-                }
-                let followed = match &self.view {
-                    PaneView::Library(p) => p.strip_prefix(path).ok().map(|rel| {
-                        if rel.as_os_str().is_empty() {
-                            new_path.clone()
-                        } else {
-                            new_path.join(rel)
-                        }
-                    }),
-                    _ => None,
-                };
-                if let Some(view_path) = followed {
-                    self.open_library_file(view_path, window, cx);
-                    return;
-                }
+            Ok(new_path) => self.relocate_library_path(path, &new_path, window, cx),
+            Err(e) => {
+                window.push_notification(format!("Could not rename: {e}"), cx);
+                self.reload_notes(cx);
+                cx.notify();
             }
-            Err(e) => window.push_notification(format!("Could not rename: {e}"), cx),
+        }
+    }
+
+    /// Whether a tree drag (Notes or Library) may land in `dest_dir`: the
+    /// source must exist, the target must be a real folder, a folder can't
+    /// drop into itself or a descendant, a move into the item's own folder is
+    /// a no-op, and a name already taken at the target is refused. Drives both
+    /// the drop-target highlight (only valid folders light up) and the drop.
+    pub(crate) fn can_move_into(src: &Path, dest_dir: &Path) -> bool {
+        if !src.exists() || !dest_dir.is_dir() {
+            return false;
+        }
+        let Some(name) = src.file_name() else { return false };
+        if src.parent() == Some(dest_dir) {
+            return false;
+        }
+        if src.is_dir() && dest_dir.starts_with(src) {
+            return false;
+        }
+        !dest_dir.join(name).exists()
+    }
+
+    /// Move a library file or folder into `dest_dir` (the sidebar's
+    /// drag-to-a-folder), recording it on the vault history so Cmd/Super+Z
+    /// takes it back. Pending edits flush first so they travel with the file;
+    /// the open document and any expanded folders follow the move.
+    pub fn move_library_path(
+        &mut self,
+        src: PathBuf,
+        dest_dir: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !Self::can_move_into(&src, &dest_dir) {
+            return;
+        }
+        self.flush_note_editor(cx);
+        self.save_library_text(cx);
+        match notes::move_library_path(&src, &dest_dir) {
+            Ok(new_path) => {
+                self.vault_history.push(crate::history::VaultOp::PathMove {
+                    ms: crate::note_editor::now_ms(),
+                    src: src.clone(),
+                    dest: new_path.clone(),
+                    library: true,
+                });
+                self.relocate_library_path(&src, &new_path, window, cx);
+            }
+            Err(e) => {
+                window.push_notification(format!("Could not move: {e}"), cx);
+                self.reload_notes(cx);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Shared fix-up after a library file or folder changed path (rename,
+    /// move, or an undo/redo of either): carry expanded folders and the open
+    /// document over to the new path, reveal the destination folder, then
+    /// reload the trees.
+    fn relocate_library_path(
+        &mut self,
+        old: &Path,
+        new_path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let moved: Vec<PathBuf> = self
+            .library_expanded
+            .iter()
+            .filter(|p| p.starts_with(old))
+            .cloned()
+            .collect();
+        for prev in moved {
+            self.library_expanded.remove(&prev);
+            if let Ok(rel) = prev.strip_prefix(old) {
+                self.library_expanded.insert(new_path.join(rel));
+            }
+        }
+        // Reveal where it landed so the move is visibly confirmed.
+        if let Some(parent) = new_path.parent() {
+            self.library_expanded.insert(parent.to_path_buf());
+        }
+        // Dropped, not synced out: its edits are already saved and its old
+        // path no longer exists; reopening rebuilds it.
+        if self.library_text.as_ref().is_some_and(|ed| ed.path.starts_with(old)) {
+            self.library_text = None;
+        }
+        let followed = match &self.view {
+            PaneView::Library(p) => p.strip_prefix(old).ok().map(|rel| {
+                if rel.as_os_str().is_empty() {
+                    new_path.to_path_buf()
+                } else {
+                    new_path.join(rel)
+                }
+            }),
+            _ => None,
+        };
+        if let Some(view_path) = followed {
+            self.open_library_file(view_path, window, cx);
+            return;
         }
         self.reload_notes(cx);
         cx.notify();
@@ -1556,6 +1685,77 @@ impl Workspace {
                 }
             }
             Err(e) => window.push_notification(format!("Could not rename note: {e}"), cx),
+        }
+        self.reload_notes(cx);
+        cx.notify();
+    }
+
+    /// Move a note or notes-folder into `dest_dir` (the Notes tree's
+    /// drag-to-a-folder), recorded on the vault history for Cmd/Super+Z. A
+    /// note keeps its filename, so its title and every wiki link to it stay
+    /// valid; only its folder changes. The open note follows the move.
+    pub fn move_note_to(
+        &mut self,
+        src: PathBuf,
+        dest_dir: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !Self::can_move_into(&src, &dest_dir) {
+            return;
+        }
+        // Save without the title rename: `src` must still name the file.
+        self.save_note_editor(cx);
+        match notes::move_note(&src, &dest_dir) {
+            Ok(new_path) => {
+                self.vault_history.push(crate::history::VaultOp::PathMove {
+                    ms: crate::note_editor::now_ms(),
+                    src: src.clone(),
+                    dest: new_path.clone(),
+                    library: false,
+                });
+                self.relocate_note_path(&src, &new_path, cx);
+            }
+            Err(e) => {
+                window.push_notification(format!("Could not move note: {e}"), cx);
+                self.reload_notes(cx);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Shared fix-up after a note or notes-folder changed path (a move, or an
+    /// undo/redo of one): carry expanded folders and the open note over to
+    /// the new path, reveal the destination folder, then reload the tree.
+    fn relocate_note_path(&mut self, old: &Path, new_path: &Path, cx: &mut Context<Self>) {
+        let moved: Vec<PathBuf> = self
+            .notes_expanded
+            .iter()
+            .filter(|p| p.starts_with(old))
+            .cloned()
+            .collect();
+        for prev in moved {
+            self.notes_expanded.remove(&prev);
+            if let Ok(rel) = prev.strip_prefix(old) {
+                self.notes_expanded.insert(new_path.join(rel));
+            }
+        }
+        // Reveal where it landed (the Notes root is never in the expanded set).
+        if let Some(parent) = new_path.parent()
+            && parent != self.notes_root.join("Notes")
+        {
+            self.notes_expanded.insert(parent.to_path_buf());
+        }
+        // Follow the open note (or a note under a moved folder) to its new path.
+        if let PaneView::Note(p) = &self.view
+            && let Ok(rel) = p.strip_prefix(old)
+        {
+            let np = if rel.as_os_str().is_empty() {
+                new_path.to_path_buf()
+            } else {
+                new_path.join(rel)
+            };
+            self.view = PaneView::Note(np);
         }
         self.reload_notes(cx);
         cx.notify();

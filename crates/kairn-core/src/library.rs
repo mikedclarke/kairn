@@ -316,6 +316,43 @@ pub fn rename_library_path(path: &Path, name: &str) -> io::Result<PathBuf> {
     Ok(dest)
 }
 
+/// Move a library file or folder into `dest_dir`, keeping its name. Used by
+/// the sidebar's drag-to-a-folder. Refuses to move a folder into itself or
+/// one of its own descendants, refuses to overwrite an existing name, and
+/// treats a move into the file's own current folder as a no-op. Returns the
+/// new path.
+pub fn move_library_path(path: &Path, dest_dir: &Path) -> io::Result<PathBuf> {
+    let Some(file_name) = path.file_name() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "nothing to move",
+        ));
+    };
+    let dest = dest_dir.join(file_name);
+    if dest == path {
+        return Ok(dest);
+    }
+    // A directory can't be dropped into itself or anywhere beneath it: the
+    // rename would either fail or orphan the subtree.
+    if path.is_dir() && dest_dir.starts_with(path) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "can't move a folder into itself",
+        ));
+    }
+    if dest.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "\"{}\" already exists here",
+                file_name.to_string_lossy()
+            ),
+        ));
+    }
+    fs::rename(path, &dest)?;
+    Ok(dest)
+}
+
 /// Files larger than this never get a body scan: a library can hold logs
 /// and data dumps that would drown the search in reads.
 const BODY_SEARCH_CAP: u64 = 1_000_000;
@@ -543,6 +580,36 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         let same = rename_library_path(&retyped, "final.txt").expect("no-op");
         assert_eq!(same, retyped);
+    }
+
+    #[test]
+    fn move_library_path_relocates_and_guards() {
+        let root = ScratchRoot::new("librarymove");
+        let file = root.write("report.md", "# Report\n");
+        let sub = root.0.join("archive");
+        fs::create_dir_all(&sub).expect("mkdir");
+
+        // A move keeps the name and carries the contents.
+        let dest = move_library_path(&file, &sub).expect("move");
+        assert_eq!(dest, sub.join("report.md"));
+        assert!(!file.exists());
+        assert_eq!(fs::read_to_string(&dest).expect("read"), "# Report\n");
+
+        // A name already at the target is refused; nothing moves.
+        let clash = root.write("report.md", "# Other\n");
+        let err = move_library_path(&clash, &sub).expect_err("collision");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(clash.exists());
+
+        // A folder can't be dropped into itself or a descendant.
+        let outer = root.0.join("outer");
+        let inner = root.0.join("outer/inner");
+        fs::create_dir_all(&inner).expect("mkdir");
+        assert!(move_library_path(&outer, &inner).is_err());
+        assert!(outer.exists());
+
+        // A move into the item's own folder is a quiet no-op.
+        assert_eq!(move_library_path(&clash, &root.0).expect("noop"), clash);
     }
 
     #[test]
