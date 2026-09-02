@@ -19,3 +19,5 @@ restating the same fact twice; no em dashes. Rewrite to this standard before rel
 ## Fixed
 
 <!-- Bugs that no longer happen. -->
+
+- `kairn carry` now moves italic task-group headers (`*Group*`, `_Group_`) with their tasks, not only `**bold**` ones, and removes them from the old day when emptied.
