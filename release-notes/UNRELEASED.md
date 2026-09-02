@@ -20,3 +20,5 @@ restating the same fact twice; no em dashes. Rewrite to this standard before rel
 
 <!-- Bugs that no longer happen. -->
 
+- Ticking a task's checkbox no longer scrolls the note to the cursor's position when the cursor is off screen.
+
