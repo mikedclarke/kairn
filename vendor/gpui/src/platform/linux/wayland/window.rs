@@ -82,6 +82,15 @@ struct InProgressConfigure {
     tiling: Tiling,
 }
 
+/// Whether a tick of the frame loop is on its way. `Parked` means nothing is scheduled and
+/// nothing will happen until something calls `request_redraw`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameLoop {
+    Parked,
+    Scheduled,
+    Ticking,
+}
+
 pub struct WaylandWindowState {
     xdg_surface: xdg_surface::XdgSurface,
     acknowledged_first_configure: bool,
@@ -111,6 +120,10 @@ pub struct WaylandWindowState {
     hovered: bool,
     in_progress_configure: Option<InProgressConfigure>,
     resize_throttle: bool,
+    frame_loop: FrameLoop,
+    redraw_requested: bool,
+    drew: bool,
+    pending_frame_callback: bool,
     in_progress_window_controls: Option<WindowControls>,
     window_controls: WindowControls,
     client_inset: Option<Pixels>,
@@ -181,6 +194,10 @@ impl WaylandWindowState {
             window_bounds: options.bounds,
             in_progress_configure: None,
             resize_throttle: false,
+            frame_loop: FrameLoop::Parked,
+            redraw_requested: false,
+            drew: false,
+            pending_frame_callback: false,
             client,
             appearance,
             handle,
@@ -354,15 +371,51 @@ impl WaylandWindowStatePtr {
     }
 
     pub fn frame(&self) {
-        let mut state = self.state.borrow_mut();
-        state.surface.frame(&state.globals.qh, state.surface.id());
-        state.resize_throttle = false;
-        drop(state);
-
-        let mut cb = self.callbacks.borrow_mut();
-        if let Some(fun) = cb.request_frame.as_mut() {
-            fun(Default::default());
+        {
+            let mut state = self.state.borrow_mut();
+            state.pending_frame_callback = false;
+            state.redraw_requested = false;
+            state.frame_loop = FrameLoop::Ticking;
+            state.resize_throttle = false;
         }
+
+        {
+            let mut cb = self.callbacks.borrow_mut();
+            if let Some(fun) = cb.request_frame.as_mut() {
+                fun(Default::default());
+            }
+        }
+
+        let redraw_requested = {
+            let mut state = self.state.borrow_mut();
+            // A frame callback requested by `completed_frame` is the compositor's promise of the
+            // next tick, so the loop keeps ticking and nothing else has to be scheduled.
+            if state.pending_frame_callback {
+                return;
+            }
+            state.frame_loop = FrameLoop::Parked;
+            state.redraw_requested
+        };
+        if redraw_requested {
+            self.schedule_frame();
+        }
+    }
+
+    /// Runs one more tick from the main thread. The tick goes through the foreground executor
+    /// rather than straight onto the event loop's idle queue, because an idle inserted while the
+    /// loop is already running its idles would not be picked up until the next wake-up.
+    fn schedule_frame(&self) {
+        let executor = {
+            let mut state = self.state.borrow_mut();
+            if state.frame_loop != FrameLoop::Parked {
+                return;
+            }
+            state.frame_loop = FrameLoop::Scheduled;
+            state.globals.executor.clone()
+        };
+
+        let this = self.clone();
+        executor.spawn(async move { this.frame() }).detach();
     }
 
     pub fn handle_xdg_surface_event(&self, event: xdg_surface::Event) {
@@ -1020,11 +1073,28 @@ impl PlatformWindow for WaylandWindow {
     fn draw(&self, scene: &Scene) {
         let mut state = self.borrow_mut();
         state.renderer.draw(scene);
+        state.drew = true;
     }
 
     fn completed_frame(&self) {
-        let state = self.borrow();
+        let mut state = self.borrow_mut();
+        // Committing is only worth a compositor round trip when a buffer was attached, and
+        // `draw` is the only thing that attaches one.
+        if !state.drew {
+            return;
+        }
+        state.drew = false;
+        if !state.pending_frame_callback {
+            state.surface.frame(&state.globals.qh, state.surface.id());
+            state.pending_frame_callback = true;
+        }
         state.surface.commit();
+        state.frame_loop = FrameLoop::Ticking;
+    }
+
+    fn request_redraw(&self) {
+        self.borrow_mut().redraw_requested = true;
+        self.0.schedule_frame();
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

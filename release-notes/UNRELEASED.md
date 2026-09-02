@@ -16,6 +16,11 @@ restating the same fact twice; no em dashes. Rewrite to this standard before rel
 
 <!-- Refinements to existing workflows, reliability, performance, or UX. -->
 
+- On Linux, an idle window no longer wakes the app and the compositor 60 times a second, cutting idle CPU, GPU, and battery use.
+- An unchanged note is no longer re-parsed and re-shaped on every redraw.
+- The caret stops blinking after ten seconds without input and while the window is in the background.
+- Terminal output repaints at most 30 times a second, and 10 times a second in a pane that is not focused.
+
 ## Fixed
 
 <!-- Bugs that no longer happen. -->
