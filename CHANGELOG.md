@@ -5,6 +5,19 @@ in [release-notes/UNRELEASED.md](release-notes/UNRELEASED.md) as they are built 
 here when a version ships. The release process is described in
 [docs/RELEASING.md](docs/RELEASING.md).
 
+## 0.3.6 (2026-09-02)
+
+### Improved
+
+- On Linux, an idle window no longer wakes the app and the compositor 60 times a second, cutting idle CPU, GPU, and battery use.
+- An unchanged note is no longer re-parsed and re-shaped on every redraw.
+- The caret stops blinking after ten seconds without input and while the window is in the background.
+- Terminal output repaints at most 30 times a second, and 10 times a second in a pane that is not focused.
+
+### Fixed
+
+- `kairn carry` now moves italic task-group headers (`*Group*`, `_Group_`) with their tasks, not only `**bold**` ones, and removes them from the old day when emptied.
+
 ## 0.3.5 (2026-08-26)
 
 ### Improved
