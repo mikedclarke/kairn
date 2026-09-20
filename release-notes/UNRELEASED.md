@@ -13,6 +13,7 @@ restating the same fact twice; no em dashes. Rewrite to this standard before rel
 <!-- New user-visible capabilities. -->
 
 - Drag a note or library file onto another folder in the sidebar to move it, with the destination highlighted while you hover and the move covered by undo.
+- Turn sessions off in Settings for a notes-only Kairn, with no terminal pane, split, or session controls.
 
 ## Improved
 
