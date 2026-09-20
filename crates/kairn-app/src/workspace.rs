@@ -423,6 +423,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.settings.sessions_enabled {
+            return;
+        }
         let id = self.next_session_id;
         self.next_session_id += 1;
         let weak = cx.weak_entity();
@@ -438,7 +441,7 @@ impl Workspace {
     }
 
     pub fn activate_session(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if idx >= self.sessions.len() {
+        if !self.settings.sessions_enabled || idx >= self.sessions.len() {
             return;
         }
         self.active_session = idx;
@@ -494,6 +497,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.settings.sessions_enabled {
+            return;
+        }
         self.layout = if self.layout == LayoutMode::TerminalFull {
             LayoutMode::Split
         } else {
@@ -504,8 +510,16 @@ impl Workspace {
     }
 
     fn on_toggle_writing(&mut self, _: &ToggleWriting, _: &mut Window, cx: &mut Context<Self>) {
-        self.layout = if self.layout == LayoutMode::Writing {
+        // Writing toggles back to the normal working layout, which is
+        // full-width notes when sessions are off (there is no split to
+        // return to) and the split otherwise.
+        let base = if self.settings.sessions_enabled {
             LayoutMode::Split
+        } else {
+            LayoutMode::NotesFull
+        };
+        self.layout = if self.layout == LayoutMode::Writing {
+            base
         } else {
             LayoutMode::Writing
         };
@@ -516,6 +530,10 @@ impl Workspace {
     /// TerminalFull hand focus to the terminal; NotesFull leaves it with the
     /// note editor. Also the escape from Writing back into a normal layout.
     pub(crate) fn set_layout(&mut self, mode: LayoutMode, window: &mut Window, cx: &mut Context<Self>) {
+        // Notes-only has no terminal layouts to switch to.
+        if !self.settings.sessions_enabled && mode.shows_terminal() {
+            return;
+        }
         if self.layout == mode {
             return;
         }
@@ -588,6 +606,24 @@ impl Workspace {
             return;
         }
         self.settings.show_tasks = on;
+        if let Err(e) = self.settings.save() {
+            eprintln!("kairn: failed to save settings: {e}");
+        }
+        cx.notify();
+    }
+
+    /// Turn terminal sessions on or off. Off makes the app notes-only: the
+    /// layout drops to full-width notes if a terminal layout was showing, and
+    /// the session UI and shortcuts stop responding. Live sessions keep their
+    /// processes so they return unchanged when sessions are turned back on.
+    pub fn set_sessions_enabled(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.settings.sessions_enabled == on {
+            return;
+        }
+        self.settings.sessions_enabled = on;
+        if !on && self.layout.shows_terminal() {
+            self.layout = LayoutMode::NotesFull;
+        }
         if let Err(e) = self.settings.save() {
             eprintln!("kairn: failed to save settings: {e}");
         }
@@ -680,6 +716,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.settings.sessions_enabled {
+            return;
+        }
         self.spawn_session(SessionKind::Local, window, cx);
     }
 

@@ -658,8 +658,9 @@ impl Workspace {
         // Agents: recent CLI writes from the vault's activity log, quiet
         // read-only rows. The empty state stays honest when there are none.
         // The whole section can be turned off in Settings (working fully
-        // remote leaves it permanently empty).
-        if self.settings.show_agents {
+        // remote leaves it permanently empty). It also hides with sessions
+        // off, since notes-only has no local agent terminals to report.
+        if self.settings.show_agents && self.settings.sessions_enabled {
             let collapsed = self.section_collapsed("Agents");
             side = side.child(
                 sechead(t, "sec-agents", "Agents", None, collapsed).on_click(cx.listener(

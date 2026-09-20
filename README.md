@@ -8,6 +8,8 @@ Your notes and terminals in one calm, native window.
 
 Kairn is a notes and tasks app with real terminal sessions. Plan the day, run the work, and capture what you learned without switching apps.
 
+Prefer just the notes? Turn sessions off in Settings and Kairn becomes a focused, open-source notes and tasks app: a NotePlan-style daily planner on plain markdown.
+
 All plain markdown files on disk. Built in Rust on [GPUI](https://www.gpui.rs). One codebase for
 macOS and Linux. Not Electron.
 
@@ -56,6 +58,7 @@ No cloud, no accounts, no database. Just a folder of markdown.
 - Real PTY terminals beside your notes: resizable split, full-screen toggle, multiple sessions with live busy indicators, saved SSH hosts
 - Full-fidelity emulation on the alacritty engine: true colour, scrollback, application cursor mode, OSC 52 clipboard, bracketed paste, SGR mouse reporting (click, drag, and all three buttons, so TUI apps are fully clickable), focus reporting
 - Per-theme terminal palettes and font, live font-size zoom
+- Optional: turn sessions off in Settings for a notes-only Kairn, with no terminal pane, split or terminal layouts, and no session controls; your notes are untouched and turning it back on restores everything
 
 ![The terminal at full width running the kairn CLI, with the notes sidebar alongside](docs/terminal.png)
 

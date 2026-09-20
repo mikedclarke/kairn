@@ -830,7 +830,7 @@ impl Workspace {
                 .filter(|(_, s)| notes::fuzzy_score(&query, &s.label()).is_some())
                 .map(|(i, _)| i)
                 .collect();
-            if !session_hits.is_empty() {
+            if self.settings.sessions_enabled && !session_hits.is_empty() {
                 card = card.child(switcher_section(t, "Sessions"));
                 for i in session_hits {
                     let session = &self.sessions[i];
@@ -947,40 +947,42 @@ impl Workspace {
             return Some(switcher_backdrop(self, t, cx).child(card));
         }
 
-        card = card.child(switcher_section(t, "Sessions"));
+        if self.settings.sessions_enabled {
+            card = card.child(switcher_section(t, "Sessions"));
 
-        for (i, session) in self.sessions.iter().enumerate() {
-            let busy = session.busy;
-            let meta = match &session.kind {
-                SessionKind::Local | SessionKind::App { host: None, .. } => {
-                    if busy {
-                        "local · running"
-                    } else {
-                        "local · idle"
+            for (i, session) in self.sessions.iter().enumerate() {
+                let busy = session.busy;
+                let meta = match &session.kind {
+                    SessionKind::Local | SessionKind::App { host: None, .. } => {
+                        if busy {
+                            "local · running"
+                        } else {
+                            "local · idle"
+                        }
                     }
-                }
-                SessionKind::Ssh(_) | SessionKind::App { host: Some(_), .. } => "SSH · connected",
-            };
-            card = card.child(
-                switcher_item(t, ("switcher-session", i), cx)
-                    .child(
-                        div()
-                            .w(px(7.))
-                            .h(px(7.))
-                            .rounded_full()
-                            .when_else(
-                                busy,
-                                |d| d.bg(t.accent),
-                                |d| d.border_1().border_color(t.faint),
-                            ),
-                    )
-                    .child(div().flex_1().child(session.label()))
-                    .child(div().text_size(px(11.)).text_color(t.faint).child(meta))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.activate_session(i, window, cx);
-                        this.close_overlays(window, cx);
-                    })),
-            );
+                    SessionKind::Ssh(_) | SessionKind::App { host: Some(_), .. } => "SSH · connected",
+                };
+                card = card.child(
+                    switcher_item(t, ("switcher-session", i), cx)
+                        .child(
+                            div()
+                                .w(px(7.))
+                                .h(px(7.))
+                                .rounded_full()
+                                .when_else(
+                                    busy,
+                                    |d| d.bg(t.accent),
+                                    |d| d.border_1().border_color(t.faint),
+                                ),
+                        )
+                        .child(div().flex_1().child(session.label()))
+                        .child(div().text_size(px(11.)).text_color(t.faint).child(meta))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.activate_session(i, window, cx);
+                            this.close_overlays(window, cx);
+                        })),
+                );
+            }
         }
 
         let today_day = today.date_naive();

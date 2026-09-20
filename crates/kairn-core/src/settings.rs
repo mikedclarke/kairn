@@ -89,6 +89,12 @@ pub struct Settings {
     /// Whether the sidebar shows the Tasks section; hidden by default.
     #[serde(default)]
     pub show_tasks: bool,
+    /// Whether terminal sessions are available. When off, the app is
+    /// notes-only: the terminal pane, the split and terminal-full layouts,
+    /// the titlebar sessions control, and the session shortcuts all go away,
+    /// leaving the full-width notes and Writing layouts. On by default.
+    #[serde(default = "default_true")]
+    pub sessions_enabled: bool,
     /// Direction of the retired three-day sidebar list. Kept so settings
     /// files that carry it still load; nothing reads it.
     #[serde(default = "default_true")]
@@ -161,6 +167,7 @@ impl Default for Settings {
             show_agents: false,
             show_daily: true,
             show_tasks: false,
+            sessions_enabled: true,
             daily_forward: true,
             sidebar_collapsed: Vec::new(),
             week_strip: default_week_strip(),

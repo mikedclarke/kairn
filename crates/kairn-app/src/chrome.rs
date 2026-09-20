@@ -19,6 +19,7 @@ const CAPSULE_H: f32 = 28.;
 impl Workspace {
     pub(crate) fn render_titlebar(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {
         let hover_bg = t.hover;
+        let sessions_on = self.settings.sessions_enabled;
         let sidebar_btn = div()
             .id("sidebar-btn")
             .flex()
@@ -57,7 +58,11 @@ impl Workspace {
             .on_click(cx.listener(|this, _, window, cx| {
                 this.on_toggle_switcher(&ToggleSwitcher, window, cx);
             }))
-            .child("Search notes, days, sessions");
+            .child(if sessions_on {
+                "Search notes, days, sessions"
+            } else {
+                "Search notes and days"
+            });
 
         let capsule = h_flex()
             .h(px(CAPSULE_H))
@@ -76,8 +81,12 @@ impl Workspace {
                     .px(px(3.))
                     .child(self.layout_mode_button(t, "mode-writing", LayoutMode::Writing, cx))
                     .child(self.layout_mode_button(t, "mode-notes", LayoutMode::NotesFull, cx))
-                    .child(self.layout_mode_button(t, "mode-split", LayoutMode::Split, cx))
-                    .child(self.layout_mode_button(t, "mode-term", LayoutMode::TerminalFull, cx)),
+                    // The split and terminal layouts only make sense with
+                    // sessions on; notes-only keeps just the two note layouts.
+                    .when(sessions_on, |c| {
+                        c.child(self.layout_mode_button(t, "mode-split", LayoutMode::Split, cx))
+                            .child(self.layout_mode_button(t, "mode-term", LayoutMode::TerminalFull, cx))
+                    }),
             );
 
         // The sessions indicator: how many are open, lit while any is busy.
@@ -126,7 +135,13 @@ impl Workspace {
 
         TitleBar::new()
             .child(h_flex().h_full().items_center().child(sidebar_btn))
-            .child(h_flex().pr(px(8.)).gap(px(8.)).child(capsule).child(sessions_btn))
+            .child(
+                h_flex()
+                    .pr(px(8.))
+                    .gap(px(8.))
+                    .child(capsule)
+                    .when(sessions_on, move |c| c.child(sessions_btn)),
+            )
     }
 
     /// One cell of the layout switcher: its glyph (drawn, so every cell keeps
