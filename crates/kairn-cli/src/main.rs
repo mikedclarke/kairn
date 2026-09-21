@@ -61,6 +61,8 @@ Examples:
   kairn append today \"decided: ship it\" --section Log
   kairn edit today --find \"email sam\" --append \"(done by phone)\"
   kairn edit 2026-08-07 --find \"old reminder\" --delete
+  kairn section today \"### Status\" --replace - --create < status.md
+                                       keep one block of a note up to date
   kairn carry --dry-run                what would move into today
   kairn recent --days 2                notes touched since yesterday"
 )]
@@ -224,6 +226,49 @@ command fails so it can be rerun.")]
         delete: bool,
     },
 
+    /// Replace, create, or delete one heading's block in a note
+    #[command(long_about = "\
+Rewrite one section of a note as a unit: the heading line through the
+line before the next heading of the same or higher level (or the end of
+the note). Made for a block that a script or agent keeps up to date, such
+as a status block in a daily note, without touching anything around it.
+
+HEADING is matched like --section elsewhere: `#` marks, `==` highlights,
+and case are ignored, so \"seat\" finds `### ==Seat==`. The change is one of:
+
+  --replace TEXT   the body under the heading becomes TEXT (`-` reads it
+                   from stdin); the heading line stays as written in the
+                   note. Nothing is written when the body is already TEXT,
+                   so a caller can run this as often as it likes.
+  --delete         the heading and its body are removed.
+
+With --create, a missing heading is added: HEADING verbatim when it brings
+its own `#` marks, as a `## ` heading otherwise, placed --before or --after
+a named heading, else at the end of the note. Exit 3 when the heading is
+missing without --create, or when the --before/--after heading is missing.
+Blank lines and rules after the block belong to the boundary and are kept.")]
+    Section {
+        /// Note title, ISO date, period, or today/tomorrow/yesterday
+        note: String,
+        /// The heading whose block to change (e.g. \"### Seat\")
+        heading: String,
+        /// The new body, or - to read it from stdin
+        #[arg(long, value_name = "TEXT", conflicts_with = "delete", allow_hyphen_values = true)]
+        replace: Option<String>,
+        /// Add the section when the heading is missing
+        #[arg(long, action = ArgAction::SetTrue, conflicts_with = "delete")]
+        create: bool,
+        /// With --create: put the new section above this heading
+        #[arg(long, value_name = "HEADING", requires = "create", conflicts_with = "after")]
+        before: Option<String>,
+        /// With --create: put the new section after this heading's block
+        #[arg(long, value_name = "HEADING", requires = "create")]
+        after: Option<String>,
+        /// Remove the heading and its body
+        #[arg(long, action = ArgAction::SetTrue)]
+        delete: bool,
+    },
+
     /// Move overdue tasks from past days into today
     #[command(long_about = "\
 Move every overdue open task off past daily notes and into one day
@@ -374,6 +419,23 @@ fn run(cli: Cli) -> Result<(), Failure> {
                     .hint("one of --replace TEXT, --append TEXT, or --delete"));
             };
             cmd_edit(&root, &note, &find, op, &actor, cli.json)
+        }
+        Command::Section { note, heading, replace, create, before, after, delete } => {
+            let edit = if delete {
+                write::SectionEdit::Delete
+            } else if let Some(body) = replace {
+                let body = if body == "-" { read_stdin()? } else { body };
+                let place = match (before, after) {
+                    (Some(h), _) => Some(write::SectionPlace::Before(h)),
+                    (_, Some(h)) => Some(write::SectionPlace::After(h)),
+                    _ => create.then_some(write::SectionPlace::End),
+                };
+                write::SectionEdit::Replace { body, create: place }
+            } else {
+                return Err(Failure::new(2, "say what to change")
+                    .hint("one of --replace TEXT (or --replace - for stdin), or --delete"));
+            };
+            cmd_section(&root, &note, &heading, &edit, &actor, cli.json)
         }
         Command::Carry { to, from, section, dry_run } => {
             let dest = parse_when(&to)?;
@@ -773,6 +835,102 @@ fn cmd_edit(
         match &after {
             Some(new_line) => println!("edited: {new_line}"),
             None => println!("deleted: {line}"),
+        }
+    }
+    Ok(())
+}
+
+fn read_stdin() -> Result<String, Failure> {
+    use std::io::Read as _;
+    let mut body = String::new();
+    std::io::stdin()
+        .read_to_string(&mut body)
+        .map_err(|e| Failure::new(EXIT_FAILED, format!("could not read stdin: {e}")))?;
+    Ok(body)
+}
+
+fn cmd_section(
+    root: &Path,
+    note: &str,
+    heading: &str,
+    edit: &write::SectionEdit,
+    actor: &str,
+    json: bool,
+) -> Result<(), Failure> {
+    if heading.trim().trim_start_matches('#').trim().is_empty() {
+        return Err(Failure::new(2, "give the heading whose block to change"));
+    }
+    let creating = matches!(edit, write::SectionEdit::Replace { create: Some(_), .. });
+    let path = match resolve_target(root, note)? {
+        Target::Day(date) if creating => {
+            let rule = Settings::load().daily_template_rule;
+            write::ensure_day_note(root, date, &rule).map_err(|e| {
+                Failure::new(EXIT_FAILED, format!("could not write the daily note: {e}"))
+            })?
+        }
+        Target::Day(date) => existing_daily(root, date)?,
+        Target::Note(path) => path,
+    };
+    let outcome = write::edit_section_on_disk(&path, heading, edit).map_err(|e| {
+        Failure::new(EXIT_FAILED, format!("could not update {}: {e}", path.display()))
+    })?;
+    let change = match outcome {
+        Ok(change) => change,
+        Err(write::SectionMiss::Heading) => {
+            let failure = Failure::new(
+                EXIT_NOT_FOUND,
+                format!("no heading matches {heading:?} in {}", rel(root, &path)),
+            );
+            return Err(match edit {
+                write::SectionEdit::Delete => failure,
+                _ => failure.hint("add --create to add the section"),
+            });
+        }
+        Err(write::SectionMiss::Anchor(anchor)) => {
+            return Err(Failure::new(
+                EXIT_NOT_FOUND,
+                format!("no heading matches {anchor:?} in {} to place the section by", rel(root, &path)),
+            )
+            .hint("drop --before/--after to add it at the end"));
+        }
+    };
+    use write::SectionAction;
+    let (action, changed) = match change.action {
+        SectionAction::Unchanged => ("unchanged", false),
+        SectionAction::Replaced => ("replaced", true),
+        SectionAction::Created => ("created", true),
+        SectionAction::Deleted => ("deleted", true),
+    };
+    let block_lines = change.text[change.start..change.end].trim_matches(['\n', '\r']).lines().count();
+    if changed {
+        let detail = match change.action {
+            SectionAction::Deleted => format!("{action} {}", change.heading),
+            _ => format!("{action} {} ({block_lines} lines)", change.heading),
+        };
+        log_write(root, actor, "section", &path, &detail);
+    }
+    if json {
+        let body = json!({
+            "file": rel(root, &path),
+            "heading": change.heading,
+            "action": action,
+            "changed": changed,
+            "line": change.line + 1,
+            "lines": block_lines,
+            "start": change.start,
+            "end": change.end,
+        });
+        println!("{body}");
+    } else {
+        match change.action {
+            SectionAction::Unchanged => println!("unchanged: {} in {}", change.heading, rel(root, &path)),
+            SectionAction::Deleted => println!("deleted: {} from {}", change.heading, rel(root, &path)),
+            _ => println!(
+                "{action}: {} in {} (line {}, {block_lines} lines)",
+                change.heading,
+                rel(root, &path),
+                change.line + 1
+            ),
         }
     }
     Ok(())
@@ -1192,6 +1350,113 @@ mod tests {
         // Trailing whitespace is content (markdown hard breaks): the suffix
         // lands before it.
         assert_eq!(append_suffix("* call Sam  ", "→ GDL-42"), "* call Sam → GDL-42  ");
+    }
+
+    /// A throwaway notes folder with the Kairn layout, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!("kairn-cli-test-{tag}-{nanos}"));
+            vault::ensure_layout(&root);
+            Self(root)
+        }
+
+        fn write(&self, rel: &str, content: &str) -> PathBuf {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, content).expect("write");
+            path
+        }
+
+        fn read(&self, rel: &str) -> String {
+            std::fs::read_to_string(self.0.join(rel)).expect("read")
+        }
+
+        fn activity(&self) -> Vec<ActivityEntry> {
+            kairn_core::recent_activity(&self.0, 20)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn replace(body: &str, create: Option<write::SectionPlace>) -> write::SectionEdit {
+        write::SectionEdit::Replace { body: body.to_string(), create }
+    }
+
+    #[test]
+    fn section_replaces_creates_and_deletes_one_block() {
+        let root = Scratch::new("section");
+        root.write("Notes/Status.md", "# Status\n\n### Tasks\n* one\n\n### Local Agent\n- theirs\n");
+        // Missing without --create: exit 3, nothing written, nothing logged.
+        let err = cmd_section(&root.0, "Status", "### Seat", &replace("- a", None), "seat", false)
+            .expect_err("missing heading");
+        assert_eq!(err.code, EXIT_NOT_FOUND);
+        assert!(root.activity().is_empty());
+        // --create --before places it above the anchor.
+        let before = Some(write::SectionPlace::Before("local agent".into()));
+        cmd_section(&root.0, "Status", "### Seat", &replace("- a\n- b\n", before.clone()), "seat", true)
+            .expect("created");
+        assert_eq!(
+            root.read("Notes/Status.md"),
+            "# Status\n\n### Tasks\n* one\n\n### Seat\n- a\n- b\n\n### Local Agent\n- theirs\n"
+        );
+        let log = root.activity();
+        assert_eq!(log.len(), 1);
+        assert_eq!((log[0].actor.as_str(), log[0].action.as_str()), ("seat", "section"));
+        assert_eq!(log[0].detail, "created ### Seat (3 lines)");
+        // The same body again is a no-op: no write, no log entry.
+        cmd_section(&root.0, "Status", "seat", &replace("- a\n- b", before.clone()), "seat", true)
+            .expect("unchanged");
+        assert_eq!(root.activity().len(), 1);
+        // A new body replaces only the block; the heading line and the gap stay.
+        cmd_section(&root.0, "Status", "Seat", &replace("- c", None), "seat", false).expect("replaced");
+        assert_eq!(
+            root.read("Notes/Status.md"),
+            "# Status\n\n### Tasks\n* one\n\n### Seat\n- c\n\n### Local Agent\n- theirs\n"
+        );
+        assert_eq!(root.activity()[0].detail, "replaced ### Seat (2 lines)");
+        // A missing anchor is exit 3 too.
+        let err = cmd_section(
+            &root.0,
+            "Status",
+            "### Other",
+            &replace("x", Some(write::SectionPlace::Before("Nope".into()))),
+            "seat",
+            false,
+        )
+        .expect_err("missing anchor");
+        assert_eq!(err.code, EXIT_NOT_FOUND);
+        // --delete takes the heading, its body, and its trailing gap.
+        cmd_section(&root.0, "Status", "seat", &write::SectionEdit::Delete, "seat", false).expect("deleted");
+        assert_eq!(root.read("Notes/Status.md"), "# Status\n\n### Tasks\n* one\n\n### Local Agent\n- theirs\n");
+        assert_eq!(root.activity()[0].detail, "deleted ### Seat");
+        let err = cmd_section(&root.0, "Status", "seat", &write::SectionEdit::Delete, "seat", false)
+            .expect_err("already gone");
+        assert_eq!(err.code, EXIT_NOT_FOUND);
+        // An unknown note is exit 3 as everywhere else.
+        let err = cmd_section(&root.0, "Nope", "seat", &replace("x", None), "seat", false).expect_err("no note");
+        assert_eq!(err.code, EXIT_NOT_FOUND);
+    }
+
+    #[test]
+    fn section_on_a_day_creates_the_note_only_with_create() {
+        let root = Scratch::new("section-day");
+        let err = cmd_section(&root.0, "2026-09-21", "### Seat", &replace("- a", None), "seat", false)
+            .expect_err("no note yet");
+        assert_eq!(err.code, EXIT_NOT_FOUND);
+        assert!(!root.0.join("Calendar/20260921.md").exists());
+        cmd_section(&root.0, "2026-09-21", "### Seat", &replace("- a", Some(write::SectionPlace::End)), "seat", false)
+            .expect("created");
+        assert_eq!(root.read("Calendar/20260921.md"), "### Seat\n- a\n");
     }
 
     #[test]

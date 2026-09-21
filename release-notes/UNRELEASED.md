@@ -12,6 +12,8 @@ restating the same fact twice; no em dashes. Rewrite to this standard before rel
 
 <!-- New user-visible capabilities. -->
 
+- `kairn section` replaces, creates, or deletes one heading's block in a note as a unit, writing nothing when the block is already up to date, so scripts and agents can keep a status block current and logged in the activity sidebar.
+
 ## Improved
 
 <!-- Refinements to existing workflows, reliability, performance, or UX. -->

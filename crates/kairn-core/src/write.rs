@@ -690,6 +690,260 @@ pub fn append_to_section(path: &Path, section: &str, text: &str) -> io::Result<u
     Ok(idx)
 }
 
+/// Where a section created by [`edit_section_in_text`] goes when the note
+/// has no heading for it yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SectionPlace {
+    /// After the last line of the note.
+    End,
+    /// Directly above the named heading.
+    Before(String),
+    /// After the last content line of the named heading's section.
+    After(String),
+}
+
+/// What [`edit_section_in_text`] should do to the section.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SectionEdit {
+    /// The body under the heading becomes `body`; the heading line itself
+    /// stays as written. With `create`, a missing section is added there.
+    Replace { body: String, create: Option<SectionPlace> },
+    /// The heading and its body go.
+    Delete,
+}
+
+/// What happened to the section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SectionAction {
+    /// The block already read exactly as requested; nothing to write.
+    Unchanged,
+    Replaced,
+    Created,
+    Deleted,
+}
+
+/// The result of a section edit: the new text and where the block sits in
+/// it (`start..end` bytes, `line` the heading's 0-based line index). After a
+/// delete, `start == end` marks where the block was.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SectionChange {
+    pub text: String,
+    pub action: SectionAction,
+    pub heading: String,
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Why a section edit could not be applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SectionMiss {
+    /// No heading matches, and the edit did not ask to create one.
+    Heading,
+    /// The heading named by `Before`/`After` is not in the note.
+    Anchor(String),
+}
+
+fn find_heading(lines: &[&str], heading: &str) -> Option<(usize, u8)> {
+    let key = section_key(heading);
+    if key.is_empty() {
+        return None;
+    }
+    lines.iter().enumerate().find_map(|(i, l)| match crate::parse::parse_line(l) {
+        crate::parse::Line::Heading { level, .. } if section_key(l) == key => Some((i, level)),
+        _ => None,
+    })
+}
+
+/// Rewrite one heading's block in `text` as a unit: the heading line through
+/// the last content line before the next heading of the same or higher
+/// level (or the end of the note). Trailing blank lines and rules belong to
+/// the boundary and survive a replace; a delete takes them too, so no double
+/// gap is left behind. The section is the first heading matching `heading`
+/// (hashes, `==` highlights, and case ignored, like [`append_to_section`]).
+/// A created heading is `heading` verbatim when it brings its own `#` marks,
+/// `## heading` otherwise, set off by one blank line from its neighbours.
+/// Line endings and the file's trailing-newline convention are preserved.
+pub fn edit_section_in_text(
+    text: &str,
+    heading: &str,
+    edit: &SectionEdit,
+) -> Result<SectionChange, SectionMiss> {
+    let lines: Vec<&str> = text.lines().collect();
+    let crlf = text.contains("\r\n");
+    let ending = if crlf { "\r\n" } else { "\n" };
+    let found = find_heading(&lines, heading);
+    let body_lines = |body: &str| -> Vec<String> {
+        body.trim_matches(['\n', '\r'])
+            .lines()
+            .map(|l| l.trim_end_matches('\r').to_string())
+            .collect()
+    };
+    // The block to write, the line it starts at, and how many lines it replaces.
+    let (block, at, removed): (Vec<String>, usize, usize) = match (found, edit) {
+        (Some((idx, level)), SectionEdit::Replace { body, .. }) => {
+            let end = section_end_insert_idx(&lines, idx, level);
+            let mut block = vec![lines[idx].to_string()];
+            block.extend(body_lines(body));
+            (block, idx, end - idx)
+        }
+        (Some((idx, level)), SectionEdit::Delete) => {
+            let end = lines
+                .iter()
+                .enumerate()
+                .skip(idx + 1)
+                .find_map(|(i, l)| match crate::parse::parse_line(l) {
+                    crate::parse::Line::Heading { level: lv, .. } if lv <= level => Some(i),
+                    _ => None,
+                })
+                .unwrap_or(lines.len());
+            (Vec::new(), idx, end - idx)
+        }
+        (None, SectionEdit::Delete) | (None, SectionEdit::Replace { create: None, .. }) => {
+            return Err(SectionMiss::Heading);
+        }
+        (None, SectionEdit::Replace { body, create: Some(place) }) => {
+            let heading_line = if heading.trim_start().starts_with('#') {
+                heading.trim().to_string()
+            } else {
+                format!("## {}", heading.trim())
+            };
+            let at = match place {
+                SectionPlace::End => lines.len(),
+                SectionPlace::Before(anchor) => {
+                    find_heading(&lines, anchor)
+                        .ok_or_else(|| SectionMiss::Anchor(anchor.clone()))?
+                        .0
+                }
+                SectionPlace::After(anchor) => {
+                    let (i, lv) = find_heading(&lines, anchor)
+                        .ok_or_else(|| SectionMiss::Anchor(anchor.clone()))?;
+                    section_end_insert_idx(&lines, i, lv)
+                }
+            };
+            let is_blank = |i: usize| lines.get(i).is_none_or(|l| l.trim().is_empty());
+            let mut block = Vec::new();
+            if at > 0 && !is_blank(at - 1) {
+                block.push(String::new());
+            }
+            block.push(heading_line);
+            block.extend(body_lines(body));
+            if at < lines.len() && !is_blank(at) {
+                block.push(String::new());
+            }
+            (block, at, 0)
+        }
+    };
+    let creating = found.is_none();
+    let unchanged = !creating
+        && matches!(edit, SectionEdit::Replace { .. })
+        && lines[at..at + removed].iter().copied().eq(block.iter().map(String::as_str));
+    if unchanged {
+        let start: usize = lines[..at].iter().map(|l| l.len() + ending.len()).sum();
+        let end = start + block.iter().map(|l| l.len() + ending.len()).sum::<usize>();
+        return Ok(SectionChange {
+            text: text.to_string(),
+            action: SectionAction::Unchanged,
+            heading: lines[at].to_string(),
+            line: at,
+            start,
+            end: end.min(text.len()),
+        });
+    }
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut start = 0;
+    let mut end = 0;
+    let push_block = |out: &mut String, start: &mut usize, end: &mut usize| {
+        *start = out.len();
+        for b in &block {
+            out.push_str(b);
+            out.push_str(ending);
+        }
+        *end = out.len();
+    };
+    for (i, line) in lines.iter().enumerate() {
+        if i == at {
+            push_block(&mut out, &mut start, &mut end);
+        }
+        if i >= at && i < at + removed {
+            continue;
+        }
+        out.push_str(line);
+        out.push_str(ending);
+    }
+    if at >= lines.len() {
+        push_block(&mut out, &mut start, &mut end);
+    }
+    if !text.ends_with('\n') && !text.is_empty() {
+        while out.ends_with('\n') || out.ends_with('\r') {
+            out.pop();
+        }
+        end = end.min(out.len());
+    }
+    let mut heading_line_idx = at;
+    // A created block may be set off by spacer lines; the range reported is
+    // the heading and body only, so it means the same thing as after a replace.
+    if creating && block.first().is_some_and(|b| b.is_empty()) {
+        heading_line_idx += 1;
+        start += ending.len();
+    }
+    if creating && block.len() > 1 && block.last().is_some_and(|b| b.is_empty()) {
+        end -= ending.len();
+    }
+    let action = if creating {
+        SectionAction::Created
+    } else if matches!(edit, SectionEdit::Delete) {
+        SectionAction::Deleted
+    } else {
+        SectionAction::Replaced
+    };
+    let heading_text = match action {
+        SectionAction::Deleted => lines[at].to_string(),
+        _ => block.iter().find(|b| !b.is_empty()).cloned().unwrap_or_default(),
+    };
+    Ok(SectionChange {
+        text: out,
+        action,
+        heading: heading_text,
+        line: heading_line_idx,
+        start,
+        end: if action == SectionAction::Deleted { start } else { end },
+    })
+}
+
+/// Apply [`edit_section_in_text`] to a note on disk: read, compute, and
+/// write atomically only when something changes, so an unchanged block is
+/// never rewritten (no sync churn, nothing to log). A missing file counts as
+/// empty when the edit creates the section. The outer error is I/O; the
+/// inner one is the section miss.
+pub fn edit_section_on_disk(
+    path: &Path,
+    heading: &str,
+    edit: &SectionEdit,
+) -> io::Result<Result<SectionChange, SectionMiss>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e)
+            if e.kind() == io::ErrorKind::NotFound
+                && matches!(edit, SectionEdit::Replace { create: Some(_), .. }) =>
+        {
+            String::new()
+        }
+        Err(e) => return Err(e),
+    };
+    let change = match edit_section_in_text(&text, heading, edit) {
+        Ok(change) => change,
+        Err(miss) => return Ok(Err(miss)),
+    };
+    if change.action != SectionAction::Unchanged {
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        atomic_write(path, &change.text)?;
+    }
+    Ok(Ok(change))
+}
+
 /// Insert `block` (which may span lines) at the very top of `date`'s daily
 /// note, above everything already there. The file is created if the day has
 /// none; a new today-or-future file is seeded from the daily template first
@@ -1024,6 +1278,105 @@ mod tests {
         // An empty section inserts directly after its heading.
         let empty: Vec<&str> = vec!["## A", "## B", "text"];
         assert_eq!(section_insert_idx(&empty, "A"), Some(1));
+    }
+
+    #[test]
+    fn section_edit_replaces_one_block_and_keeps_the_gap() {
+        let text = "### Tasks\n* one\n\n### ==Seat==\n- old a\n- old b\n\n### Local Agent\n- theirs\n";
+        let edit = SectionEdit::Replace { body: "- new a\n".into(), create: None };
+        let change = edit_section_in_text(text, "seat", &edit).expect("found");
+        assert_eq!(change.action, SectionAction::Replaced);
+        assert_eq!(change.text, "### Tasks\n* one\n\n### ==Seat==\n- new a\n\n### Local Agent\n- theirs\n");
+        assert_eq!(change.heading, "### ==Seat==");
+        assert_eq!(change.line, 3);
+        assert_eq!(&change.text[change.start..change.end], "### ==Seat==\n- new a\n");
+        // Same body again: nothing to write.
+        let again = edit_section_in_text(&change.text, "### Seat", &SectionEdit::Replace { body: "- new a".into(), create: None })
+            .expect("found");
+        assert_eq!(again.action, SectionAction::Unchanged);
+        assert_eq!(again.text, change.text);
+        assert_eq!(&again.text[again.start..again.end], "### ==Seat==\n- new a\n");
+        // A deeper heading is part of the block; the last section runs to the end.
+        let nested = "## A\n#### Sub\nx\n## B\ny";
+        let c = edit_section_in_text(nested, "A", &SectionEdit::Replace { body: "z".into(), create: None }).expect("found");
+        assert_eq!(c.text, "## A\nz\n## B\ny");
+        let c = edit_section_in_text(nested, "B", &SectionEdit::Replace { body: "".into(), create: None }).expect("found");
+        assert_eq!(c.text, "## A\n#### Sub\nx\n## B");
+    }
+
+    #[test]
+    fn section_edit_creates_before_after_or_at_end() {
+        let text = "### Tasks\n* one\n\n### Local Agent\n- theirs\n";
+        let before = SectionEdit::Replace {
+            body: "- a".into(),
+            create: Some(SectionPlace::Before("local agent".into())),
+        };
+        let c = edit_section_in_text(text, "### Seat", &before).expect("placed");
+        assert_eq!(c.action, SectionAction::Created);
+        assert_eq!(c.text, "### Tasks\n* one\n\n### Seat\n- a\n\n### Local Agent\n- theirs\n");
+        assert_eq!(c.line, 3);
+        assert_eq!(&c.text[c.start..c.end], "### Seat\n- a\n");
+        let after = SectionEdit::Replace { body: "- a".into(), create: Some(SectionPlace::After("Tasks".into())) };
+        let c = edit_section_in_text(text, "Seat", &after).expect("placed");
+        assert_eq!(c.text, "### Tasks\n* one\n\n## Seat\n- a\n\n### Local Agent\n- theirs\n");
+        assert_eq!(c.line, 3);
+        let at_end = SectionEdit::Replace { body: "- a".into(), create: Some(SectionPlace::End) };
+        let c = edit_section_in_text(text, "### Seat", &at_end).expect("placed");
+        assert_eq!(c.text, "### Tasks\n* one\n\n### Local Agent\n- theirs\n\n### Seat\n- a\n");
+        assert_eq!(c.line, 6);
+        assert_eq!(&c.text[c.start..c.end], "### Seat\n- a\n");
+        // An empty note gets just the block.
+        let c = edit_section_in_text("", "### Seat", &at_end).expect("placed");
+        assert_eq!(c.text, "### Seat\n- a\n");
+        // A missing anchor or a missing heading without create is a miss.
+        let missing = SectionEdit::Replace { body: "x".into(), create: Some(SectionPlace::Before("Nope".into())) };
+        assert_eq!(edit_section_in_text(text, "Seat", &missing), Err(SectionMiss::Anchor("Nope".into())));
+        let plain = SectionEdit::Replace { body: "x".into(), create: None };
+        assert_eq!(edit_section_in_text(text, "Seat", &plain), Err(SectionMiss::Heading));
+    }
+
+    #[test]
+    fn section_edit_deletes_the_block_with_its_gap() {
+        let text = "### Tasks\n* one\n\n### Seat\n- a\n\n### Local Agent\n- theirs\n";
+        let c = edit_section_in_text(text, "seat", &SectionEdit::Delete).expect("found");
+        assert_eq!(c.action, SectionAction::Deleted);
+        assert_eq!(c.text, "### Tasks\n* one\n\n### Local Agent\n- theirs\n");
+        assert_eq!(c.heading, "### Seat");
+        assert_eq!((c.line, c.start, c.end), (3, 17, 17));
+        let c = edit_section_in_text(text, "Local Agent", &SectionEdit::Delete).expect("found");
+        assert_eq!(c.text, "### Tasks\n* one\n\n### Seat\n- a\n\n");
+        assert_eq!(edit_section_in_text(text, "Nope", &SectionEdit::Delete), Err(SectionMiss::Heading));
+        // CRLF files stay CRLF.
+        let crlf = "## A\r\nx\r\n\r\n## B\r\ny\r\n";
+        let c = edit_section_in_text(crlf, "A", &SectionEdit::Replace { body: "p\nq".into(), create: None }).expect("found");
+        assert_eq!(c.text, "## A\r\np\r\nq\r\n\r\n## B\r\ny\r\n");
+    }
+
+    #[test]
+    fn section_edit_on_disk_writes_only_when_changed() {
+        let root = ScratchRoot::new("section-disk");
+        let path = root.write("Calendar/20260921.md", "### Tasks\n* one\n\n### Local Agent\n- theirs\n");
+        let edit = SectionEdit::Replace {
+            body: "- Working on: x".into(),
+            create: Some(SectionPlace::Before("Local Agent".into())),
+        };
+        let c = edit_section_on_disk(&path, "### Seat", &edit).expect("io").expect("placed");
+        assert_eq!(c.action, SectionAction::Created);
+        let written = fs::read_to_string(&path).expect("read");
+        assert_eq!(written, "### Tasks\n* one\n\n### Seat\n- Working on: x\n\n### Local Agent\n- theirs\n");
+        let before = fs::metadata(&path).expect("meta").modified().expect("mtime");
+        let c = edit_section_on_disk(&path, "Seat", &edit).expect("io").expect("found");
+        assert_eq!(c.action, SectionAction::Unchanged);
+        assert_eq!(fs::metadata(&path).expect("meta").modified().expect("mtime"), before);
+        // A missing file is created when the edit creates the section.
+        let fresh = root.0.join("Notes/Fresh.md");
+        let c = edit_section_on_disk(&fresh, "Log", &SectionEdit::Replace { body: "first".into(), create: Some(SectionPlace::End) })
+            .expect("io")
+            .expect("placed");
+        assert_eq!(c.action, SectionAction::Created);
+        assert_eq!(fs::read_to_string(&fresh).expect("read"), "## Log\nfirst\n");
+        // A missing file without create is an I/O error, not a silent miss.
+        assert!(edit_section_on_disk(&root.0.join("Notes/None.md"), "Log", &SectionEdit::Delete).is_err());
     }
 
     #[test]

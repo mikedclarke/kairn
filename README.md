@@ -106,6 +106,7 @@ kairn done <match>          Complete the matching open task
 kairn capture <text>        Append a line to today's note
 kairn append <note> <text>  Append text to any note (--section targets or creates a section)
 kairn edit <note> --find X  Replace, extend, or delete the one matching line
+kairn section <note> <h>    Replace, create, or delete one heading's block (--replace -, --create, --before, --after, --delete)
 kairn carry                 Move overdue tasks from past days into today (--dry-run, --from)
 kairn search <query>        Fuzzy title + full-text search
 kairn recent                List notes by modification time, newest first (--days)
@@ -119,7 +120,10 @@ today, tomorrow, and yesterday. Global flags: `--root <dir>` (or `$KAIRN_ROOT`),
 
 Writes never clobber: every edit re-verifies the target line against the file on disk
 and refuses rather than guesses, appends are atomic, and `carry` previews with
-`--dry-run` and only looks back 14 days unless told otherwise.
+`--dry-run` and only looks back 14 days unless told otherwise. `section` rewrites one
+heading's block (the heading through the line before the next heading of the same or
+higher level) as a unit and writes nothing when the block already matches, so a script
+or agent can keep a status block in a note current without touching the rest of it.
 
 ## Install
 
