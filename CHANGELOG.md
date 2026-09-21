@@ -5,6 +5,17 @@ in [release-notes/UNRELEASED.md](release-notes/UNRELEASED.md) as they are built 
 here when a version ships. The release process is described in
 [docs/RELEASING.md](docs/RELEASING.md).
 
+## 0.3.7 (2026-09-21)
+
+### Added
+
+- Turn sessions off in Settings for a notes-only Kairn, with no terminal pane, split, or session controls.
+- Drag a note or library file onto another folder in the sidebar to move it, with the destination highlighted while you hover and the move covered by undo.
+
+### Fixed
+
+- Ticking a task's checkbox no longer scrolls the note to the cursor's position when the cursor is off screen.
+
 ## 0.3.6 (2026-09-02)
 
 ### Improved
