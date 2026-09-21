@@ -38,12 +38,28 @@ pub(crate) enum VaultOp {
         before: String,
         after: String,
     },
+    /// A note or library file/folder dragged into another folder. Both ends
+    /// are full paths; the item at one is expected to be absent and the other
+    /// present, so an undo landing after it moved again refuses quietly
+    /// rather than clobbering. `library` picks the tree the move belongs to,
+    /// so undo/redo restore the right pane and reload the right side.
+    PathMove {
+        ms: u64,
+        /// Where the item started (and where undo returns it).
+        src: PathBuf,
+        /// Where the item landed (and where redo sends it again).
+        dest: PathBuf,
+        /// A library move (vs a Notes-tree move).
+        library: bool,
+    },
 }
 
 impl VaultOp {
     pub fn ms(&self) -> u64 {
         match self {
-            VaultOp::Transfer { ms, .. } | VaultOp::Retime { ms, .. } => *ms,
+            VaultOp::Transfer { ms, .. }
+            | VaultOp::Retime { ms, .. }
+            | VaultOp::PathMove { ms, .. } => *ms,
         }
     }
 }

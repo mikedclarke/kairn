@@ -21,7 +21,16 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let container = div().flex_1().min_w(px(0.)).min_h(px(0.));
-        match self.layout {
+        // With sessions off the app is notes-only: any terminal-showing layout
+        // collapses to full-width notes. Layout is not persisted (it starts as
+        // Split every launch), so this gate is what a notes-only user relies on
+        // at startup, not just an in-session safeguard.
+        let layout = if self.settings.sessions_enabled || !self.layout.shows_terminal() {
+            self.layout
+        } else {
+            LayoutMode::NotesFull
+        };
+        match layout {
             LayoutMode::TerminalFull => container.child(self.render_terminal_pane(t, cx)),
             LayoutMode::Writing => container.child(self.render_note_pane(t, true, cx)),
             LayoutMode::NotesFull => container.child(self.render_note_pane(t, false, cx)),

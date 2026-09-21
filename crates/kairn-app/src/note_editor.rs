@@ -468,10 +468,19 @@ impl NoteEditor {
     }
 
     fn after_edit(&mut self, cx: &mut Context<Self>) {
+        self.after_edit_inner(true, cx);
+    }
+
+    /// Shared tail of an edit. `follow` scrolls the caret into view; a glyph
+    /// toggle passes `false` so clicking an off-screen task's checkbox does
+    /// not yank the viewport to wherever the caret happens to sit.
+    fn after_edit_inner(&mut self, follow: bool, cx: &mut Context<Self>) {
         self.selection_anchor = None;
         self.hovered_link = None;
         self.reset_blink(cx);
-        self.follow_cursor.set(true);
+        if follow {
+            self.follow_cursor.set(true);
+        }
         self.schedule_autosave(cx);
         cx.notify();
     }
@@ -1525,7 +1534,7 @@ impl NoteEditor {
         let line = self.text()[raw_range.clone()].to_string();
         let Some(toggled) = notes::toggle_task_line(&line) else { return };
         self.buffer.edit(raw_range, &toggled, self.cursor, now_ms());
-        self.after_edit(cx);
+        self.after_edit_inner(false, cx);
     }
 
     /// The in-flight line drag, once it has actually moved: the first

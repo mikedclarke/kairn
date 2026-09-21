@@ -452,14 +452,14 @@ impl SettingsEditor {
             .upgrade()
             .map(|ws| ws.read(cx).settings.week_strip.clone())
             .unwrap_or_else(|| "always".to_string());
-        let (show_agents, show_daily, show_tasks) = self
+        let (show_agents, show_daily, show_tasks, sessions_enabled) = self
             .workspace
             .upgrade()
             .map(|ws| {
                 let s = &ws.read(cx).settings;
-                (s.show_agents, s.show_daily, s.show_tasks)
+                (s.show_agents, s.show_daily, s.show_tasks, s.sessions_enabled)
             })
-            .unwrap_or((true, true, true));
+            .unwrap_or((true, true, true, true));
         let library_sort = self
             .workspace
             .upgrade()
@@ -516,6 +516,18 @@ impl SettingsEditor {
                 .child(div().w(px(90.)).text_size(px(12.5)).child(label))
                 .child(vis_button(on_id, section, true, current))
                 .child(vis_button(off_id, section, false, current))
+        };
+        // Sessions on/off: not a sidebar section but a whole mode. Off makes
+        // the app notes-only (no terminal pane, no split, no session UI).
+        let sessions_button = |id: &'static str, on: bool| {
+            let btn = Button::new(id).label(if on { "On" } else { "Off" });
+            let btn = if on == sessions_enabled { btn.primary() } else { btn.outline() };
+            btn.on_click(cx.listener(move |this, _, _, cx| {
+                let _ = this.workspace.update(cx, |ws, cx| {
+                    ws.set_sessions_enabled(on, cx);
+                });
+                cx.notify();
+            }))
         };
 
         v_flex()
@@ -591,6 +603,20 @@ impl SettingsEditor {
                     .child(strip_button("strip-daily", "Daily notes only", "daily"))
                     .child(strip_button("strip-off", "Hidden", "off")),
             )
+            .child(Self::section("Sessions"))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().w(px(90.)).text_size(px(12.5)).child("Terminals"))
+                    .child(sessions_button("sessions-on", true))
+                    .child(sessions_button("sessions-off", false)),
+            )
+            .child(div().text_size(px(11.)).opacity(0.55).child(
+                "Off makes Kairn notes-only: no terminal pane, no split or terminal \
+                 layouts, and no session controls. Your notes are untouched, and turning \
+                 sessions back on restores everything.",
+            ))
             .child(Self::section("Sidebar sections"))
             .child(vis_row("Calendar", "daily", "daily-vis-on", "daily-vis-off", show_daily))
             .child(vis_row("Tasks", "tasks", "tasks-vis-on", "tasks-vis-off", show_tasks))
