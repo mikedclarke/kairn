@@ -139,10 +139,6 @@ pub struct Workspace {
     /// (task views, unreadable notes, missing root).
     pub(crate) note_editor: Option<gpui::Entity<crate::note_editor::NoteEditor>>,
     pub(crate) _note_editor_sub: Option<gpui::Subscription>,
-    /// Editor text whose merge target vanished or conflicted before it could
-    /// be saved: (file it was bound for, the user's text). Rendered as a
-    /// banner so typed text is never silently dropped.
-    pub orphaned: Option<(PathBuf, String)>,
     pub sessions: Vec<Session>,
     pub active_session: usize,
     next_session_id: u64,
@@ -318,9 +314,12 @@ impl Workspace {
         // Closing the window must not drop a pending edit.
         let flush = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
-            flush
+            if !flush
                 .update(cx, |ws, cx| ws.flush_note_editor(cx))
-                .ok();
+                .unwrap_or(true)
+            {
+                return false;
+            }
             if cfg!(target_os = "macos") {
                 // Minimize instead of destroying the window: the workspace
                 // (and its live terminal sessions) survives, and a Dock
@@ -358,7 +357,6 @@ impl Workspace {
             settings_view: None,
             note_editor: None,
             _note_editor_sub: None,
-            orphaned: None,
             sessions: Vec::new(),
             active_session: 0,
             next_session_id: 1,
@@ -702,6 +700,9 @@ impl Workspace {
     /// collected in the editor's context and applied here, so neither
     /// entity re-enters the other.
     pub(crate) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.flush_note_editor(cx) {
+            return;
+        }
         if let Some(editor) = self.settings_view.take() {
             let patch = editor.update(cx, |editor, cx| editor.collect_patch(cx));
             self.apply_settings(patch, window, cx);
@@ -723,8 +724,9 @@ impl Workspace {
     }
 
     fn on_quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
-        self.flush_note_editor(cx);
-        cx.quit();
+        if self.flush_note_editor(cx) {
+            cx.quit();
+        }
     }
 
     /// The undo chord, owned here rather than by the editor: whichever

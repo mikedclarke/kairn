@@ -56,9 +56,8 @@ pub enum NoteEditorEvent {
     /// The editor wrote its file; the workspace should note the self-write
     /// and refresh sidebar state.
     Saved(PathBuf),
-    /// A merge collision: typed text that lost to a disk change and must be
-    /// surfaced, never dropped.
-    Conflicts(PathBuf, Vec<String>),
+    ConflictSaved(PathBuf),
+    SaveFailed,
     OpenWikiLink(String),
     OpenDate(chrono::NaiveDate),
     OpenUrl(String),
@@ -72,6 +71,7 @@ pub enum NoteEditorEvent {
 
 pub struct NoteEditor {
     pub path: PathBuf,
+    pub save_error: Option<String>,
     buffer: NoteBuffer,
     /// The file used CRLF endings; the buffer holds LF and saves convert back.
     crlf: bool,
@@ -340,6 +340,7 @@ impl NoteEditor {
         };
         Self {
             path,
+            save_error: None,
             buffer,
             crlf,
             cursor: 0,
@@ -366,18 +367,45 @@ impl NoteEditor {
     }
 
     /// Absorb the document as it now stands on disk (watcher event or
-    /// navigation reload). Merges into any in-flight edits; conflicts are
-    /// emitted, never dropped.
-    pub fn reconcile_from_disk(&mut self, disk: &str, cx: &mut Context<Self>) {
+    /// navigation reload), preserving conflicting text before changing the buffer.
+    pub fn reconcile_from_disk(&mut self, disk: &str, cx: &mut Context<Self>) -> bool {
         let disk = if disk.contains("\r\n") { disk.replace("\r\n", "\n") } else { disk.to_string() };
         let before = self.buffer.text().to_string();
-        let (cursor, conflicts) = self.buffer.reconcile(&disk, self.cursor);
+        let mut copy = None;
+        let result = self.buffer.try_reconcile(&disk, self.cursor, |text| {
+            let content = if self.crlf { text.replace('\n', "\r\n") } else { text.to_string() };
+            copy = Some(notes::write_conflict_copy(&self.path, &content)?);
+            Ok::<_, std::io::Error>(())
+        });
+        let (cursor, _) = match result {
+            Ok(result) => result,
+            Err(e) => {
+                self.save_failed(format!("Could not preserve conflicting edits: {e}"), cx);
+                return false;
+            }
+        };
         self.cursor = cursor;
         if self.buffer.text() != before {
             self.drop_stale_offsets();
         }
-        if !conflicts.is_empty() {
-            cx.emit(NoteEditorEvent::Conflicts(self.path.clone(), conflicts));
+        if copy.is_some() || !self.buffer.is_dirty() {
+            self.save_error = None;
+        }
+        if let Some(copy) = copy {
+            cx.emit(NoteEditorEvent::ConflictSaved(copy));
+        }
+        cx.notify();
+        true
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.buffer.is_dirty()
+    }
+
+    fn save_failed(&mut self, message: String, cx: &mut Context<Self>) {
+        if self.save_error.as_ref() != Some(&message) {
+            self.save_error = Some(message);
+            cx.emit(NoteEditorEvent::SaveFailed);
         }
         cx.notify();
     }
@@ -417,23 +445,19 @@ impl NoteEditor {
 
     /// Write the buffer now if it holds unsaved edits: the flush point for
     /// navigation, Cmd+S, and quit.
-    pub fn save_now(&mut self, cx: &mut Context<Self>) {
+    pub fn save_now(&mut self, cx: &mut Context<Self>) -> bool {
         self._autosave = None;
-        if self.ime_marked.is_some() || !self.buffer.is_dirty() {
-            return;
+        if self.ime_marked.is_some() {
+            return false;
+        }
+        if !self.buffer.is_dirty() {
+            self.save_error = None;
+            return true;
         }
         match std::fs::read_to_string(&self.path) {
             Ok(disk) => {
-                let disk =
-                    if disk.contains("\r\n") { disk.replace("\r\n", "\n") } else { disk };
-                let before = self.buffer.text().to_string();
-                let (cursor, conflicts) = self.buffer.reconcile(&disk, self.cursor);
-                self.cursor = cursor;
-                if self.buffer.text() != before {
-                    self.drop_stale_offsets();
-                }
-                if !conflicts.is_empty() {
-                    cx.emit(NoteEditorEvent::Conflicts(self.path.clone(), conflicts));
+                if !self.reconcile_from_disk(&disk, cx) {
+                    return false;
                 }
             }
             // A file that never existed (template seed, fresh note) or was
@@ -441,8 +465,8 @@ impl NoteEditor {
             // explicit resurrect; nothing on disk can be clobbered.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
-                eprintln!("kairn: could not read {}: {e}", self.path.display());
-                return;
+                self.save_failed(format!("Could not read this note before saving: {e}"), cx);
+                return false;
             }
         }
         let out = if self.crlf {
@@ -453,11 +477,16 @@ impl NoteEditor {
         match notes::write_note(&self.path, &out) {
             Ok(()) => {
                 self.buffer.mark_saved();
+                self.save_error = None;
                 cx.emit(NoteEditorEvent::Saved(self.path.clone()));
             }
-            Err(e) => eprintln!("kairn: could not save {}: {e}", self.path.display()),
+            Err(e) => {
+                self.save_failed(format!("Could not save this note: {e}"), cx);
+                return false;
+            }
         }
         cx.notify();
+        true
     }
 
     fn schedule_autosave(&mut self, cx: &mut Context<Self>) {

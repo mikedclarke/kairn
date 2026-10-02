@@ -21,3 +21,5 @@ restating the same fact twice; no em dashes. Rewrite to this standard before rel
 ## Fixed
 
 <!-- Bugs that no longer happen. -->
+
+- Conflicting note edits are saved as recovery copies that survive closing the app, and simultaneous line insertions keep both additions.

@@ -517,7 +517,7 @@ impl Workspace {
         } else {
             note_frame(t, writing, masthead, badge, subline)
         };
-        if let Some(banner) = self.render_orphan_banner(t, cx) {
+        if let Some(banner) = self.render_save_error(t, cx) {
             note = note.child(banner);
         }
         for banner in self.render_conflict_banners(t, cx) {
@@ -729,24 +729,12 @@ impl Workspace {
         body.into_any_element()
     }
 
-    /// A line edit whose target line vanished from the file before saving:
-    /// the typed text is shown until the user restores or dismisses it,
-    /// never silently dropped.
-    fn render_orphan_banner(
+    fn render_save_error(
         &self,
         t: &KairnTheme,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
-        let (_, text) = self.orphaned.as_ref()?;
-        let action = |label: &'static str, id: &'static str| {
-            let hover = t.text;
-            div()
-                .id(id)
-                .text_color(t.dim)
-                .cursor_pointer()
-                .hover(move |s| s.text_color(hover))
-                .child(label)
-        };
+        let error = self.note_editor.as_ref()?.read(cx).save_error.as_ref()?;
         Some(
             div()
                 .mb(px(10.))
@@ -757,41 +745,21 @@ impl Workspace {
                 .border_color(t.amber.opacity(0.5))
                 .bg(t.amber.opacity(0.08))
                 .text_size(t.ui_px(12.))
+                .text_color(t.text)
+                .child(error.clone())
                 .child(
-                    div()
-                        .text_color(t.dim)
-                        .child("This line changed on disk before your edit could be saved:"),
-                )
-                .child(div().my(px(4.)).text_color(t.text).child(text.clone()))
-                .child(
-                    div()
-                        .flex()
-                        .gap(px(14.))
-                        .text_size(t.ui_px(11.5))
-                        .child(action("Put it back at the end of its note", "orphan-append").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.resolve_orphan(true, cx);
-                            }),
-                        ))
-                        .child(action("Discard", "orphan-discard").on_click(cx.listener(
-                            |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.resolve_orphan(false, cx);
-                            },
-                        ))),
+                    div().mt(px(4.))
+                        .child("Your edits are still open. Save again before leaving this note."),
                 ),
         )
     }
 
-    /// One banner per Syncthing conflict copy of the current note: without
-    /// this the conflicted version of a day is unreachable from every
-    /// surface, which is silent data loss after a sync clash.
     fn render_conflict_banners(
         &self,
         t: &KairnTheme,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
+        let library = matches!(self.view, PaneView::Library(_));
         self.conflicts
             .iter()
             .enumerate()
@@ -823,9 +791,11 @@ impl Workspace {
                     .border_color(t.amber.opacity(0.5))
                     .bg(t.amber.opacity(0.08))
                     .text_size(t.ui_px(12.))
-                    .child(div().text_color(t.dim).child(
-                        "A sync conflict copy of this note exists; it may hold changes this version is missing. Resolving moves the losing file to the vault trash.",
-                    ))
+                    .child(div().text_color(t.dim).child(if library {
+                        "A conflict copy preserves another version of this file."
+                    } else {
+                        "A conflict copy preserves another version of this note. Resolving moves the losing file to the vault trash."
+                    }))
                     .child(div().mt(px(2.)).text_color(t.faint).child(name.clone()))
                     .child(
                         h_flex()
@@ -833,25 +803,31 @@ impl Workspace {
                             .gap(px(14.))
                             .text_size(t.ui_px(11.5))
                             .child(action("Open the copy", ("conflict-open", i)).on_click(
-                                cx.listener(move |this, _, _, cx| {
+                                cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
-                                    this.open_note(open.clone(), cx);
+                                    if library {
+                                        this.open_library_file(open.clone(), window, cx);
+                                    } else {
+                                        this.open_note(open.clone(), cx);
+                                    }
                                 }),
                             ))
-                            .child(
-                                action("Keep this version", ("conflict-keep-mine", i))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.resolve_conflict(&keep_mine, false, cx);
-                                    })),
-                            )
-                            .child(
-                                action("Use the copy instead", ("conflict-keep-copy", i))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.resolve_conflict(&keep_copy, true, cx);
-                                    })),
-                            )
+                            .when(!library, |row| {
+                                row.child(
+                                    action("Keep this version", ("conflict-keep-mine", i))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.resolve_conflict(&keep_mine, false, cx);
+                                        })),
+                                )
+                                .child(
+                                    action("Use the copy instead", ("conflict-keep-copy", i))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.resolve_conflict(&keep_copy, true, cx);
+                                        })),
+                                )
+                            })
                             .child(action("Copy path", ("conflict-copy-path", i)).on_click(
                                 cx.listener(move |_, _, _, cx| {
                                     cx.stop_propagation();

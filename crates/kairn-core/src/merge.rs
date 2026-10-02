@@ -24,10 +24,10 @@ pub fn merge3(base: &str, disk: &str, ours: &str) -> Merged {
         return Merged { text: disk.to_string(), conflicts: Vec::new() };
     }
 
-    // `split` (not `lines`) so a trailing newline survives the round-trip.
-    let b: Vec<&str> = base.split('\n').collect();
-    let d: Vec<&str> = disk.split('\n').collect();
-    let o: Vec<&str> = ours.split('\n').collect();
+    // A terminal newline is not a blank line competing with an EOF insertion.
+    let b: Vec<&str> = base.split_terminator('\n').collect();
+    let d: Vec<&str> = disk.split_terminator('\n').collect();
+    let o: Vec<&str> = ours.split_terminator('\n').collect();
 
     let mut to_disk: Vec<Option<usize>> = vec![None; b.len()];
     for (i, j) in lcs_pairs(&b, &d) {
@@ -56,7 +56,16 @@ pub fn merge3(base: &str, disk: &str, ours: &str) -> Merged {
     }
     resolve(&b[bi..], &d[dj..], &o[ok..], &mut out, &mut conflicts);
 
-    Merged { text: out.join("\n"), conflicts }
+    let trailing_newline = if ours.ends_with('\n') == base.ends_with('\n') {
+        disk.ends_with('\n')
+    } else {
+        ours.ends_with('\n')
+    };
+    let mut text = out.join("\n");
+    if !out.is_empty() && trailing_newline {
+        text.push('\n');
+    }
+    Merged { text, conflicts }
 }
 
 /// Resolve one hunk (a region between anchors) into the output.
@@ -71,6 +80,9 @@ fn resolve<'a>(
         out.extend_from_slice(ours);
     } else if ours == base {
         out.extend_from_slice(disk);
+    } else if base.is_empty() {
+        out.extend_from_slice(disk);
+        out.extend_from_slice(ours);
     } else {
         out.extend_from_slice(disk);
         // Our side of the collision is preserved for the caller; a hunk of
@@ -174,6 +186,36 @@ mod tests {
         let m = merge3("a\n", "a\nsame new line\n", "a\nsame new line\n");
         assert_eq!(m.text, "a\nsame new line\n");
         assert!(m.conflicts.is_empty());
+    }
+
+    #[test]
+    fn simultaneous_insertions_keep_both_in_order() {
+        for (base, disk, ours, expected) in [
+            ("a\nb\n", "a\ndisk\nb\n", "a\nours\nb\n", "a\ndisk\nours\nb\n"),
+            ("a\n", "disk\na\n", "ours\na\n", "disk\nours\na\n"),
+            ("a\n", "a\ndisk\n", "a\nours\n", "a\ndisk\nours\n"),
+            ("a\n", "a\ndisk\n", "a\nours", "a\ndisk\nours"),
+            ("a", "a\ndisk", "a\nours", "a\ndisk\nours"),
+            ("", "disk\n", "ours", "disk\nours\n"),
+            ("a\n", "a\nsame\n", "a\nsame", "a\nsame"),
+            ("a\n\n", "a\ndisk\n\n", "a\nours\n\n", "a\ndisk\nours\n\n"),
+        ] {
+            let merged = merge3(base, disk, ours);
+            assert_eq!(merged.text, expected, "base: {base:?}");
+            assert!(merged.conflicts.is_empty(), "base: {base:?}");
+        }
+    }
+
+    #[test]
+    fn newline_edits_merge_without_losing_blank_lines() {
+        for (base, disk, ours, expected) in [
+            ("a\nb\n", "A\nb\n", "a\nb", "A\nb"),
+            ("a\nb", "A\nb", "a\nb\n", "A\nb\n"),
+            ("a\nkeep\nb\n\n", "A\nkeep\nb\n\n", "a\nkeep\nB\n\n", "A\nkeep\nB\n\n"),
+            ("a\n", "", "A\n", ""),
+        ] {
+            assert_eq!(merge3(base, disk, ours).text, expected);
+        }
     }
 
     #[test]

@@ -171,7 +171,9 @@ impl Workspace {
     }
 
     fn select_period(&mut self, view: PaneView, day: NaiveDate, cx: &mut Context<Self>) {
-        self.flush_note_editor(cx);
+        if !self.flush_note_editor(cx) {
+            return;
+        }
         // The mini calendar reads cal_offset in the shown view's unit
         // (months over days and weeks, years over months), so a stale
         // offset from another view kind would land somewhere surprising.
@@ -187,7 +189,9 @@ impl Workspace {
 
     pub fn open_note(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let was_open = self.view == PaneView::Note(path.clone());
-        self.flush_note_editor(cx);
+        if !self.flush_note_editor(cx) {
+            return;
+        }
         // The flush may have just renamed this very note to its typed title
         // (a click on its not-yet-refreshed tree row): follow the rename
         // rather than reopening the stale path as a fresh empty note.
@@ -202,7 +206,9 @@ impl Workspace {
     }
 
     pub fn open_task_view(&mut self, query: TaskQuery, cx: &mut Context<Self>) {
-        self.flush_note_editor(cx);
+        if !self.flush_note_editor(cx) {
+            return;
+        }
         self.view = PaneView::Tasks(query);
         self.show_note_pane();
         self.reload_notes(cx);
@@ -213,20 +219,24 @@ impl Workspace {
     /// write the single-buffer editor's pending edits now, then let a
     /// freshly created untitled note's filename catch up with its typed
     /// title. A no-op when the editor is clean or absent.
-    pub(crate) fn flush_note_editor(&mut self, cx: &mut Context<Self>) {
-        self.save_note_editor(cx);
+    pub(crate) fn flush_note_editor(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.save_note_editor(cx) {
+            return false;
+        }
         self.save_library_text(cx);
         if let Some(path) = self.note_editor.as_ref().map(|e| e.read(cx).path.clone()) {
             self.rename_note_to_title(path, cx);
         }
+        true
     }
 
     /// The save half of a flush, without the title rename: for callers about
     /// to trash or rename the file at a path they are holding on to.
-    pub(crate) fn save_note_editor(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn save_note_editor(&mut self, cx: &mut Context<Self>) -> bool {
         if let Some(editor) = &self.note_editor {
-            editor.update(cx, |ed, cx| ed.save_now(cx));
+            return editor.update(cx, |ed, cx| ed.save_now(cx));
         }
+        true
     }
 
     /// Keep the single-buffer editor entity in step with the pane's document
@@ -244,6 +254,9 @@ impl Workspace {
         use crate::note_editor::{NoteEditor, NoteEditorEvent};
 
         if self.doc_error.is_some() || self.root_missing {
+            if self.note_editor.as_ref().is_some_and(|ed| ed.read(cx).is_dirty()) {
+                return;
+            }
             self.note_editor = None;
             self._note_editor_sub = None;
             return;
@@ -277,8 +290,22 @@ impl Workspace {
                     this.reload_notes(cx);
                     cx.notify();
                 }
-                NoteEditorEvent::Conflicts(path, conflicts) => {
-                    this.orphaned = Some((path.clone(), conflicts.join("\n")));
+                NoteEditorEvent::ConflictSaved(copy) => {
+                    this.note_self_write(copy);
+                    this.reload_notes(cx);
+                    cx.notify();
+                }
+                NoteEditorEvent::SaveFailed => {
+                    if let Some(error) = this.note_editor.as_ref()
+                        .and_then(|ed| ed.read(cx).save_error.clone())
+                        && let Some(win) = cx.active_window()
+                    {
+                        cx.defer(move |cx| {
+                            let _ = win.update(cx, |_, window, cx| {
+                                window.push_notification(error, cx);
+                            });
+                        });
+                    }
                     cx.notify();
                 }
                 NoteEditorEvent::OpenWikiLink(title) => {
@@ -649,7 +676,9 @@ impl Workspace {
         let Some(path) = self.doc_path.clone() else { return };
         // Pending editor keystrokes reach the file first so the rewrite
         // lands on what's actually on screen.
-        self.flush_note_editor(cx);
+        if !self.flush_note_editor(cx) {
+            return;
+        }
         match notes::replace_line_on_disk(&path, drag.line_idx, &drag.expected, &new_line) {
             Ok(Some(idx)) => {
                 self.note_self_write(&path);
@@ -758,8 +787,10 @@ impl Workspace {
     /// than guess.
     pub(crate) fn vault_undo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use crate::history::VaultOp;
+        if !self.flush_note_editor(cx) {
+            return;
+        }
         let Some(op) = self.vault_history.pop_undo() else { return };
-        self.flush_note_editor(cx);
         match op {
             VaultOp::Transfer { ms, from, to, block, from_line_idx, to_line_idx } => {
                 match notes::remove_block_lines(&to, &block) {
@@ -850,8 +881,10 @@ impl Workspace {
     /// verification contract as [`Self::vault_undo`].
     pub(crate) fn vault_redo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use crate::history::VaultOp;
+        if !self.flush_note_editor(cx) {
+            return;
+        }
         let Some(op) = self.vault_history.pop_redo() else { return };
-        self.flush_note_editor(cx);
         match op {
             VaultOp::Transfer { ms, from, to, block, from_line_idx, to_line_idx } => {
                 match notes::remove_block_lines(&from, &block) {
@@ -969,7 +1002,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.flush_note_editor(cx);
+        if !self.flush_note_editor(cx) {
+            return;
+        }
         self.view = PaneView::Library(path.clone());
         self.show_note_pane();
         // Text files get their editor here, where a Window exists to build
@@ -1185,6 +1220,11 @@ impl Workspace {
     /// files on disk are untouched. A library file on screen drops back to
     /// the day view rather than showing a path the sidebar no longer owns.
     pub fn remove_library_root(&mut self, root: &Path, cx: &mut Context<Self>) {
+        if matches!(&self.view, PaneView::Library(p) if p.starts_with(root))
+            && !self.flush_note_editor(cx)
+        {
+            return;
+        }
         let resolved = self.settings.library_roots();
         let Some(idx) = resolved.iter().position(|r| r == root) else { return };
         self.settings.library_roots.remove(idx);
@@ -1193,7 +1233,6 @@ impl Workspace {
         }
         self.library_expanded.retain(|p| !p.starts_with(root));
         if matches!(&self.view, PaneView::Library(p) if p.starts_with(root)) {
-            self.flush_note_editor(cx);
             self.view = PaneView::Day;
         }
         self.rearm_library_watchers(cx);
@@ -1291,7 +1330,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.flush_note_editor(cx);
+        if !self.flush_note_editor(cx) {
+            return;
+        }
         self.save_library_text(cx);
         match notes::rename_library_path(path, name) {
             Ok(new_path) => self.relocate_library_path(path, &new_path, window, cx),
@@ -1336,7 +1377,9 @@ impl Workspace {
         if !Self::can_move_into(&src, &dest_dir) {
             return;
         }
-        self.flush_note_editor(cx);
+        if !self.flush_note_editor(cx) {
+            return;
+        }
         self.save_library_text(cx);
         match notes::move_library_path(&src, &dest_dir) {
             Ok(new_path) => {
@@ -1417,7 +1460,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.flush_note_editor(cx);
+        if !self.flush_note_editor(cx) {
+            return;
+        }
         self.save_library_text(cx);
         match os_trash(path) {
             Ok(()) => {
@@ -1570,10 +1615,8 @@ impl Workspace {
         };
         // For a day with no file yet, check where the file would be: the
         // conflicted copy of a note that vanished is exactly the case that
-        // needs surfacing. Library files stay out: resolving a conflict
-        // trashes into the vault, which must never touch external trees.
+        // needs surfacing.
         let conflict_probe = match &self.view {
-            PaneView::Library(_) => None,
             PaneView::Day => path
                 .clone()
                 .or_else(|| Some(notes::daily_path(&self.notes_root, self.selected_day))),
@@ -1654,7 +1697,9 @@ impl Workspace {
     /// to the day view.
     pub fn trash_note_at(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
         // Save without the title rename: `path` must still name the file.
-        self.save_note_editor(cx);
+        if !self.save_note_editor(cx) {
+            return;
+        }
         match notes::trash_note(&self.notes_root, path) {
             Ok(_) => {
                 if self.view == PaneView::Note(path.to_path_buf()) {
@@ -1677,7 +1722,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         // Save without the title rename: `path` must still name the file.
-        self.save_note_editor(cx);
+        if !self.save_note_editor(cx) {
+            return;
+        }
         match notes::rename_note(path, new_stem) {
             Ok(new_path) => {
                 if self.view == PaneView::Note(path.to_path_buf()) {
@@ -1705,7 +1752,9 @@ impl Workspace {
             return;
         }
         // Save without the title rename: `src` must still name the file.
-        self.save_note_editor(cx);
+        if !self.save_note_editor(cx) {
+            return;
+        }
         match notes::move_note(&src, &dest_dir) {
             Ok(new_path) => {
                 self.vault_history.push(crate::history::VaultOp::PathMove {
@@ -1766,6 +1815,9 @@ impl Workspace {
     /// title — the file takes that name at the next flush (see
     /// [`Self::rename_note_to_title`]). No name prompt: NotePlan-style.
     pub fn create_new_note(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.flush_note_editor(cx) {
+            return;
+        }
         match notes::new_untitled_note_in(&dir) {
             Ok(path) => {
                 self.note_self_write(&path);
@@ -1890,13 +1942,14 @@ impl Workspace {
         self.flush_note_editor(cx);
     }
 
-    /// Dismiss the orphaned-line banner, optionally appending its text to
-    /// the note it was bound for so nothing typed is lost.
     /// Resolve a sync conflict, keeping either the current note or the
     /// conflict copy. The losing file moves to `Notes/@Trash/` (nothing is
     /// destroyed); adopting the copy renames it into the note's place, and
     /// the file watcher plus reload pick the new content up everywhere.
     pub fn resolve_conflict(&mut self, copy: &Path, keep_copy: bool, cx: &mut Context<Self>) {
+        if !self.save_note_editor(cx) {
+            return;
+        }
         let result = if keep_copy {
             match notes::conflict_owner(copy) {
                 Some(owner) => notes::adopt_conflict_copy(&self.notes_root, &owner, copy),
@@ -1927,20 +1980,6 @@ impl Workspace {
             Some(date) => self.select_day(date, cx),
             None => self.open_note(owner.to_path_buf(), cx),
         }
-    }
-
-    pub fn resolve_orphan(&mut self, append: bool, cx: &mut Context<Self>) {
-        let Some((path, text)) = self.orphaned.take() else { return };
-        if append {
-            if let Err(e) = notes::append_line(&path, &text) {
-                eprintln!("kairn: could not save {}: {e}", path.display());
-                self.orphaned = Some((path, text));
-                return;
-            }
-            self.note_self_write(&path);
-            self.reload_notes(cx);
-        }
-        cx.notify();
     }
 
     /// Watch the notes root recursively; any change outside `.kairn/` reloads
