@@ -225,16 +225,31 @@ impl VaultIo {
         content: &[u8],
         before: &BeforeWrite,
     ) -> io::Result<VaultPath> {
+        let original_abs = self.abs(original);
+        for existing in kairn_core::conflict_copies(&original_abs) {
+            if existing.extension() != original_abs.extension() {
+                continue;
+            }
+            let _lock = kairn_core::NoteLock::acquire(&existing)?;
+            if read_opt_abs(&existing)?.as_deref() == Some(content) {
+                sync_copy(&existing)?;
+                if let Some(copy) = self.rel_of(&existing) {
+                    return Ok(copy);
+                }
+            }
+        }
         let now = Local::now();
         for nth in 1..=1000 {
             let copy = self.conflict_copy_path(original, now, nth);
             if self.write(&copy, content, &Precondition::Absent, before)? {
+                sync_copy(&self.abs(&copy))?;
                 return Ok(copy);
             }
             // A copy already sitting there with exactly this text *is* this
             // copy: a retried resolution should not leave the same losing text
             // twice over.
             if read_opt_abs(&self.abs(&copy))?.as_deref() == Some(content) {
+                sync_copy(&self.abs(&copy))?;
                 return Ok(copy);
             }
         }
@@ -348,6 +363,15 @@ impl VaultIo {
         }
         Some(VaultPath(parts.join("/")))
     }
+}
+
+fn sync_copy(path: &Path) -> io::Result<()> {
+    std::fs::File::open(path)?.sync_all()?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn read_opt_abs(path: &Path) -> io::Result<Option<Vec<u8>>> {
@@ -620,6 +644,19 @@ mod tests {
             kairn_core::conflict_copies(&s.0.join("Notes/a.md")).len(),
             2
         );
+    }
+
+    #[test]
+    fn conflict_copy_reuse_survives_a_restart_and_a_different_timestamp() {
+        let s = Scratch::new("cc-restart");
+        let original = VaultPath::new("Notes/a.md");
+        let io = VaultIo::new(&s.0, "MAC");
+        let old = io.conflict_copy_path(&original,
+            Local.with_ymd_and_hms(2020, 1, 2, 3, 4, 5).unwrap(), 1);
+        io.write(&old, b"local\n", &Precondition::Absent, &*noop()).unwrap();
+        let restarted = VaultIo::new(&s.0, "MAC");
+        assert_eq!(restarted.write_conflict_copy(&original, b"local\n", &*noop()).unwrap(), old);
+        assert_eq!(restarted.scan().unwrap().len(), 1);
     }
 
     #[test]

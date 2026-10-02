@@ -20,6 +20,8 @@ restating the same fact twice; no em dashes. Rewrite to this standard before rel
 
 ## Fixed
 
+- Sync preserves conflict copies before replacing notes and reuses them when a failed sync is retried.
+
 - App, CLI and sync writes share a lock across reading and replacement; busy files refuse the write for retry.
 
 <!-- Bugs that no longer happen. -->

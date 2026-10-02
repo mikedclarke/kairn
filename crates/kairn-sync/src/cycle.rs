@@ -283,13 +283,13 @@ fn apply_entry(
             content,
             conflict_copy,
         } => {
+            let copy = ctx
+                .vault
+                .write_conflict_copy(path, &conflict_copy, &announce)?;
             if !ctx.vault.write(path, &content, &pre, &announce)? {
                 changed_underneath(ctx, path);
                 return Ok(());
             }
-            let copy = ctx
-                .vault
-                .write_conflict_copy(path, &conflict_copy, &announce)?;
             (ctx.emit)(SyncEvent::ConflictCopyCreated {
                 original: path.clone(),
                 copy,
@@ -457,12 +457,12 @@ fn apply_push_resolution(
             content,
             conflict_copy,
         } => {
-            if !ctx.vault.write(path, &content, pre, announce)? {
-                return Ok(None);
-            }
             let copy = ctx
                 .vault
                 .write_conflict_copy(path, &conflict_copy, announce)?;
+            if !ctx.vault.write(path, &content, pre, announce)? {
+                return Ok(None);
+            }
             (ctx.emit)(SyncEvent::ConflictCopyCreated {
                 original: path.clone(),
                 copy,
@@ -909,6 +909,91 @@ mod tests {
     impl Drop for Device {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn conflict_copy_failure_leaves_the_original_and_baseline_intact() {
+        for push_side in [false, true] {
+            let server = FakeServer::new();
+            let local = Device::new(&server, "copy-failure");
+            let path = VaultPath::new("Notes/example.md");
+            local.write(&path.0, "local\n");
+            local.state.record_synced(&path, 0, b"base\n", true).unwrap();
+            local.client.put_blob(&path, 0, &hash_bytes(b"remote\n"), b"remote\n").unwrap();
+            let entry = local.client.changes(0, 10).unwrap().entries.remove(0);
+            let blocked = RefCell::new(None);
+            let emit = |event| {
+                if let SyncEvent::AboutToWrite(copy) = event {
+                    assert!(copy.0.contains(".sync-conflict-"));
+                    let dest = local.root.join(copy.0);
+                    std::fs::create_dir(&dest).unwrap();
+                    *blocked.borrow_mut() = Some(dest);
+                }
+            };
+            let config = SyncConfig::default();
+            let ctx = SyncContext {
+                transport: local.client.as_ref(), state: &local.state, vault: &local.vault,
+                emit: &emit, config: &config, cancel: &|| false,
+            };
+            let mut report = CycleReport::default();
+            let result = if push_side {
+                apply_push_resolution(&ctx, &path,
+                    resolve_change(&path, Some(b"base\n"), b"remote\n", b"local\n"),
+                    b"remote\n", entry.rev, &Precondition::Unchanged(hash_bytes(b"local\n")),
+                    &ctx.announce(), &mut report).map(|_| ())
+            } else {
+                apply_entry(&ctx, &entry, &mut report)
+            };
+            assert!(result.is_err());
+            assert_eq!(local.read(&path.0).as_deref(), Some("local\n"));
+            assert_eq!(local.state.file_state(&path).unwrap().unwrap().rev, 0);
+            std::fs::remove_dir(blocked.borrow().as_ref().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn conflict_retry_reuses_the_durable_copy_after_original_write_refusal() {
+        for push_side in [false, true] {
+            let server = FakeServer::new();
+            let local = Device::new(&server, "copy-retry");
+            let path = VaultPath::new("Notes/example.md");
+            local.write(&path.0, "local\n");
+            local.state.record_synced(&path, 0, b"base\n", true).unwrap();
+            local.client.put_blob(&path, 0, &hash_bytes(b"remote\n"), b"remote\n").unwrap();
+            let entry = local.client.changes(0, 10).unwrap().entries.remove(0);
+            let held = RefCell::new(None);
+            let emit = |event| {
+                if let SyncEvent::AboutToWrite(copy) = event
+                    && copy.0.contains(".sync-conflict-")
+                {
+                    *held.borrow_mut() = Some(kairn_core::NoteLock::acquire(&local.root.join(&path.0)).unwrap());
+                }
+            };
+            let config = SyncConfig::default();
+            let mut ctx = SyncContext {
+                transport: local.client.as_ref(), state: &local.state, vault: &local.vault,
+                emit: &emit, config: &config, cancel: &|| false,
+            };
+            let apply = |ctx: &SyncContext| {
+                let mut report = CycleReport::default();
+                if push_side {
+                    apply_push_resolution(ctx, &path,
+                        resolve_change(&path, Some(b"base\n"), b"remote\n", b"local\n"),
+                        b"remote\n", entry.rev, &Precondition::Unchanged(hash_bytes(b"local\n")),
+                        &ctx.announce(), &mut report).map(|_| ())
+                } else {
+                    apply_entry(ctx, &entry, &mut report)
+                }
+            };
+            assert!(apply(&ctx).is_err());
+            assert_eq!(local.read(&path.0).as_deref(), Some("local\n"));
+            assert_eq!(local.conflict_copies(&path.0), vec!["local\n"]);
+            held.borrow_mut().take();
+            ctx.emit = &|_| {};
+            apply(&ctx).unwrap();
+            assert_eq!(local.read(&path.0).as_deref(), Some("remote\n"));
+            assert_eq!(local.conflict_copies(&path.0), vec!["local\n"]);
         }
     }
 
