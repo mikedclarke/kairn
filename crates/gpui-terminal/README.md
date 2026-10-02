@@ -9,6 +9,8 @@ top of upstream:
   screen, local scrollback otherwise; typing snaps back to the live view.
 - The renderer honours `display_offset`, so scrollback is actually visible
   while scrolled, and the cursor shifts/hides with the scrolled viewport.
+- Output and lifecycle events are processed even while the terminal is hidden;
+  construction takes its owning window. Pending output is bounded to 32 chunks.
 
 Worth offering upstream once battle-tested.
 
@@ -36,7 +38,7 @@ use gpui_terminal::{TerminalConfig, TerminalView, ColorPalette};
 
 // Create terminal with PTY reader/writer
 let terminal = cx.new(|cx| {
-    TerminalView::new(pty_writer, pty_reader, config, cx)
+    TerminalView::new(pty_writer, pty_reader, config, window, cx)
         .with_resize_callback(|cols, rows| {
             // Notify PTY of size change
         })

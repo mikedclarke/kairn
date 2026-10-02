@@ -96,8 +96,7 @@ pub struct GpuiEventProxy {
 
     /// PTY writer and palette for answering terminal queries (cursor
     /// position, device attributes, color queries) directly. Responses
-    /// bypass the event channel: applications block waiting for them, and
-    /// the channel is only drained on render.
+    /// bypass the event channel because applications block waiting for them.
     responder: Option<(PtyWriter, SharedPalette)>,
 }
 

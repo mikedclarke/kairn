@@ -2,10 +2,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use gpui::{AppContext, ClipboardItem, Context, Edges, Entity, SharedString, WeakEntity, px};
+use gpui::{AppContext, ClipboardItem, Context, Edges, Entity, SharedString, Task, WeakEntity, Window, px};
 use gpui_terminal::{TerminalConfig, TerminalView};
 use parking_lot::Mutex;
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use kairn_core::settings::{HostApp, SshHost};
 use crate::theme::KairnThemeExt as _;
@@ -44,7 +44,8 @@ pub struct Session {
     pub busy: bool,
     pub view: Entity<TerminalView>,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+    killer: Box<dyn ChildKiller + Send + Sync>,
+    _exit_task: Task<()>,
     shell_pid: Option<u32>,
 }
 
@@ -73,13 +74,9 @@ impl Session {
         }
     }
 
-    /// Force-quit the session's process. The PTY reader then sees EOF and the
-    /// exit callback removes the session from the workspace, the same path an
-    /// ordinary `exit` takes.
-    pub fn terminate(&self) {
-        let mut child = self.child.lock();
-        let _ = child.kill();
-        let _ = child.wait();
+    /// Signal the child; the background wait removes the session after it exits.
+    pub fn terminate(&mut self) {
+        let _ = self.killer.kill();
     }
 }
 
@@ -149,6 +146,7 @@ pub fn spawn(
     id: u64,
     kind: SessionKind,
     workspace: WeakEntity<Workspace>,
+    window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Result<Session> {
     let (term_colors, mono_font) = {
@@ -172,7 +170,7 @@ pub fn spawn(
         cmd.cwd(home);
     }
 
-    let child = pair
+    let mut child = pair
         .slave
         .spawn_command(cmd)
         .context("failed to spawn command in PTY")?;
@@ -182,7 +180,7 @@ pub fn spawn(
     let writer = pair.master.take_writer().context("PTY writer")?;
     let reader = pair.master.try_clone_reader().context("PTY reader")?;
     let master = Arc::new(Mutex::new(pair.master));
-    let child = Arc::new(Mutex::new(child));
+    let killer = child.clone_killer();
 
     let config = TerminalConfig {
         font_family: mono_font,
@@ -201,12 +199,13 @@ pub fn spawn(
     };
 
     let resize_master = master.clone();
-    let exit_child = child.clone();
-    let exit_workspace = workspace.clone();
-    let title_workspace = workspace;
+    let title_workspace = workspace.clone();
+    let clipboard_workspace = workspace.clone();
 
     let view = cx.new(|cx| {
-        TerminalView::new(writer, reader, config, cx)
+        let terminal = TerminalView::new(writer, reader, config, window, cx);
+        let focus = terminal.focus_handle().clone();
+        terminal
             .with_resize_callback(move |cols, rows| {
                 if let Err(e) = resize_master.lock().resize(PtySize {
                     cols: cols as u16,
@@ -226,16 +225,29 @@ pub fn spawn(
             // OSC 52: applications copy through the terminal (herdr's
             // copy, tmux/vim yanks over SSH). Without this the copy
             // silently does nothing.
-            .with_clipboard_store_callback(|_window, cx, text| {
-                cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
-            })
-            .with_exit_callback(move |window, cx| {
-                // Reap here so the dead shell doesn't linger as a zombie.
-                let _ = exit_child.lock().wait();
-                let _ = exit_workspace.update(cx, |ws, cx| {
-                    ws.handle_session_exit(id, window, cx);
+            .with_clipboard_store_callback(move |window, cx, text| {
+                let visible = clipboard_workspace.upgrade().is_some_and(|workspace| {
+                    workspace.read(cx).session_visible(id)
                 });
+                if visible && window.is_window_active() && focus.is_focused(window) {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+                }
             })
+    });
+
+    let (exit_tx, exit_rx) = futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = exit_tx.send(child.wait());
+    });
+    let exit_task = cx.spawn_in(window, async move |_, cx| {
+        if let Ok(result) = exit_rx.await {
+            if let Err(error) = result {
+                eprintln!("kairn: could not reap terminal process: {error}");
+            }
+            let _ = workspace.update_in(cx, |ws, window, cx| {
+                ws.handle_session_exit(id, window, cx);
+            });
+        }
     });
 
     Ok(Session {
@@ -246,7 +258,8 @@ pub fn spawn(
         title: SharedString::default(),
         view,
         master,
-        child,
+        killer,
+        _exit_task: exit_task,
         shell_pid,
     })
 }

@@ -436,7 +436,7 @@ impl Workspace {
         let id = self.next_session_id;
         self.next_session_id += 1;
         let weak = cx.weak_entity();
-        match spawn(id, kind, weak, cx) {
+        match spawn(id, kind, weak, window, cx) {
             Ok(session) => {
                 self.sessions.push(session);
                 self.activate_session(self.sessions.len() - 1, window, cx);
@@ -466,10 +466,9 @@ impl Workspace {
         }
     }
 
-    /// Close a session from the sidebar menu: kill its process and let the
-    /// exit callback (the same path `exit` takes) remove it and fix focus.
+    /// Signal the process; the child wait task removes the session on exit.
     pub fn close_session(&mut self, idx: usize) {
-        if let Some(session) = self.sessions.get(idx) {
+        if let Some(session) = self.sessions.get_mut(idx) {
             session.terminate();
         }
     }
@@ -482,12 +481,26 @@ impl Workspace {
             }
     }
 
+    pub(crate) fn session_visible(&self, id: u64) -> bool {
+        self.settings.sessions_enabled
+            && self.layout.shows_terminal()
+            && self.settings_view.is_none()
+            && self.overlay.is_none()
+            && self.sessions.get(self.active_session).is_some_and(|session| session.id == id)
+    }
+
     pub fn handle_session_exit(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        self.sessions.retain(|s| s.id != id);
-        if self.active_session >= self.sessions.len() {
-            self.active_session = self.sessions.len().saturating_sub(1);
+        let active_id = self.sessions.get(self.active_session).map(|session| session.id);
+        let focus_next = active_id == Some(id)
+            && self.session_visible(id)
+            && self.sessions[self.active_session].view.read(cx).focus_handle().is_focused(window);
+        self.sessions.retain(|session| session.id != id);
+        self.active_session = active_id
+            .and_then(|active| self.sessions.iter().position(|session| session.id == active))
+            .unwrap_or_else(|| self.active_session.min(self.sessions.len().saturating_sub(1)));
+        if focus_next {
+            self.focus_active_terminal(window, cx);
         }
-        self.focus_active_terminal(window, cx);
         cx.notify();
     }
 
