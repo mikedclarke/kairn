@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
@@ -75,6 +75,8 @@ struct Inner {
     state: StateStore,
     vault: VaultIo,
     transport: Box<dyn Transport>,
+    next_full_scan: Instant,
+    _vault_lock: std::fs::File,
 }
 
 /// Everything a cycle needs that outlives one call, shared with the worker
@@ -88,6 +90,7 @@ struct Shared {
     config: SyncConfig,
     /// Set by `stop()`, checked by the cycle between transport calls.
     cancel: AtomicBool,
+    invalidate_scan: AtomicBool,
 }
 
 struct Worker {
@@ -135,6 +138,7 @@ impl SyncEngine {
             config.vault_id.as_deref(),
         )?;
         let vault = VaultIo::new(&config.vault_root, &config.device_label);
+        let vault_lock = vault.lock_engine()?;
         let remote_wake = config.remote_wake.clone();
         Ok(Self {
             shared: Arc::new(Shared {
@@ -142,6 +146,8 @@ impl SyncEngine {
                     state,
                     vault,
                     transport,
+                    next_full_scan: Instant::now(),
+                    _vault_lock: vault_lock,
                 }),
                 status: Mutex::new(SyncStatus::default()),
                 emit: on_event,
@@ -149,6 +155,7 @@ impl SyncEngine {
                     allow_bulk_delete: config.allow_bulk_delete,
                 },
                 cancel: AtomicBool::new(false),
+                invalidate_scan: AtomicBool::new(true),
             }),
             worker: Mutex::new(None),
             vault_root: config.vault_root,
@@ -161,7 +168,13 @@ impl SyncEngine {
     /// server), so never call it on a UI thread. Safe from any other thread, and
     /// while the background worker is running: cycles are serialised.
     pub fn sync_now(&self) -> Result<CycleReport> {
-        run_once(&self.shared)
+        run_once(&self.shared, true)
+    }
+
+    /// Run a periodic cycle, reusing hashes until metadata changes or the
+    /// safety deadline expires. Explicit user requests should use `sync_now`.
+    pub fn poll(&self) -> Result<CycleReport> {
+        run_once(&self.shared, false)
     }
 
     /// A snapshot of engine state for the host UI (spec §14).
@@ -181,6 +194,7 @@ impl SyncEngine {
         }
         *self.wake.0.lock().unwrap() = WakeState::default();
         self.shared.cancel.store(false, Ordering::SeqCst);
+        self.shared.invalidate_scan.store(true, Ordering::SeqCst);
         let shared = self.shared.clone();
         let wake = self.wake.clone();
         let root = self.vault_root.clone();
@@ -219,9 +233,14 @@ impl Drop for SyncEngine {
 /// Run one cycle under the cycle lock, fold the outcome into `status`, then
 /// deliver the terminal event with both locks released, so a listener that calls
 /// straight back into the engine cannot deadlock.
-fn run_once(shared: &Shared) -> Result<CycleReport> {
-    let result = {
-        let guard = shared.inner.lock().unwrap();
+fn run_once(shared: &Shared, force_scan: bool) -> Result<CycleReport> {
+    let result = (|| {
+        let mut guard = shared.inner.lock().unwrap();
+        let invalidated = shared.invalidate_scan.swap(false, Ordering::SeqCst);
+        if force_scan || invalidated || Instant::now() >= guard.next_full_scan {
+            guard.next_full_scan = Instant::now() + SAFETY_INTERVAL;
+            guard.state.clear_scan_cache()?;
+        }
         let cancel = || shared.cancel.load(Ordering::SeqCst);
         let ctx = SyncContext {
             transport: guard.transport.as_ref(),
@@ -232,7 +251,7 @@ fn run_once(shared: &Shared) -> Result<CycleReport> {
             cancel: &cancel,
         };
         run_cycle(&ctx)
-    };
+    })();
     let event = {
         let mut s = shared.status.lock().unwrap();
         match &result {
@@ -262,7 +281,7 @@ fn worker_loop(
     // The watcher lives for the thread's lifetime and is dropped (unwatched)
     // when the loop exits. On iOS it is never built (no persistent watcher).
     #[cfg(not(target_os = "ios"))]
-    let _watcher = make_watcher(&root, wake.clone());
+    let _watcher = make_watcher(&root, shared.clone(), wake.clone());
     #[cfg(target_os = "ios")]
     let _ = &root;
 
@@ -282,7 +301,9 @@ fn worker_loop(
     let _ = remote;
 
     loop {
-        let _ = run_once(&shared);
+        let _ = run_once(&shared, false);
+        let until_scan = shared.inner.lock().unwrap().next_full_scan
+            .saturating_duration_since(Instant::now());
         let (lock, cvar) = &*wake;
         let mut g = lock.lock().unwrap();
         if g.stop {
@@ -291,7 +312,7 @@ fn worker_loop(
         // A change that arrived during the cycle just run isn't lost: skip the
         // wait and run again now. Otherwise wait for the watcher or safety timer.
         if !g.pending {
-            let (next, _timeout) = cvar.wait_timeout(g, SAFETY_INTERVAL).unwrap();
+            let (next, _timeout) = cvar.wait_timeout(g, until_scan).unwrap();
             g = next;
         }
         if g.stop {
@@ -311,11 +332,17 @@ fn worker_loop(
 #[cfg(not(target_os = "ios"))]
 fn make_watcher(
     root: &std::path::Path,
+    shared: Arc<Shared>,
     wake: Arc<(Mutex<WakeState>, Condvar)>,
 ) -> Option<notify::RecommendedWatcher> {
     use notify::{RecursiveMode, Watcher};
+    let watched_root = root.to_path_buf();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if res.is_ok() {
+        if match res {
+            Ok(event) => watch_event_relevant(&watched_root, &event),
+            Err(_) => true,
+        } {
+            shared.invalidate_scan.store(true, Ordering::SeqCst);
             // Record that a change happened, then wake the worker. The flag is
             // what makes the wake survive if the worker is mid-cycle.
             let (lock, cvar) = &*wake;
@@ -326,6 +353,17 @@ fn make_watcher(
     .ok()?;
     watcher.watch(root, RecursiveMode::Recursive).ok()?;
     Some(watcher)
+}
+
+#[cfg(not(target_os = "ios"))]
+fn watch_event_relevant(root: &std::path::Path, event: &notify::Event) -> bool {
+    if matches!(event.kind, notify::EventKind::Access(_)) {
+        return false;
+    }
+    event.need_rescan() || event.paths.is_empty() || event.paths.iter().any(|path| {
+        path.strip_prefix(root).ok().and_then(|path| path.to_str())
+            .is_none_or(|path| !crate::ignore::is_ignored(&crate::types::VaultPath::new(path)))
+    })
 }
 
 #[cfg(test)]
@@ -493,6 +531,116 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(err.contains("already running"), "{err}");
+    }
+
+    #[test]
+    fn vault_ownership_does_not_depend_on_the_state_database() {
+        let server = FakeServer::new();
+        let first = Fixture::new("owner");
+        let second = Fixture::new("other-db");
+        let engine = first.engine(&server, "one");
+        let error = second.try_engine(&server, "two", &first.root).err().unwrap();
+        assert!(error.to_string().contains("already running"), "{error}");
+        drop(engine);
+        assert!(second.try_engine(&server, "two", &first.root).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_vault_alias_cannot_bypass_ownership() {
+        let server = FakeServer::new();
+        let first = Fixture::new("owner-alias");
+        let second = Fixture::new("alias-db");
+        let alias = second.root.join("alias");
+        std::os::unix::fs::symlink(&first.root, &alias).unwrap();
+        let _engine = first.engine(&server, "one");
+        let error = second.try_engine(&server, "two", &alias).err().unwrap();
+        assert!(error.to_string().contains("already running"), "{error}");
+    }
+
+    #[test]
+    fn full_scans_detect_edits_with_preserved_size_and_timestamp() {
+        use std::fs::{File, FileTimes};
+        let server = FakeServer::new();
+        let fx = Fixture::new("rehash");
+        let path = fx.root.join("a.md");
+        let old_time = std::time::SystemTime::now() - Duration::from_secs(60);
+        let write = |text: &[u8]| {
+            std::fs::write(&path, text).unwrap();
+            File::open(&path).unwrap().set_times(FileTimes::new().set_modified(old_time)).unwrap();
+        };
+        write(b"first\n");
+        let mut engine = fx.engine(&server, "one");
+        assert_eq!(run_once(&engine.shared, false).unwrap().pushed, 1);
+        for (mode, content) in [b"other\n", b"third\n", b"again\n", b"final\n"].into_iter().enumerate() {
+            write(content);
+            assert_eq!(run_once(&engine.shared, false).unwrap().pushed, 0);
+            let report = match mode {
+                0 => engine.sync_now().unwrap(),
+                1 => {
+                    engine.shared.invalidate_scan.store(true, Ordering::SeqCst);
+                    run_once(&engine.shared, false).unwrap()
+                }
+                2 => {
+                    engine.shared.inner.lock().unwrap().next_full_scan = Instant::now();
+                    run_once(&engine.shared, false).unwrap()
+                }
+                _ => {
+                    drop(engine);
+                    engine = fx.engine(&server, "one");
+                    run_once(&engine.shared, false).unwrap()
+                }
+            };
+            assert_eq!(report.pushed, 1, "mode {mode}");
+            assert_eq!(server.head(&VaultPath::new("a.md")).unwrap().hash,
+                Some(crate::hash::hash_bytes(content)));
+        }
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn watcher_ignores_reads_and_private_lock_files() {
+        use notify::{Event, EventKind, event::{AccessKind, ModifyKind}};
+        let root = std::path::Path::new("vault");
+        for kind in [AccessKind::Any, AccessKind::Read, AccessKind::Open(notify::event::AccessMode::Read),
+            AccessKind::Close(notify::event::AccessMode::Write)] {
+            let event = Event::new(EventKind::Access(kind)).add_path(root.join("a.md"));
+            assert!(!watch_event_relevant(root, &event));
+        }
+        let changed = Event::new(EventKind::Modify(ModifyKind::Any));
+        assert!(!watch_event_relevant(root, &changed.clone().add_path(root.join(".sync-engine.kairn-lock"))));
+        assert!(!watch_event_relevant(root, &changed.clone().add_path(root.join(".kairn/local/state.db"))));
+        assert!(watch_event_relevant(root, &changed.clone().add_path(root.join("a.md"))));
+        assert!(watch_event_relevant(root, &changed));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inotify_reads_do_not_wake_sync_but_preserved_timestamp_edits_do() {
+        let server = FakeServer::new();
+        let fx = Fixture::new("inotify");
+        let path = fx.root.join("a.md");
+        std::fs::write(&path, b"first\n").unwrap();
+        let time = std::time::SystemTime::now() - Duration::from_secs(60);
+        let times = std::fs::FileTimes::new().set_modified(time);
+        std::fs::File::open(&path).unwrap().set_times(times).unwrap();
+        let engine = fx.engine(&server, "one");
+        engine.sync_now().unwrap();
+        let _watcher = make_watcher(&fx.root, engine.shared.clone(), engine.wake.clone()).unwrap();
+        for _ in 0..10 {
+            assert_eq!(std::fs::read(&path).unwrap(), b"first\n");
+            let _entries: Vec<_> = std::fs::read_dir(&fx.root).unwrap().collect();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!engine.wake.0.lock().unwrap().pending);
+        std::fs::write(&path, b"other\n").unwrap();
+        std::fs::File::open(&path).unwrap().set_times(times).unwrap();
+        for _ in 0..200 {
+            if engine.wake.0.lock().unwrap().pending { break; }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(engine.wake.0.lock().unwrap().pending);
+        assert_eq!(run_once(&engine.shared, false).unwrap().pushed, 1);
     }
 
     /// A journal-advance frame on the freshness socket wakes the worker into

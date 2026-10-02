@@ -109,7 +109,7 @@ fn main() -> Result<()> {
             server_url: Some(args.server.clone()),
             vault_id: Some(args.vault.clone()),
             allow_bulk_delete: args.allow_bulk_delete,
-            // The bridge drives its own sync_now() poll loop below rather than
+            // The bridge drives its own poll loop below rather than
             // the engine's worker, so the freshness socket has nothing to wake.
             remote_wake: None,
         },
@@ -165,7 +165,7 @@ fn main() -> Result<()> {
 
     let mut failures: u32 = 0;
     while running.load(Ordering::SeqCst) {
-        match engine.sync_now() {
+        match engine.poll() {
             Ok(report) => {
                 if failures > 0 {
                     log("recovered; back to the normal interval");

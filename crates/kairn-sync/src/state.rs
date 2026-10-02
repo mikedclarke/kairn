@@ -372,6 +372,11 @@ impl StateStore {
 
     // ---- scan memo -------------------------------------------------------
 
+    pub fn clear_scan_cache(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM scan_cache", [])?;
+        Ok(())
+    }
+
     /// Drop memo rows for paths no longer in the vault, so the memo can't grow
     /// without bound across a vault's lifetime of renames and deletes.
     pub fn prune_scan_cache(&self, keep: &HashSet<VaultPath>) -> Result<usize> {

@@ -136,6 +136,17 @@ impl VaultIo {
         vault_fs::parent(self.root_handle.as_ref().unwrap(), path, create)
     }
 
+    pub(crate) fn lock_engine(&self) -> io::Result<std::fs::File> {
+        self.validate_root()?;
+        vault_fs::lock(self.root_handle.as_ref().unwrap(), "sync-engine").map_err(|error| {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                io::Error::new(error.kind(), "a sync engine is already running for this vault")
+            } else {
+                error
+            }
+        })
+    }
+
     fn validate_parent(&self, path: &VaultPath, original: &Dir) -> io::Result<()> {
         let (current, _) = self.parent(path, false)?;
         if !vault_fs::same_directory(original, &current)? {
@@ -327,8 +338,8 @@ impl VaultIo {
 
     /// Walk the vault, returning every syncable file with its hash and size
     /// (spec §4 exclusions applied), re-hashing only files whose size or mtime
-    /// moved since `cache` last saw them. The startup and 30-minute safety scans
-    /// and the push scan all run through this.
+    /// moved since `cache` last saw them. The engine invalidates the cache on
+    /// filesystem changes, startup, explicit sync and its safety deadline.
     pub fn scan_cached(&self, cache: &dyn HashCache) -> io::Result<Vec<ScannedFile>> {
         self.validate_root()?;
         let mut out = Vec::new();
