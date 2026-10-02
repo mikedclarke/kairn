@@ -56,6 +56,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn block_offsets_inside_unicode_are_safe() {
+        for at in [1, 3, 4, 5, u64::MAX] {
+            let range = block_range("é😀".into(), at);
+            assert_eq!((range.start, range.end), (0, 6));
+        }
+    }
+
+    #[test]
     fn block_carries_deeper_indented_lines() {
         let text = "* parent\n    * child\nnext";
         let range = block_range(text.into(), 0);

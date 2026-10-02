@@ -95,7 +95,9 @@ pub fn retime_line(line: &str, start: NaiveTime, end: Option<NaiveTime>) -> Opti
             && let Some((end_ix, ..)) = parse::parse_time_token(line, i)
         {
             // A time-shaped path segment inside a URL is not a schedule.
-            let word_start = line[..i].rfind(char::is_whitespace).map_or(0, |w| w + 1);
+            let word_start = line[..i].char_indices().rev()
+                .find(|(_, ch)| ch.is_whitespace())
+                .map_or(0, |(offset, ch)| offset + ch.len_utf8());
             let word_end = line[i..]
                 .find(char::is_whitespace)
                 .map_or(line.len(), |w| i + w);
@@ -209,6 +211,14 @@ fn find_time(text: &str) -> Option<(Range<usize>, NaiveTime, Option<NaiveTime>)>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retime_accepts_unicode_whitespace() {
+        for space in ['\u{00a0}', '\u{2003}', '\u{202f}'] {
+            let line = format!("* call{space}09:00");
+            assert_eq!(retime_line(&line, t(10, 0), None), Some(format!("* call{space}10:00")));
+        }
+    }
 
     fn t(h: u32, m: u32) -> NaiveTime {
         NaiveTime::from_hms_opt(h, m, 0).expect("valid time")
@@ -325,4 +335,3 @@ mod tests {
         );
     }
 }
-

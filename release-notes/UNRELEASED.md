@@ -22,4 +22,6 @@ restating the same fact twice; no em dashes. Rewrite to this standard before rel
 
 <!-- Bugs that no longer happen. -->
 
+- Undoing a moved block after an external edit and handling Unicode text no longer cause note operations to panic.
+
 - Conflicting note edits are saved as recovery copies that survive closing the app, and simultaneous line insertions keep both additions.

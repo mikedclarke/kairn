@@ -22,7 +22,7 @@ pub fn line_indent_width(line: &str) -> usize {
 /// block of one. The end excludes the final newline.
 pub fn block_range(text: &str, at: usize) -> Range<usize> {
     let at = at.min(text.len());
-    let start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+    let start = text.as_bytes()[..at].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
     let first_end = text[start..].find('\n').map_or(text.len(), |i| start + i);
     let first = &text[start..first_end];
     if matches!(parse_line(first), Line::Heading { .. } | Line::Blank) {
@@ -64,7 +64,7 @@ pub fn selection_block_ranges(text: &str, sel: Range<usize>) -> Vec<Range<usize>
         return Vec::new();
     }
     let mut ranges = Vec::new();
-    let mut line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
+    let mut line_start = text.as_bytes()[..start].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
     // A selection ending exactly at a line start (triple-click style) does
     // not include that line.
     while line_start < end {
@@ -95,6 +95,9 @@ pub struct HeadingRef {
 /// boundary, not the content). The section runs to the next heading of the
 /// same or higher level.
 pub fn section_end_line(lines: &[&str], start: usize, level: u8) -> usize {
+    if start >= lines.len() {
+        return lines.len();
+    }
     let level_of = |line: &str| match parse_line(line) {
         Line::Heading { level, .. } => Some(level),
         _ => None,
@@ -144,6 +147,17 @@ pub fn note_headings(text: &str) -> Vec<HeadingRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_offsets_inside_unicode_stay_on_the_same_line() {
+        let text = "é😀\n    child\nnext";
+        for at in 0.."é😀".len() {
+            assert_eq!(block_range(text, at), 0..16);
+            assert_eq!(selection_block_ranges(text, at..at + 1), vec![0..16]);
+        }
+        assert_eq!(block_range(text, usize::MAX), 17..21);
+        assert_eq!(section_end_line(&["# Heading"], usize::MAX, 1), 1);
+    }
 
     #[test]
     fn indent_width_counts_tabs_as_four() {

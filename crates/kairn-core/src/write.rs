@@ -573,8 +573,8 @@ pub fn remove_block_lines(path: &Path, block: &str) -> io::Result<Option<usize>>
     if block_lines.is_empty() {
         return Ok(None);
     }
-    let mut starts = (0..=lines.len().saturating_sub(block_lines.len()))
-        .filter(|&i| lines[i..i + block_lines.len()] == block_lines[..]);
+    let mut starts = lines.windows(block_lines.len()).enumerate()
+        .filter_map(|(i, window)| (window == block_lines).then_some(i));
     let Some(idx) = starts.next() else {
         return Ok(None);
     };
@@ -1781,6 +1781,11 @@ mod tests {
         let bare = root.write("Calendar/20260807.md", "* a\n* b");
         assert_eq!(remove_block_lines(&bare, "* b").expect("io"), Some(1));
         assert_eq!(fs::read_to_string(&bare).expect("read"), "* a");
+        for text in ["", "* moved\n", "unrelated"] {
+            fs::write(&path, text).unwrap();
+            assert_eq!(remove_block_lines(&path, "* moved\n\tsub").unwrap(), None);
+            assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        }
     }
 
     #[test]
