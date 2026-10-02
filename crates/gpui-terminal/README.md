@@ -11,6 +11,9 @@ top of upstream:
   while scrolled, and the cursor shifts/hides with the scrolled viewport.
 - Output and lifecycle events are processed even while the terminal is hidden;
   construction takes its owning window. Pending output is bounded to 32 chunks.
+- PTY input and query replies use a worker with a 1 MiB / 128-operation queue.
+  Overflow rejects the whole operation and reports through `with_input_error_callback`.
+  Bracketed pastes strip ESC characters and enqueue both guards with the payload.
 
 Worth offering upstream once battle-tested.
 

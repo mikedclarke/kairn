@@ -50,12 +50,10 @@
 
 use crate::colors::ColorPalette;
 use alacritty_terminal::event::{Event, EventListener};
-use std::io::Write;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
-/// Shared handle to the PTY input, for writing query responses.
-pub type PtyWriter = Arc<parking_lot::Mutex<Box<dyn Write + Send>>>;
+pub use crate::pty_input::PtyWriter;
 
 /// Shared handle to the palette, for answering color queries after runtime
 /// config updates.
@@ -138,9 +136,7 @@ impl GpuiEventProxy {
     /// Write a query response to the PTY, if a responder is attached.
     fn respond(&self, bytes: &[u8]) {
         if let Some((writer, _)) = &self.responder {
-            let mut writer = writer.lock();
-            let _ = writer.write_all(bytes);
-            let _ = writer.flush();
+            let _ = writer.send(bytes);
         }
     }
 
@@ -222,7 +218,9 @@ impl EventListener for GpuiEventProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc::channel;
+    use std::io::Write;
+    use std::sync::mpsc::{channel, Receiver, Sender};
+    use std::time::Duration;
 
     #[test]
     fn test_event_proxy_creation() {
@@ -230,28 +228,23 @@ mod tests {
         let _proxy = GpuiEventProxy::new(tx);
     }
 
-    /// A writer that appends into a shared buffer, standing in for the PTY.
-    struct SinkWriter(Arc<parking_lot::Mutex<Vec<u8>>>);
+    struct SinkWriter(Sender<Vec<u8>>);
 
     impl Write for SinkWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().extend_from_slice(buf);
+            self.0.send(buf.to_vec()).unwrap();
             Ok(buf.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
     }
 
-    fn responder_proxy() -> (GpuiEventProxy, Arc<parking_lot::Mutex<Vec<u8>>>) {
+    fn responder_proxy() -> (GpuiEventProxy, Receiver<Vec<u8>>) {
         let (tx, _rx) = channel();
-        let sink = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let writer: PtyWriter = Arc::new(parking_lot::Mutex::new(
-            Box::new(SinkWriter(sink.clone())) as Box<dyn Write + Send>,
-        ));
+        let (sink, output) = channel();
+        let (writer, _errors) = PtyWriter::new(SinkWriter(sink));
         let palette: SharedPalette = Arc::new(parking_lot::Mutex::new(ColorPalette::default()));
         let proxy = GpuiEventProxy::new(tx).with_pty_responder(writer, palette);
-        (proxy, sink)
+        (proxy, output)
     }
 
     #[test]
@@ -263,7 +256,7 @@ mod tests {
         // reply.
         state.process_bytes(b"\x1b[6n");
 
-        assert_eq!(&*sink.lock(), b"\x1b[1;1R");
+        assert_eq!(sink.recv_timeout(Duration::from_secs(2)).unwrap(), b"\x1b[1;1R");
     }
 
     #[test]
@@ -274,7 +267,7 @@ mod tests {
         // OSC 11: query the background color (light/dark detection).
         state.process_bytes(b"\x1b]11;?\x07");
 
-        let response = sink.lock().clone();
+        let response = sink.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(
             response.starts_with(b"\x1b]11;rgb:"),
             "unexpected response: {response:?}"

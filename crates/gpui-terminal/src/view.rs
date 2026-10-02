@@ -23,7 +23,7 @@
 //! # Thread Safety
 //!
 //! - [`TerminalView`] itself is not `Send` (it contains GPUI handles)
-//! - The stdin writer is wrapped in `Arc<parking_lot::Mutex<>>` for thread-safe writes
+//! - PTY input is queued to a dedicated writer thread
 //! - Callbacks ([`ResizeCallback`], [`KeyHandler`]) must be `Send + Sync`
 //!
 //! # Example
@@ -50,6 +50,7 @@
 use crate::colors::ColorPalette;
 use crate::event::{GpuiEventProxy, TerminalEvent};
 use crate::input::keystroke_to_bytes;
+use crate::pty_input::PtyWriter;
 use crate::links::{URL_REGEX, link_at_point};
 use crate::render::TerminalRenderer;
 use crate::terminal::TerminalState;
@@ -339,6 +340,9 @@ pub type ClipboardStoreCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalV
 /// ```
 pub type ExitCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>)>;
 
+/// Reports rejected input or a failed PTY write.
+pub type InputErrorCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>, &str)>;
+
 /// The main terminal view component for GPUI applications.
 ///
 /// `TerminalView` is a GPUI entity that implements the [`Render`] trait,
@@ -385,8 +389,8 @@ pub type ExitCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>)>;
 ///
 /// # Thread Safety
 ///
-/// `TerminalView` is not `Send` as it contains GPUI handles. The stdin writer
-/// is internally wrapped in `Arc<parking_lot::Mutex<>>` for safe concurrent access.
+/// `TerminalView` is not `Send` as it contains GPUI handles. PTY input is
+/// queued to a dedicated writer thread.
 pub struct TerminalView {
     /// The terminal state managing the grid and VTE parser
     state: TerminalState,
@@ -398,7 +402,7 @@ pub struct TerminalView {
     focus_handle: FocusHandle,
 
     /// Writer for sending input to the terminal process
-    stdin_writer: Arc<parking_lot::Mutex<Box<dyn Write + Send>>>,
+    stdin_writer: PtyWriter,
 
     /// Palette shared with the event proxy, which answers color queries
     /// from it; kept in sync by `update_config`
@@ -413,6 +417,8 @@ pub struct TerminalView {
     /// Async task that reads bytes and notifies the view (push-based)
     #[allow(dead_code)]
     _reader_task: Task<()>,
+    _writer_task: Task<()>,
+    input_error_callback: Option<InputErrorCallback>,
 
     /// Callback to notify the PTY about size changes
     resize_callback: Option<Arc<ResizeCallback>>,
@@ -460,13 +466,8 @@ pub struct TerminalView {
     /// lookups (DFA construction is not free)
     url_regex: RegexSearch,
 
-    /// Focus listeners that forward focus in/out to applications that request
-    /// reporting (CSI ?1004); registered on first render, when a Window exists
+    /// Focus listeners for applications requesting CSI ?1004 reporting.
     focus_subscriptions: Vec<Subscription>,
-
-    /// Focus as of the last render, which picks the repaint interval (the
-    /// reader task has no Window to ask)
-    focused_at_render: bool,
 
     /// When PTY output last repainted, and the deferred repaint waiting for
     /// the interval to elapse, if one is pending
@@ -535,10 +536,20 @@ impl TerminalView {
             None => Box::new(stdout_reader),
         };
 
-        // Wrap stdin writer in Arc<Mutex> for thread-safe access. Created
-        // before the event proxy so the proxy can answer terminal queries
-        // (cursor position, color queries) directly on the PTY.
-        let stdin_writer = Arc::new(parking_lot::Mutex::new(stdin_writer));
+        let (stdin_writer, input_errors) = PtyWriter::new(stdin_writer);
+        let writer_task = cx.spawn_in(window, async move |this, cx| {
+            while let Ok(error) = input_errors.recv_async().await {
+                if this.update_in(cx, |view: &mut Self, window, cx| {
+                    if let Some(callback) = &view.input_error_callback {
+                        callback(window, cx, &error.to_string());
+                    } else {
+                        eprintln!("{error}");
+                    }
+                }).is_err() {
+                    break;
+                }
+            }
+        });
 
         // The palette is shared with the proxy so color queries stay correct
         // after runtime config updates.
@@ -576,6 +587,7 @@ impl TerminalView {
         // Spawn async task that awaits on the channel and notifies the view
         // This is push-based: the task blocks until bytes arrive, then immediately notifies
         let reader_task = cx.spawn_in(window, async move |this, cx| {
+            let mut chunks = 0;
             loop {
                 // Wait for bytes from the background reader (blocks until data arrives)
                 match bytes_rx.recv_async().await {
@@ -584,11 +596,16 @@ impl TerminalView {
                         let result = this.update_in(cx, |view: &mut Self, window, cx| {
                             view.state.process_bytes(&bytes);
                             view.process_events(window, cx);
-                            view.request_repaint(cx);
+                            view.request_repaint(window, cx);
                         });
                         if result.is_err() {
                             // View was dropped, exit
                             break;
+                        }
+                        chunks += 1;
+                        if chunks == 32 {
+                            cx.background_executor().timer(Duration::from_millis(1)).await;
+                            chunks = 0;
                         }
                     }
                     Err(_) => {
@@ -612,6 +629,8 @@ impl TerminalView {
             event_rx,
             config,
             _reader_task: reader_task,
+            _writer_task: writer_task,
+            input_error_callback: None,
             resize_callback: None,
             key_handler: None,
             bell_callback: None,
@@ -626,7 +645,6 @@ impl TerminalView {
             last_mouse_position: None,
             url_regex: RegexSearch::new(URL_REGEX).expect("URL_REGEX compiles"),
             focus_subscriptions: Vec::new(),
-            focused_at_render: false,
             last_repaint: Instant::now(),
             _repaint_task: None,
         }
@@ -635,8 +653,8 @@ impl TerminalView {
     /// Repaint for new PTY output: at once after a quiet spell, otherwise
     /// once the repaint interval has elapsed since the last one. Chunks that
     /// land while a deferred repaint is pending ride along with it.
-    fn request_repaint(&mut self, cx: &mut Context<Self>) {
-        let interval = if self.focused_at_render {
+    fn request_repaint(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let interval = if window.is_window_active() && self.focus_handle.is_focused(window) {
             REPAINT_FOCUSED
         } else {
             REPAINT_UNFOCUSED
@@ -876,36 +894,24 @@ impl TerminalView {
         }
 
         if let Some(bytes) = keystroke_to_bytes(&event.keystroke, self.state.mode()) {
-            let mut writer = self.stdin_writer.lock();
-            let _ = writer.write_all(&bytes);
-            let _ = writer.flush();
+            self.write_to_pty(&bytes);
         }
     }
 
-    /// Write bytes to the terminal process and flush.
     fn write_to_pty(&self, bytes: &[u8]) {
-        let mut writer = self.stdin_writer.lock();
-        let _ = writer.write_all(bytes);
-        let _ = writer.flush();
+        let _ = self.stdin_writer.send(bytes);
     }
 
-    /// Paste text into the terminal.
-    ///
-    /// Uses bracketed paste (CSI 200~ / 201~) when the application has
-    /// requested it, with the closing guard stripped from the payload so
-    /// pasted content cannot break out of the bracket. Otherwise newlines
-    /// become carriage returns, the way every mainstream terminal pastes.
     fn paste_text(&self, text: &str) {
-        if self.state.mode().contains(TermMode::BRACKETED_PASTE) {
-            let sanitized = text.replace("\x1b[201~", "");
-            let mut writer = self.stdin_writer.lock();
-            let _ = writer.write_all(b"\x1b[200~");
-            let _ = writer.write_all(sanitized.as_bytes());
-            let _ = writer.write_all(b"\x1b[201~");
-            let _ = writer.flush();
-        } else {
-            self.write_to_pty(text.replace("\r\n", "\r").replace('\n', "\r").as_bytes());
-        }
+        self.stdin_writer.paste(text, self.state.mode().contains(TermMode::BRACKETED_PASTE));
+    }
+
+    pub fn with_input_error_callback(
+        mut self,
+        callback: impl Fn(&mut Window, &mut Context<Self>, &str) + 'static,
+    ) -> Self {
+        self.input_error_callback = Some(Box::new(callback));
+        self
     }
 
     /// Map a window position to a grid cell, clamped to the visible grid so
@@ -1121,14 +1127,9 @@ impl TerminalView {
             let point =
                 crate::mouse::pixel_to_cell(event.position, origin, cell_width, cell_height);
             if let Some(bytes) = crate::mouse::scroll_report(lines, point, 0, mode) {
-                let mut writer = self.stdin_writer.lock();
-                // A mouse report encodes one wheel click; repeat it per line.
-                // The arrow-key fallback already encodes the repetition.
+                // Mouse reports encode one click; arrow fallback already repeats.
                 let repeats = if mouse_mode { lines.unsigned_abs() } else { 1 };
-                for _ in 0..repeats {
-                    let _ = writer.write_all(&bytes);
-                }
-                let _ = writer.flush();
+                self.stdin_writer.repeat(&bytes, repeats as usize);
             }
         } else {
             self.state.with_term_mut(|term| {
@@ -1264,8 +1265,6 @@ impl TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.focused_at_render = self.focus_handle.is_focused(window);
-
         // Register focus forwarding when first shown. Check CSI ?1004 at
         // event time so it tracks the application's current state.
         if self.focus_subscriptions.is_empty() {

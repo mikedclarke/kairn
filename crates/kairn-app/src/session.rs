@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use gpui::{AppContext, ClipboardItem, Context, Edges, Entity, SharedString, Task, WeakEntity, Window, px};
 use gpui_terminal::{TerminalConfig, TerminalView};
+use gpui_component::WindowExt as _;
 use parking_lot::Mutex;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
@@ -206,6 +207,9 @@ pub fn spawn(
         let terminal = TerminalView::new(writer, reader, config, window, cx);
         let focus = terminal.focus_handle().clone();
         terminal
+            .with_input_error_callback(|window, cx, error| {
+                window.push_notification(error.to_string(), cx);
+            })
             .with_resize_callback(move |cols, rows| {
                 if let Err(e) = resize_master.lock().resize(PtySize {
                     cols: cols as u16,
