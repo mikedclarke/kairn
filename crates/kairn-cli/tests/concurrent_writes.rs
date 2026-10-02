@@ -4,34 +4,27 @@ use std::process::{Command, Output};
 
 use kairn_core::{NoteBuffer, NoteLock};
 
-struct Vault(PathBuf);
+struct Vault {
+    root: PathBuf,
+    _directory: tempfile::TempDir,
+}
 
 impl Vault {
     fn new() -> Self {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("kairn-writers-{}-{stamp}", std::process::id()));
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_owned();
         fs::create_dir_all(root.join("Notes")).unwrap();
-        Self(root)
+        Self { root, _directory: directory }
     }
 
     fn cli(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_kairn"))
             .arg("--root")
-            .arg(&self.0)
-            .env("KAIRN_CONFIG", self.0.join("settings.json"))
+            .arg(&self.root)
+            .env("KAIRN_CONFIG", self.root.join("settings.json"))
             .args(args)
             .output()
             .unwrap()
-    }
-}
-
-impl Drop for Vault {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
@@ -44,7 +37,7 @@ fn assert_busy(output: Output, path: &Path, expected: &str) {
 #[test]
 fn editor_transaction_excludes_cli_append_and_section_until_replacement_finishes() {
     let vault = Vault::new();
-    let path = vault.0.join("Notes/Example.md");
+    let path = vault.root.join("Notes/Example.md");
     let base = "# Example\n\n## Status\nwaiting\n\n## Log\n";
     fs::write(&path, base).unwrap();
     let lock = NoteLock::acquire(&path).unwrap();
@@ -80,7 +73,7 @@ fn editor_transaction_excludes_cli_append_and_section_until_replacement_finishes
 #[test]
 fn cli_and_editor_insertions_both_survive_a_locked_buffer_save() {
     let vault = Vault::new();
-    let path = vault.0.join("Notes/Example.md");
+    let path = vault.root.join("Notes/Example.md");
     let base = "# Example\n";
     fs::write(&path, base).unwrap();
     let mut buffer = NoteBuffer::new(base);

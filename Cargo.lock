@@ -3538,6 +3538,7 @@ dependencies = [
  "kairn-core",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
