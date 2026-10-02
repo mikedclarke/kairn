@@ -116,7 +116,8 @@ pub(super) fn lock(dir: &Dir, name: &str) -> io::Result<File> {
 
 pub(super) fn sync_directory(dir: &Dir) -> io::Result<()> {
     #[cfg(unix)]
-    dir.try_clone()?.into_std_file().sync_all()?;
+    // Capability handles may use O_PATH, which cannot be synced.
+    dir.open(".")?.sync_all()?;
     Ok(())
 }
 

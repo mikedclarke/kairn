@@ -507,6 +507,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn directory_flush_uses_the_open_handle_after_a_path_replacement() {
+        let scratch = Scratch::new("directory-flush");
+        let original = scratch.0.join("original");
+        std::fs::create_dir(&original).unwrap();
+        let dir = Dir::open_ambient_dir(&original, cap_std::ambient_authority()).unwrap();
+        std::fs::rename(&original, scratch.0.join("moved")).unwrap();
+        std::os::unix::fs::symlink(scratch.0.join("missing"), &original).unwrap();
+        vault_fs::sync_directory(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn symlinked_parents_refuse_reads_writes_deletes_and_conflict_copies() {
         let vault = Scratch::new("contained");
         let outside = Scratch::new("outside");
