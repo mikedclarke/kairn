@@ -71,8 +71,7 @@ pub enum NoteEditorEvent {
 
 pub struct NoteEditor {
     pub path: PathBuf,
-    pub save_error: Option<String>,
-    recovery: notes::RecoverySnapshot,
+    pub lifecycle: notes::DocumentLifecycle,
     buffer: NoteBuffer,
     /// The file used CRLF endings; the buffer holds LF and saves convert back.
     crlf: bool,
@@ -341,8 +340,7 @@ impl NoteEditor {
         };
         Self {
             path,
-            save_error: None,
-            recovery: notes::RecoverySnapshot::default(),
+            lifecycle: notes::DocumentLifecycle::default(),
             buffer,
             crlf,
             cursor: 0,
@@ -371,33 +369,31 @@ impl NoteEditor {
     /// Absorb the document as it now stands on disk (watcher event or
     /// navigation reload), preserving conflicting text before changing the buffer.
     pub fn reconcile_from_disk(&mut self, disk: &str, cx: &mut Context<Self>) -> bool {
-        let disk = if disk.contains("\r\n") { disk.replace("\r\n", "\n") } else { disk.to_string() };
-        let before = self.buffer.text().to_string();
-        let mut copy = None;
-        let result = self.buffer.try_reconcile(&disk, self.cursor, |text| {
-            let content = if self.crlf { text.replace('\n', "\r\n") } else { text.to_string() };
-            copy = Some(notes::write_conflict_copy(&self.path, &content)?);
-            Ok::<_, std::io::Error>(())
-        });
-        let (cursor, _) = match result {
-            Ok(result) => result,
-            Err(e) => {
-                self.save_failed(format!("Could not preserve conflicting edits: {e}"), cx);
-                return false;
-            }
-        };
-        self.cursor = cursor;
-        if self.buffer.text() != before {
+        let previous_error = self.lifecycle.error().map(str::to_owned);
+        let change = self.lifecycle.reconcile_buffer(&self.path, &mut self.buffer, disk, self.cursor, self.crlf);
+        let reconciled = change.is_some();
+        if let Some(change) = change {
+            self.apply_document_change(change, cx);
+        }
+        self.notify_document_error(previous_error, cx);
+        cx.notify();
+        reconciled
+    }
+
+    fn apply_document_change(&mut self, change: notes::DocumentChange, cx: &mut Context<Self>) {
+        self.cursor = change.cursor;
+        if change.text_changed {
             self.drop_stale_offsets();
         }
-        if copy.is_some() || !self.buffer.is_dirty() {
-            self.save_error = None;
-        }
-        if let Some(copy) = copy {
+        if let Some(copy) = change.conflict_copy {
             cx.emit(NoteEditorEvent::ConflictSaved(copy));
         }
-        cx.notify();
-        true
+    }
+
+    fn notify_document_error(&self, previous: Option<String>, cx: &mut Context<Self>) {
+        if self.lifecycle.error().is_some() && previous.as_deref() != self.lifecycle.error() {
+            cx.emit(NoteEditorEvent::SaveFailed);
+        }
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -410,12 +406,7 @@ impl NoteEditor {
         } else {
             self.buffer.text().to_string()
         };
-        let message = match self.recovery.preserve(&notes::recovery_directory(), &self.path, &content) {
-            Ok(copy) => format!("{message}. Recovery copy: {}", copy.display()),
-            Err(error) => format!("{message}. Recovery also failed: {error}. Keep this note open."),
-        };
-        if self.save_error.as_ref() != Some(&message) {
-            self.save_error = Some(message);
+        if self.lifecycle.preserve_failure(&self.path, &content, &message) {
             cx.emit(NoteEditorEvent::SaveFailed);
         }
         cx.notify();
@@ -461,50 +452,15 @@ impl NoteEditor {
         if self.ime_marked.is_some() {
             return false;
         }
-        if !self.buffer.is_dirty() {
-            self.save_error = None;
-            return true;
-        }
-        let lock = match notes::NoteLock::acquire(&self.path) {
-            Ok(lock) => lock,
-            Err(error) => {
-                self.save_failed(format!("Could not lock this note for saving: {error}"), cx);
-                return false;
-            }
-        };
-        match lock.read_text() {
-            Ok(disk) => {
-                if !self.reconcile_from_disk(&disk, cx) {
-                    return false;
-                }
-            }
-            // A file that never existed (template seed, fresh note) or was
-            // deleted externally: writing the buffer is creation or an
-            // explicit resurrect; nothing on disk can be clobbered.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                self.save_failed(format!("Could not read this note before saving: {e}"), cx);
-                return false;
-            }
-        }
-        let out = if self.crlf {
-            self.buffer.text().replace('\n', "\r\n")
-        } else {
-            self.buffer.text().to_string()
-        };
-        match lock.write_text(&out) {
-            Ok(()) => {
-                self.buffer.mark_saved();
-                self.save_error = None;
-                cx.emit(NoteEditorEvent::Saved(self.path.clone()));
-            }
-            Err(e) => {
-                self.save_failed(format!("Could not save this note: {e}"), cx);
-                return false;
-            }
+        let previous_error = self.lifecycle.error().map(str::to_owned);
+        let outcome = self.lifecycle.save_buffer(&self.path, &mut self.buffer, self.cursor, self.crlf);
+        self.apply_document_change(outcome.change, cx);
+        self.notify_document_error(previous_error, cx);
+        if outcome.wrote {
+            cx.emit(NoteEditorEvent::Saved(self.path.clone()));
         }
         cx.notify();
-        true
+        outcome.saved
     }
 
     fn schedule_autosave(&mut self, cx: &mut Context<Self>) {
@@ -2441,6 +2397,36 @@ fn shape_entry(
 #[cfg(test)]
 mod tests {
     use super::{next_word_boundary, prev_word_boundary};
+
+    #[gpui::test]
+    fn editor_flush_refuses_a_failed_save_and_retries_without_losing_typing(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        use super::{NoteEditor, notes};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("Example.md");
+        std::fs::write(&path, "base\n").unwrap();
+        let editor = cx.new(|cx| NoteEditor::new(path.clone(), "base\n", None, cx));
+        editor.update(cx, |editor, _| {
+            editor.lifecycle = notes::DocumentLifecycle::new(directory.path().join("recovery"));
+            editor.cursor = editor.buffer.edit(5..5, "typed\n", 5, 0);
+        });
+        let lock = notes::NoteLock::acquire(&path).unwrap();
+        editor.update(cx, |editor, cx| {
+            assert!(!editor.save_now(cx));
+            assert!(editor.is_dirty());
+            assert_eq!(editor.text(), "base\ntyped\n");
+            assert!(editor.lifecycle.error().is_some());
+        });
+        lock.write_text("base\nexternal\n").unwrap();
+        drop(lock);
+        editor.update(cx, |editor, cx| {
+            assert!(editor.save_now(cx));
+            assert!(!editor.is_dirty());
+            assert!(editor.lifecycle.error().is_none());
+            assert!(editor.text().contains("typed\n"));
+            assert!(editor.text().contains("external\n"));
+        });
+    }
 
     #[test]
     fn word_left_lands_on_word_starts() {

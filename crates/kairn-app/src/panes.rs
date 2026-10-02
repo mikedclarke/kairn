@@ -756,8 +756,8 @@ impl Workspace {
         t: &KairnTheme,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
-        let error = self.note_editor.as_ref().and_then(|ed| ed.read(cx).save_error.as_ref())
-            .or_else(|| self.library_text.as_ref().and_then(|ed| ed.save_error.as_ref()))?;
+        let error = self.note_editor.as_ref().and_then(|ed| ed.read(cx).lifecycle.error())
+            .or_else(|| self.library_text.as_ref().and_then(|ed| ed.lifecycle.error()))?;
         Some(
             div()
                 .mb(px(10.))
@@ -769,7 +769,7 @@ impl Workspace {
                 .bg(t.amber.opacity(0.08))
                 .text_size(t.ui_px(12.))
                 .text_color(t.text)
-                .child(error.clone())
+                .child(error.to_owned())
                 .child(
                     div().mt(px(4.))
                         .child("Your edits are still open. Save again before leaving this note."),

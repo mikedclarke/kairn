@@ -306,7 +306,7 @@ impl Workspace {
                 }
                 NoteEditorEvent::SaveFailed => {
                     if let Some(error) = this.note_editor.as_ref()
-                        .and_then(|ed| ed.read(cx).save_error.clone())
+                        .and_then(|ed| ed.read(cx).lifecycle.error().map(str::to_owned))
                     {
                         this.notify_save_error(error, cx);
                     }
@@ -1065,8 +1065,7 @@ impl Workspace {
             path,
             input,
             baseline: disk,
-            recovery: notes::RecoverySnapshot::default(),
-            save_error: None,
+            lifecycle: notes::DocumentLifecycle::default(),
             _sub: sub,
             _save: None,
         });
@@ -1074,19 +1073,19 @@ impl Workspace {
 
     /// Reconcile the Library buffer against disk before saving.
     pub(crate) fn save_library_text(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(ed) = &self.library_text else { return true };
+        let Some(ed) = &mut self.library_text else { return true };
         let value = ed.input.read(cx).value().to_string();
         if value == ed.baseline {
             return true;
         }
         let path = ed.path.clone();
-        match notes::save_text(&path, &ed.baseline, &value) {
-            Ok(saved) => {
+        let previous_error = ed.lifecycle.error().map(str::to_owned);
+        match ed.lifecycle.save_text(&path, &ed.baseline, &value) {
+            Some(saved) => {
                 self.note_self_write(&path);
                 if let Some(ed) = &mut self.library_text {
                     // Until the deferred refresh lands, this is what the input shows.
                     ed.baseline = value.clone();
-                    ed.save_error = None;
                 }
                 self.refresh_library_input(path.clone(), value, saved.text, cx);
                 if let Some(copy) = saved.conflict_copy {
@@ -1096,8 +1095,12 @@ impl Workspace {
                     cx.notify();
                 }
             }
-            Err(e) => {
-                self.preserve_library_text(format!("Could not save this file: {e}"), cx);
+            None => {
+                let message = ed.lifecycle.error().unwrap().to_owned();
+                if previous_error.as_ref() != Some(&message) {
+                    self.notify_save_error(message, cx);
+                }
+                cx.notify();
                 return false;
             }
         }
@@ -1107,12 +1110,8 @@ impl Workspace {
     fn preserve_library_text(&mut self, error: String, cx: &mut Context<Self>) {
         let Some(ed) = &mut self.library_text else { return };
         let content = ed.input.read(cx).value().to_string();
-        let message = match ed.recovery.preserve(&notes::recovery_directory(), &ed.path, &content) {
-            Ok(copy) => format!("{error}. Recovery copy: {}", copy.display()),
-            Err(e) => format!("{error}. Recovery also failed: {e}. Keep this file open."),
-        };
-        if ed.save_error.as_ref() != Some(&message) {
-            ed.save_error = Some(message.clone());
+        if ed.lifecycle.preserve_failure(&ed.path, &content, &error) {
+            let message = ed.lifecycle.error().unwrap().to_owned();
             self.notify_save_error(message, cx);
         }
         cx.notify();
@@ -2234,8 +2233,7 @@ pub(crate) struct LibraryTextEditor {
     /// The file's content at load or last save: saves write only when the
     /// buffer differs, and external reloads land only while it is clean.
     pub baseline: String,
-    recovery: notes::RecoverySnapshot,
-    pub save_error: Option<String>,
+    pub lifecycle: notes::DocumentLifecycle,
     pub(crate) _sub: gpui::Subscription,
     pub(crate) _save: Option<Task<()>>,
 }
