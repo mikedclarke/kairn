@@ -144,6 +144,7 @@ pub struct Workspace {
     next_session_id: u64,
     pub cal_offset: i32,
     pub notes_root: PathBuf,
+    pub(crate) notes_root_override: Option<PathBuf>,
     pub selected_day: NaiveDate,
     pub view: PaneView,
     /// The pane's document as read from disk (or the daily template for a
@@ -291,17 +292,15 @@ impl Workspace {
         // KAIRN_ROOT overrides the configured notes folder for this process
         // only (dev, testing, screenshots); it is never written to settings.
         // The CLI honours the same variable via --root.
-        let env_root = std::env::var("KAIRN_ROOT").ok().filter(|r| !r.is_empty());
-        let notes_root = env_root
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| settings.notes_root());
+        let notes_root_override = std::env::var_os("KAIRN_ROOT")
+            .filter(|r| !r.is_empty()).map(PathBuf::from);
+        let notes_root = settings.effective_notes_root(notes_root_override.as_deref());
         // A configured folder that isn't there means an unmounted drive or
         // a moved path: creating a fresh empty vault at that spot would be
         // worse than stopping. The default ~/kairn is always created.
-        let root_missing = (env_root.is_some()
+        let root_missing = (notes_root_override.is_some()
             || settings.notes_root.as_deref().is_some_and(|r| !r.is_empty()))
-            && !notes_root.exists();
+            && !notes_root.is_dir();
         if !root_missing {
             notes::ensure_layout(&notes_root);
         }
@@ -371,6 +370,7 @@ impl Workspace {
             next_session_id: 1,
             cal_offset: 0,
             notes_root,
+            notes_root_override,
             selected_day: Local::now().date_naive(),
             view: PaneView::Day,
             doc_text: None,

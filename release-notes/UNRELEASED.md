@@ -22,6 +22,8 @@ restating the same fact twice; no em dashes. Rewrite to this standard before rel
 
 <!-- Bugs that no longer happen. -->
 
+- The process-only notes folder override remains active after closing Settings.
+
 - Library text and code saves merge external changes and preserve conflicting edits as separate copies.
 
 - Failed saves preserve unsaved text in a local recovery folder and display its location.

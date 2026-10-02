@@ -205,6 +205,10 @@ pub fn config_path() -> PathBuf {
 }
 
 impl Settings {
+    pub fn effective_notes_root(&self, process_override: Option<&Path>) -> PathBuf {
+        process_override.map(Path::to_path_buf).unwrap_or_else(|| self.notes_root())
+    }
+
     /// Resolved notes root: the configured folder, or `~/kairn`.
     pub fn notes_root(&self) -> PathBuf {
         match self.notes_root.as_deref() {
@@ -290,6 +294,26 @@ mod tests {
             .expect("clock after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("kairn-settings-{name}-{nanos}"))
+    }
+
+    #[test]
+    fn process_root_survives_settings_changes_without_being_persisted() {
+        let dir = scratch("root-override");
+        fs::create_dir_all(&dir).unwrap();
+        let configured = dir.join("configured");
+        let process_root = dir.join("session");
+        let path = dir.join("settings.json");
+        let mut settings = Settings::default();
+        assert_eq!(settings.effective_notes_root(Some(&process_root)), process_root);
+        settings.notes_root = Some(configured.to_string_lossy().into_owned());
+        settings.theme = "light".into();
+        settings.save_to(&path).unwrap();
+        let reloaded = Settings::load_from(&path);
+        assert_eq!(reloaded.effective_notes_root(Some(&process_root)), process_root);
+        assert_eq!(reloaded.effective_notes_root(None), configured);
+        assert!(!process_root.exists());
+        assert!(!configured.exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

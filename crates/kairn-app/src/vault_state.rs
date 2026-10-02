@@ -1568,8 +1568,9 @@ impl Workspace {
     /// Re-read the pane's document and everything the sidebar derives from
     /// the notes: calendar indicators, open-task counts, the Notes tree.
     pub fn reload_notes(&mut self, cx: &mut Context<Self>) {
-        self.root_missing = self.settings.notes_root.as_deref().is_some_and(|r| !r.is_empty())
-            && !self.notes_root.exists();
+        self.root_missing = (self.notes_root_override.is_some()
+            || self.settings.notes_root.as_deref().is_some_and(|r| !r.is_empty()))
+            && !self.notes_root.is_dir();
         // One walk of Calendar/ and Notes/ and one read of each daily,
         // shared by the task scan and the mention scan below.
         let scan = notes::VaultScan::new(&self.notes_root);
@@ -2183,9 +2184,10 @@ impl Workspace {
             eprintln!("kairn: failed to save settings: {e}");
             window.push_notification("Could not write settings.json, see stderr.", cx);
         }
-        let root = self.settings.notes_root();
-        self.root_missing = self.settings.notes_root.as_deref().is_some_and(|r| !r.is_empty())
-            && !root.exists();
+        let root = self.settings.effective_notes_root(self.notes_root_override.as_deref());
+        self.root_missing = (self.notes_root_override.is_some()
+            || self.settings.notes_root.as_deref().is_some_and(|r| !r.is_empty()))
+            && !root.is_dir();
         self.notes_root = root;
         if !self.root_missing {
             notes::ensure_layout(&self.notes_root);
