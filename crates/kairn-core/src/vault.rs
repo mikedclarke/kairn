@@ -301,7 +301,7 @@ pub fn vault_conflicts(root: &Path) -> Vec<(PathBuf, PathBuf)> {
     let is_conflict = |p: &Path| {
         p.file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.contains(".sync-conflict-"))
+            .is_some_and(|n| !n.starts_with('.') && n.contains(".sync-conflict-"))
     };
     let mut out = Vec::new();
     if let Ok(entries) = fs::read_dir(root.join("Calendar")) {
@@ -739,6 +739,9 @@ mod tests {
             "Notes/Projects/Plan.sync-conflict-20260808-090000-BBBBBBB.md",
             "# stale plan\n",
         );
+        let _day_lock = crate::NoteLock::acquire(&day_copy).unwrap();
+        let _note_lock = crate::NoteLock::acquire(&note_copy).unwrap();
+        root.write("Calendar/.20260806.sync-conflict-LOCAL.md.kairn-tmp.pending", "partial");
         root.write("Calendar/20260807.md", "* unrelated\n");
 
         assert_eq!(
