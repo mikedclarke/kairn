@@ -165,7 +165,7 @@ pub struct Workspace {
     /// there is no note.
     pub doc_error: Option<String>,
     /// Daily notes that exist but couldn't be read this reload.
-    pub dailies_skipped: usize,
+    pub notes_scan_errors: usize,
     /// The configured notes folder doesn't exist (unmounted drive, moved
     /// path): the note pane blocks instead of showing a convincing empty
     /// vault, and nothing writes into the void.
@@ -379,7 +379,7 @@ impl Workspace {
             conflicts: Vec::new(),
             vault_conflicts: Vec::new(),
             doc_error: None,
-            dailies_skipped: 0,
+            notes_scan_errors: 0,
             root_missing,
             note_days: HashMap::new(),
             day_stats: HashMap::new(),

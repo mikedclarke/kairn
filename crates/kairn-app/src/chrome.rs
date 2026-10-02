@@ -197,8 +197,8 @@ impl Workspace {
         if self._notes_watcher.is_none() && !self.root_missing {
             warnings.push("file watching off".to_string());
         }
-        if self.dailies_skipped > 0 {
-            warnings.push(format!("{} unreadable day notes", self.dailies_skipped));
+        if self.notes_scan_errors > 0 {
+            warnings.push(format!("task scan incomplete: {} unreadable files or folders", self.notes_scan_errors));
         }
         if self.settings.degraded {
             warnings

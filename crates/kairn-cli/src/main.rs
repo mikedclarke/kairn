@@ -627,7 +627,8 @@ fn cmd_tasks(
     json: bool,
 ) -> Result<(), Failure> {
     let today = Local::now().date_naive();
-    let source = if done { done_tasks_in_vault(root) } else { open_tasks_in_vault(root) };
+    let source = if done { done_tasks_in_vault(root) } else { open_tasks_in_vault(root) }
+        .require_complete().map_err(|error| Failure::new(EXIT_FAILED, error.to_string()))?;
     let tasks: Vec<TaskRef> = source
         .into_iter()
         .filter(|t| query.matches(t.due, today))
@@ -953,6 +954,7 @@ fn cmd_carry(
     // vault; what falls outside it is reported, never silently dropped.
     let cutoff = from.unwrap_or(today - Duration::days(14));
     let overdue: Vec<TaskRef> = open_tasks_in_vault(root)
+        .require_complete().map_err(|error| Failure::new(EXIT_FAILED, error.to_string()))?
         .into_iter()
         .filter(|t| t.file_date.is_some_and(|d| d < today) && t.due < dest)
         .collect();
@@ -1186,7 +1188,8 @@ fn cmd_done(root: &Path, needle: &str, actor: &str, json: bool) -> Result<(), Fa
     if needle_trim.is_empty() {
         return Err(Failure::new(2, "give some words from the task's text"));
     }
-    let tasks = open_tasks_in_vault(root);
+    let tasks = open_tasks_in_vault(root).require_complete()
+        .map_err(|error| Failure::new(EXIT_FAILED, error.to_string()))?;
     let lower = needle_trim.to_lowercase();
     let matches: Vec<&TaskRef> = tasks
         .iter()

@@ -1578,9 +1578,10 @@ impl Workspace {
         // shared by the task scan and the mention scan below.
         let scan = notes::VaultScan::new(&self.notes_root);
         let dailies = scan.read_dailies_cached(&mut self.daily_cache);
-        self.dailies_skipped = scan.days.len() - dailies.len();
         let note_texts = scan.read_notes_cached(&mut self.note_cache);
-        let task_scan = notes::scan_tasks(&dailies, &note_texts);
+        self.notes_scan_errors = scan.errors.len() + dailies.errors.len() + note_texts.errors.len();
+        let dailies = dailies.items;
+        let task_scan = notes::scan_tasks(&dailies, &note_texts.items);
         self.open_tasks = task_scan.open;
         self.day_stats = task_scan.day_stats;
         self.notes_tree = notes::notes_tree(&self.notes_root, &self.notes_expanded);

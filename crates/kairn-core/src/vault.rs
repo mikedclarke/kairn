@@ -82,7 +82,46 @@ pub struct VaultScan {
     pub periods: Vec<(String, PathBuf)>,
     /// Every note file under `Notes/` with its depth, tree order.
     pub(crate) notes: Vec<(usize, PathBuf)>,
+    pub errors: Vec<ScanError>,
 }
+
+#[derive(Clone, Debug)]
+pub struct ScanError {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+impl ScanError {
+    fn new(path: &Path, error: impl std::fmt::Display) -> Self {
+        Self { path: path.to_path_buf(), message: error.to_string() }
+    }
+}
+
+pub struct ScanReport<T> {
+    pub items: Vec<T>,
+    pub errors: Vec<ScanError>,
+}
+
+impl<T> ScanReport<T> {
+    pub fn require_complete(self) -> Result<Vec<T>, ScanErrors> {
+        if self.errors.is_empty() { Ok(self.items) } else { Err(ScanErrors(self.errors)) }
+    }
+}
+
+#[derive(Debug)]
+pub struct ScanErrors(pub Vec<ScanError>);
+
+impl std::fmt::Display for ScanErrors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "incomplete vault scan")?;
+        for error in &self.0 {
+            write!(f, "\n{}: {}", error.path.display(), error.message)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ScanErrors {}
 
 /// A daily note read into memory, so one read serves both the task scan and
 /// the mention scan. The text is shared so a cache can hand it out across
@@ -105,17 +144,16 @@ pub struct TextCache {
 
 impl TextCache {
     /// The file's text, from cache when its mtime and length are unchanged.
-    /// `None` when the file can't be statted or read (vanished, unreadable).
-    fn read(&mut self, path: &Path) -> Option<std::sync::Arc<str>> {
-        let meta = fs::metadata(path).ok()?;
-        let (mtime, len) = (meta.modified().ok()?, meta.len());
+    fn read(&mut self, path: &Path) -> std::io::Result<std::sync::Arc<str>> {
+        let meta = fs::metadata(path)?;
+        let (mtime, len) = (meta.modified()?, meta.len());
         match self.map.get(path) {
-            Some((m, l, text)) if *m == mtime && *l == len => Some(text.clone()),
+            Some((m, l, text)) if *m == mtime && *l == len => Ok(text.clone()),
             _ => {
-                let text: std::sync::Arc<str> = fs::read_to_string(path).ok()?.into();
+                let text: std::sync::Arc<str> = fs::read_to_string(path)?.into();
                 self.map
                     .insert(path.to_path_buf(), (mtime, len, text.clone()));
-                Some(text)
+                Ok(text)
             }
         }
     }
@@ -136,38 +174,50 @@ impl VaultScan {
     pub fn new(root: &Path) -> Self {
         let mut days: HashMap<NaiveDate, PathBuf> = HashMap::new();
         let mut periods = Vec::new();
-        if let Ok(entries) = fs::read_dir(root.join("Calendar")) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let ext = path.extension().and_then(|x| x.to_str());
-                let is_md = matches!(ext, Some("md"));
-                if !(is_md || matches!(ext, Some("txt"))) || !path.is_file() {
-                    continue;
-                }
-                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                if stem.len() == 8
-                    && stem.bytes().all(|b| b.is_ascii_digit())
-                    && let Ok(date) = NaiveDate::parse_from_str(stem, "%Y%m%d")
-                {
-                    match days.entry(date) {
-                        std::collections::hash_map::Entry::Vacant(v) => {
-                            v.insert(path);
-                        }
-                        std::collections::hash_map::Entry::Occupied(mut o) => {
-                            if is_md {
-                                o.insert(path);
-                            }
+        let mut errors = Vec::new();
+        if let Err(error) = fs::metadata(root).and_then(|meta| {
+            if meta.is_dir() { Ok(()) } else { Err(std::io::ErrorKind::NotADirectory.into()) }
+        }) {
+            errors.push(ScanError::new(root, error));
+            return Self { days, periods, notes: Vec::new(), errors };
+        }
+        for entry in scan_entries(&root.join("Calendar"), true, &mut errors) {
+            let path = entry.path();
+            let ext = path.extension().and_then(|x| x.to_str());
+            let is_md = matches!(ext, Some("md"));
+            if !(is_md || matches!(ext, Some("txt"))) {
+                continue;
+            }
+            match fs::metadata(&path) {
+                Ok(meta) if meta.is_file() => (),
+                Ok(_) => continue,
+                Err(error) => { errors.push(ScanError::new(&path, error)); continue; }
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                errors.push(ScanError::new(&path, "file name is not UTF-8"));
+                continue;
+            };
+            if stem.len() == 8
+                && stem.bytes().all(|b| b.is_ascii_digit())
+                && let Ok(date) = NaiveDate::parse_from_str(stem, "%Y%m%d")
+            {
+                match days.entry(date) {
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(path);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut o) => {
+                        if is_md {
+                            o.insert(path);
                         }
                     }
-                } else if let Some(canon) = period_stem(stem) {
-                    periods.push((canon, path));
                 }
+            } else if let Some(canon) = period_stem(stem) {
+                periods.push((canon, path));
             }
         }
         periods.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        Self { days, periods, notes: notes_files(root) }
+        let notes = scan_note_files(root, &mut errors);
+        Self { days, periods, notes, errors }
     }
 
     /// Every note file under `Notes/`, tree order, without reading any of
@@ -177,32 +227,34 @@ impl VaultScan {
     }
 
     /// Every daily note read once, newest day first.
-    pub fn read_dailies(&self) -> Vec<DayText> {
+    pub fn read_dailies(&self) -> ScanReport<DayText> {
         self.read_dailies_cached(&mut TextCache::default())
     }
 
     /// [`Self::read_dailies`] through a cache that persists across reloads:
     /// unchanged files (same mtime and length) reuse their text, changed or
     /// new files are re-read, vanished files fall out of the cache.
-    pub fn read_dailies_cached(&self, cache: &mut TextCache) -> Vec<DayText> {
+    pub fn read_dailies_cached(&self, cache: &mut TextCache) -> ScanReport<DayText> {
+        let mut errors = Vec::new();
         let mut days: Vec<(&NaiveDate, &PathBuf)> = self.days.iter().collect();
         days.sort_unstable_by(|a, b| b.0.cmp(a.0));
         let dailies: Vec<DayText> = days
             .into_iter()
             .filter_map(|(date, path)| {
-                let text = cache.read(path)?;
+                let text = cache.read(path).map_err(|error| errors.push(ScanError::new(path, error))).ok()?;
                 Some(DayText { date: *date, path: path.clone(), text })
             })
             .collect();
         let live: HashSet<&PathBuf> = self.days.values().collect();
         cache.retain_live(&live);
-        dailies
+        ScanReport { items: dailies, errors }
     }
 
     /// Every non-daily note (period notes and `Notes/` files) read once,
     /// through a persistent cache like [`Self::read_dailies_cached`]. Feeds
     /// the task scan; keep it on its own cache instance, not the dailies'.
-    pub fn read_notes_cached(&self, cache: &mut TextCache) -> Vec<NoteText> {
+    pub fn read_notes_cached(&self, cache: &mut TextCache) -> ScanReport<NoteText> {
+        let mut errors = Vec::new();
         let paths = self
             .periods
             .iter()
@@ -211,13 +263,13 @@ impl VaultScan {
         let notes: Vec<NoteText> = paths
             .clone()
             .filter_map(|path| {
-                let text = cache.read(path)?;
+                let text = cache.read(path).map_err(|error| errors.push(ScanError::new(path, error))).ok()?;
                 Some(NoteText { path: path.clone(), text })
             })
             .collect();
         let live: HashSet<&PathBuf> = paths.collect();
         cache.retain_live(&live);
-        notes
+        ScanReport { items: notes, errors }
     }
 }
 
@@ -406,21 +458,41 @@ fn push_tree_level(
 /// deterministic order. `@Trash` is skipped everywhere links and search are
 /// concerned.
 pub(crate) fn notes_files(root: &Path) -> Vec<(usize, PathBuf)> {
-    fn walk(dir: &Path, depth: usize, out: &mut Vec<(usize, PathBuf)>) {
+    scan_note_files(root, &mut Vec::new())
+}
+
+fn scan_entries(dir: &Path, missing_ok: bool, errors: &mut Vec<ScanError>) -> Vec<fs::DirEntry> {
+    match fs::read_dir(dir) {
+        Ok(entries) => entries.filter_map(|entry| {
+            entry.map_err(|error| errors.push(ScanError::new(dir, error))).ok()
+        }).collect(),
+        Err(error) if missing_ok && error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => { errors.push(ScanError::new(dir, error)); Vec::new() }
+    }
+}
+
+fn scan_note_files(root: &Path, errors: &mut Vec<ScanError>) -> Vec<(usize, PathBuf)> {
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<(usize, PathBuf)>, errors: &mut Vec<ScanError>) {
         if depth > MAX_TREE_DEPTH {
+            errors.push(ScanError::new(dir, "note folder exceeds the scan depth limit"));
             return;
         }
-        let Ok(entries) = fs::read_dir(dir) else { return };
-        let mut items: Vec<(PathBuf, bool)> =
-            entries.flatten().map(|e| (e.path(), is_real_dir(&e))).collect();
+        let mut items: Vec<(PathBuf, bool)> = scan_entries(dir, depth == 0, errors)
+            .into_iter().filter_map(|entry| match entry.file_type() {
+                Ok(kind) => Some((entry.path(), kind.is_dir())),
+                Err(error) => { errors.push(ScanError::new(&entry.path(), error)); None }
+            }).collect();
         items.sort();
         for (path, is_dir) in items {
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                errors.push(ScanError::new(&path, "file name is not UTF-8"));
+                continue;
+            };
             if name.starts_with('.') || name == "@Trash" {
                 continue;
             }
             if is_dir {
-                walk(&path, depth + 1, out);
+                walk(&path, depth + 1, out, errors);
             } else if matches!(
                 path.extension().and_then(|x| x.to_str()),
                 Some("md") | Some("txt")
@@ -430,7 +502,7 @@ pub(crate) fn notes_files(root: &Path) -> Vec<(usize, PathBuf)> {
         }
     }
     let mut out = Vec::new();
-    walk(&root.join("Notes"), 0, &mut out);
+    walk(&root.join("Notes"), 0, &mut out, errors);
     out
 }
 
@@ -619,13 +691,13 @@ mod tests {
         let b = root.write("Calendar/20260806.md", "* task b\n");
 
         let mut cache = TextCache::default();
-        let dailies = VaultScan::new(&root.0).read_dailies_cached(&mut cache);
+        let dailies = VaultScan::new(&root.0).read_dailies_cached(&mut cache).require_complete().unwrap();
         assert_eq!(dailies.len(), 2);
         assert_eq!(cache.map.len(), 2);
         let first_arc = cache.map[&a].2.clone();
 
         // Unchanged files hand back the same shared text, no fresh read.
-        let dailies = VaultScan::new(&root.0).read_dailies_cached(&mut cache);
+        let dailies = VaultScan::new(&root.0).read_dailies_cached(&mut cache).require_complete().unwrap();
         assert!(std::sync::Arc::ptr_eq(
             &dailies.iter().find(|d| d.path == a).expect("day a").text,
             &first_arc
@@ -634,16 +706,45 @@ mod tests {
         // A changed file re-reads (length change invalidates regardless of
         // mtime resolution).
         std::fs::write(&b, "* task b\n* task b2\n").expect("rewrite");
-        let dailies = VaultScan::new(&root.0).read_dailies_cached(&mut cache);
+        let dailies = VaultScan::new(&root.0).read_dailies_cached(&mut cache).require_complete().unwrap();
         let day_b = dailies.iter().find(|d| d.path == b).expect("day b");
         assert!(day_b.text.contains("b2"));
 
         // A vanished file falls out of the cache.
         std::fs::remove_file(&b).expect("remove");
-        let dailies = VaultScan::new(&root.0).read_dailies_cached(&mut cache);
+        let dailies = VaultScan::new(&root.0).read_dailies_cached(&mut cache).require_complete().unwrap();
         assert_eq!(dailies.len(), 1);
         assert_eq!(cache.map.len(), 1);
         assert!(cache.map.contains_key(&a));
+    }
+
+    #[test]
+    fn a_file_removed_after_discovery_is_a_read_error() {
+        let root = ScratchRoot::new("scan-removed");
+        let path = root.write("Calendar/20260805.md", "* task\n");
+        let scan = VaultScan::new(&root.0);
+        fs::remove_file(&path).unwrap();
+        let result = scan.read_dailies();
+        assert!(result.items.is_empty());
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].path, path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_calendar_is_a_discovery_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = ScratchRoot::new("scan-permissions");
+        let calendar = root.0.join("Calendar");
+        let permissions = fs::metadata(&calendar).unwrap().permissions();
+        fs::set_permissions(&calendar, fs::Permissions::from_mode(0)).unwrap();
+        let can_read = fs::read_dir(&calendar).is_ok();
+        let scan = VaultScan::new(&root.0);
+        fs::set_permissions(&calendar, permissions).unwrap();
+        if !can_read {
+            assert_eq!(scan.errors.len(), 1);
+            assert_eq!(scan.errors[0].path, calendar);
+        }
     }
 
     #[test]
