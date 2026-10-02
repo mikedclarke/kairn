@@ -1069,8 +1069,7 @@ impl Workspace {
         });
     }
 
-    /// Write the text editor's buffer if it differs from its baseline.
-    /// Atomic like every other write; the watcher skips it as a self-write.
+    /// Reconcile the Library buffer against disk before saving.
     pub(crate) fn save_library_text(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(ed) = &self.library_text else { return true };
         let value = ed.input.read(cx).value().to_string();
@@ -1078,12 +1077,20 @@ impl Workspace {
             return true;
         }
         let path = ed.path.clone();
-        match notes::write_note(&path, &value) {
-            Ok(()) => {
+        match notes::save_text(&path, &ed.baseline, &value) {
+            Ok(saved) => {
                 self.note_self_write(&path);
                 if let Some(ed) = &mut self.library_text {
-                    ed.baseline = value;
+                    // Until the deferred refresh lands, this is what the input shows.
+                    ed.baseline = value.clone();
                     ed.save_error = None;
+                }
+                self.refresh_library_input(path.clone(), value, saved.text, cx);
+                if let Some(copy) = saved.conflict_copy {
+                    self.note_self_write(&copy);
+                    self.conflicts = notes::conflict_copies(&path);
+                    self.reload_library_trees();
+                    cx.notify();
                 }
             }
             Err(e) => {
@@ -1121,7 +1128,7 @@ impl Workspace {
     /// Keep the text editor in step after a reload: drop it (saving first)
     /// when the view moved elsewhere, and while it is clean, fold in
     /// external edits so agent writes appear live. A dirty buffer keeps the
-    /// user's text; the next save wins.
+    /// user's text; the next save reconciles it against disk.
     fn sync_library_text(&mut self, cx: &mut Context<Self>) {
         let keep = matches!(
             &self.view,
@@ -1149,16 +1156,25 @@ impl Workspace {
         if current != ed.baseline || disk == ed.baseline {
             return;
         }
-        // set_value needs a Window; reloads run without one, so the write
-        // into the input defers onto the active window.
-        let input = ed.input.clone();
-        let Some(win) = cx.active_window() else { return };
-        if let Some(ed) = &mut self.library_text {
-            ed.baseline = disk.clone();
+        self.refresh_library_input(ed.path.clone(), current, disk, cx);
+    }
+
+    fn refresh_library_input(&self, path: PathBuf, expected: String, disk: String, cx: &mut Context<Self>) {
+        if disk == expected {
+            return;
         }
+        let Some(win) = cx.active_window() else { return };
+        let workspace = cx.weak_entity();
         cx.defer(move |cx| {
             let _ = win.update(cx, |_, window, cx| {
-                input.update(cx, |state, cx| state.set_value(disk, window, cx));
+                let _ = workspace.update(cx, |ws, cx| {
+                    let Some(ed) = &mut ws.library_text else { return };
+                    if ed.path != path || ed.baseline != expected || ed.input.read(cx).value() != expected {
+                        return;
+                    }
+                    ed.baseline = disk.clone();
+                    ed.input.update(cx, |state, cx| state.set_value(disk, window, cx));
+                });
             });
         });
     }
@@ -1658,6 +1674,7 @@ impl Workspace {
         // conflicted copy of a note that vanished is exactly the case that
         // needs surfacing.
         let conflict_probe = match &self.view {
+            PaneView::Library(path) => Some(path.clone()),
             PaneView::Day => path
                 .clone()
                 .or_else(|| Some(notes::daily_path(&self.notes_root, self.selected_day))),

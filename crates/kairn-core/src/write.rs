@@ -128,6 +128,34 @@ pub fn write_note(path: &Path, content: &str) -> io::Result<()> {
     atomic_write(path, content)
 }
 
+pub struct TextSave {
+    pub text: String,
+    pub conflict_copy: Option<PathBuf>,
+}
+
+pub fn save_text(path: &Path, baseline: &str, local: &str) -> io::Result<TextSave> {
+    let disk = fs::read_to_string(path)?;
+    let merged = crate::merge3(
+        &baseline.replace("\r\n", "\n"),
+        &disk.replace("\r\n", "\n"),
+        &local.replace("\r\n", "\n"),
+    );
+    let conflict_copy = if merged.conflicts.is_empty() {
+        None
+    } else {
+        Some(crate::write_conflict_copy(path, local)?)
+    };
+    let text = if disk.contains("\r\n") {
+        merged.text.replace('\n', "\r\n")
+    } else {
+        merged.text
+    };
+    if text != disk {
+        atomic_write(path, &text)?;
+    }
+    Ok(TextSave { text, conflict_copy })
+}
+
 /// Resolve a sync conflict by adopting the conflict copy: the current note
 /// moves to the vault trash (the losing version stays recoverable from
 /// `Notes/@Trash/`) and the copy is renamed into its place. A note that
@@ -1186,6 +1214,32 @@ pub fn toggle_task_on_disk(path: &Path, line_idx: usize, expected: &str) -> io::
 mod tests {
     use super::*;
     use crate::ScratchRoot;
+
+    #[test]
+    fn text_save_merges_external_edits_and_preserves_conflicts() {
+        let root = ScratchRoot::new("text-save");
+        let base = "first = 1;\n\nsecond = 1;\n";
+        let path = root.write("Notes/example.rs", "first = 2;\n\nsecond = 1;\n");
+        let saved = save_text(&path, base, "first = 1;\n\nsecond = 2;\n").unwrap();
+        assert_eq!(saved.text, "first = 2;\n\nsecond = 2;\n");
+        assert!(saved.conflict_copy.is_none());
+        assert_eq!(fs::read_to_string(&path).unwrap(), saved.text);
+        let local = "first = 3;\n\nsecond = 1;\n";
+        let saved = save_text(&path, base, local).unwrap();
+        assert_eq!(fs::read_to_string(saved.conflict_copy.unwrap()).unwrap(), local);
+        assert_eq!(fs::read_to_string(path).unwrap(), "first = 2;\n\nsecond = 2;\n");
+    }
+
+    #[test]
+    fn text_save_keeps_crlf_and_refuses_an_unreadable_original() {
+        let root = ScratchRoot::new("text-save-crlf");
+        let path = root.write("Notes/example.txt", "first\r\nremote\r\n");
+        let saved = save_text(&path, "first\r\n", "first\r\nlocal").unwrap();
+        assert_eq!(saved.text, "first\r\nremote\r\nlocal");
+        fs::write(&path, [0xff]).unwrap();
+        assert!(save_text(&path, "first", "local").is_err());
+        assert_eq!(fs::read(path).unwrap(), [0xff]);
+    }
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).expect("valid date")
