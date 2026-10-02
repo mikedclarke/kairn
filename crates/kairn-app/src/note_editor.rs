@@ -72,6 +72,7 @@ pub enum NoteEditorEvent {
 pub struct NoteEditor {
     pub path: PathBuf,
     pub save_error: Option<String>,
+    recovery: notes::RecoverySnapshot,
     buffer: NoteBuffer,
     /// The file used CRLF endings; the buffer holds LF and saves convert back.
     crlf: bool,
@@ -341,6 +342,7 @@ impl NoteEditor {
         Self {
             path,
             save_error: None,
+            recovery: notes::RecoverySnapshot::default(),
             buffer,
             crlf,
             cursor: 0,
@@ -402,7 +404,16 @@ impl NoteEditor {
         self.buffer.is_dirty()
     }
 
-    fn save_failed(&mut self, message: String, cx: &mut Context<Self>) {
+    pub(crate) fn save_failed(&mut self, message: String, cx: &mut Context<Self>) {
+        let content = if self.crlf {
+            self.buffer.text().replace('\n', "\r\n")
+        } else {
+            self.buffer.text().to_string()
+        };
+        let message = match self.recovery.preserve(&notes::recovery_directory(), &self.path, &content) {
+            Ok(copy) => format!("{message}. Recovery copy: {}", copy.display()),
+            Err(error) => format!("{message}. Recovery also failed: {error}. Keep this note open."),
+        };
         if self.save_error.as_ref() != Some(&message) {
             self.save_error = Some(message);
             cx.emit(NoteEditorEvent::SaveFailed);

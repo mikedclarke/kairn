@@ -223,7 +223,9 @@ impl Workspace {
         if !self.save_note_editor(cx) {
             return false;
         }
-        self.save_library_text(cx);
+        if !self.save_library_text(cx) {
+            return false;
+        }
         if let Some(path) = self.note_editor.as_ref().map(|e| e.read(cx).path.clone()) {
             self.rename_note_to_title(path, cx);
         }
@@ -254,7 +256,11 @@ impl Workspace {
         use crate::note_editor::{NoteEditor, NoteEditorEvent};
 
         if self.doc_error.is_some() || self.root_missing {
-            if self.note_editor.as_ref().is_some_and(|ed| ed.read(cx).is_dirty()) {
+            if let Some(editor) = &self.note_editor
+                && editor.read(cx).is_dirty()
+            {
+                let error = self.doc_error.clone().unwrap_or_else(|| "Notes folder is unavailable".into());
+                editor.update(cx, |ed, cx| ed.save_failed(error, cx));
                 return;
             }
             self.note_editor = None;
@@ -298,13 +304,8 @@ impl Workspace {
                 NoteEditorEvent::SaveFailed => {
                     if let Some(error) = this.note_editor.as_ref()
                         .and_then(|ed| ed.read(cx).save_error.clone())
-                        && let Some(win) = cx.active_window()
                     {
-                        cx.defer(move |cx| {
-                            let _ = win.update(cx, |_, window, cx| {
-                                window.push_notification(error, cx);
-                            });
-                        });
+                        this.notify_save_error(error, cx);
                     }
                     cx.notify();
                 }
@@ -1031,7 +1032,9 @@ impl Workspace {
             return;
         }
         // Whatever the previous text file still holds gets written first.
-        self.save_library_text(cx);
+        if !self.save_library_text(cx) {
+            return;
+        }
         let Ok(disk) = std::fs::read_to_string(&path) else {
             self.library_text = None;
             return;
@@ -1059,6 +1062,8 @@ impl Workspace {
             path,
             input,
             baseline: disk,
+            recovery: notes::RecoverySnapshot::default(),
+            save_error: None,
             _sub: sub,
             _save: None,
         });
@@ -1066,11 +1071,11 @@ impl Workspace {
 
     /// Write the text editor's buffer if it differs from its baseline.
     /// Atomic like every other write; the watcher skips it as a self-write.
-    pub(crate) fn save_library_text(&mut self, cx: &mut Context<Self>) {
-        let Some(ed) = &self.library_text else { return };
+    pub(crate) fn save_library_text(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(ed) = &self.library_text else { return true };
         let value = ed.input.read(cx).value().to_string();
         if value == ed.baseline {
-            return;
+            return true;
         }
         let path = ed.path.clone();
         match notes::write_note(&path, &value) {
@@ -1078,9 +1083,38 @@ impl Workspace {
                 self.note_self_write(&path);
                 if let Some(ed) = &mut self.library_text {
                     ed.baseline = value;
+                    ed.save_error = None;
                 }
             }
-            Err(e) => eprintln!("kairn: could not save {}: {e}", path.display()),
+            Err(e) => {
+                self.preserve_library_text(format!("Could not save this file: {e}"), cx);
+                return false;
+            }
+        }
+        true
+    }
+
+    fn preserve_library_text(&mut self, error: String, cx: &mut Context<Self>) {
+        let Some(ed) = &mut self.library_text else { return };
+        let content = ed.input.read(cx).value().to_string();
+        let message = match ed.recovery.preserve(&notes::recovery_directory(), &ed.path, &content) {
+            Ok(copy) => format!("{error}. Recovery copy: {}", copy.display()),
+            Err(e) => format!("{error}. Recovery also failed: {e}. Keep this file open."),
+        };
+        if ed.save_error.as_ref() != Some(&message) {
+            ed.save_error = Some(message.clone());
+            self.notify_save_error(message, cx);
+        }
+        cx.notify();
+    }
+
+    fn notify_save_error(&self, message: String, cx: &mut Context<Self>) {
+        if let Some(win) = cx.active_window() {
+            cx.defer(move |cx| {
+                let _ = win.update(cx, |_, window, cx| {
+                    window.push_notification(message, cx);
+                });
+            });
         }
     }
 
@@ -1095,13 +1129,23 @@ impl Workspace {
                 if self.library_text.as_ref().is_some_and(|ed| &ed.path == p)
         );
         if !keep {
-            self.save_library_text(cx);
+            if !self.save_library_text(cx) {
+                return;
+            }
             self.library_text = None;
             return;
         }
         let Some(ed) = &self.library_text else { return };
-        let Ok(disk) = std::fs::read_to_string(&ed.path) else { return };
         let current = ed.input.read(cx).value().to_string();
+        let disk = match std::fs::read_to_string(&ed.path) {
+            Ok(disk) => disk,
+            Err(e) => {
+                if current != ed.baseline {
+                    self.preserve_library_text(format!("Could not reload this file: {e}"), cx);
+                }
+                return;
+            }
+        };
         if current != ed.baseline || disk == ed.baseline {
             return;
         }
@@ -1333,7 +1377,6 @@ impl Workspace {
         if !self.flush_note_editor(cx) {
             return;
         }
-        self.save_library_text(cx);
         match notes::rename_library_path(path, name) {
             Ok(new_path) => self.relocate_library_path(path, &new_path, window, cx),
             Err(e) => {
@@ -1380,7 +1423,6 @@ impl Workspace {
         if !self.flush_note_editor(cx) {
             return;
         }
-        self.save_library_text(cx);
         match notes::move_library_path(&src, &dest_dir) {
             Ok(new_path) => {
                 self.vault_history.push(crate::history::VaultOp::PathMove {
@@ -1463,7 +1505,6 @@ impl Workspace {
         if !self.flush_note_editor(cx) {
             return;
         }
-        self.save_library_text(cx);
         match os_trash(path) {
             Ok(()) => {
                 // Dropped, not synced out: a save after the delete would
@@ -2170,6 +2211,8 @@ pub(crate) struct LibraryTextEditor {
     /// The file's content at load or last save: saves write only when the
     /// buffer differs, and external reloads land only while it is clean.
     pub baseline: String,
+    recovery: notes::RecoverySnapshot,
+    pub save_error: Option<String>,
     pub(crate) _sub: gpui::Subscription,
     pub(crate) _save: Option<Task<()>>,
 }

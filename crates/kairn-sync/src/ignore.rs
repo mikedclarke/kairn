@@ -89,5 +89,6 @@ mod tests {
         assert!(ignored("Notes/~$doc.md"));
         assert!(ignored("Notes/draft.tmp"));
         assert!(ignored("Calendar/.20260808.md.kairn-tmp.4321.7"));
+        assert!(ignored("Notes/.Example.sync-conflict-LOCAL.md.kairn-tmp.pending"));
     }
 }

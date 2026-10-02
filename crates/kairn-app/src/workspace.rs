@@ -8,7 +8,7 @@ use gpui::{
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Task, Window, div,
     prelude::FluentBuilder as _, px,
 };
-use gpui_component::Root;
+use gpui_component::{Root, WindowExt as _};
 use kairn_core as notes;
 
 use crate::overlays::Overlay;
@@ -306,6 +306,15 @@ impl Workspace {
             notes::ensure_layout(&notes_root);
         }
         let self_writes = crate::vault_state::SelfWrites::default();
+        let recovery = notes::recovery_directory();
+        if !notes::recovery_files(&recovery).is_empty() {
+            let window = window.window_handle();
+            cx.defer(move |cx| {
+                let _ = window.update(cx, |_, window, cx| {
+                    window.push_notification(format!("Unsaved edits have recovery copies in {}", recovery.display()), cx);
+                });
+            });
+        }
         let (notes_watcher, notes_watch_task) =
             Self::watch_notes(notes_root.clone(), self_writes.clone(), cx);
         let (library_watchers, library_watch_task) =

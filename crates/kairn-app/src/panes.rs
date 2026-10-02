@@ -734,7 +734,8 @@ impl Workspace {
         t: &KairnTheme,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
-        let error = self.note_editor.as_ref()?.read(cx).save_error.as_ref()?;
+        let error = self.note_editor.as_ref().and_then(|ed| ed.read(cx).save_error.as_ref())
+            .or_else(|| self.library_text.as_ref().and_then(|ed| ed.save_error.as_ref()))?;
         Some(
             div()
                 .mb(px(10.))
@@ -1130,5 +1131,4 @@ fn spans_text(t: &KairnTheme, spans: &[Span]) -> StyledText {
 fn spans_el(t: &KairnTheme, spans: &[Span], base_color: gpui::Hsla) -> gpui::Div {
     div().text_color(base_color).child(spans_text(t, spans))
 }
-
 

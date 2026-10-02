@@ -28,7 +28,7 @@ pub fn write_conflict_copy(note: &Path, content: &str) -> io::Result<PathBuf> {
         let copy = dir.join(&name);
         let mut tmp_name = std::ffi::OsString::from(".");
         tmp_name.push(&name);
-        tmp_name.push(".kairn-tmp");
+        tmp_name.push(".kairn-tmp.pending");
         let tmp = dir.join(tmp_name);
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -64,10 +64,161 @@ pub fn write_conflict_copy(note: &Path, content: &str) -> io::Result<PathBuf> {
     }
 }
 
+pub fn recovery_directory() -> PathBuf {
+    crate::settings::config_path().with_file_name("recovery")
+}
+
+#[derive(Default)]
+pub struct RecoverySnapshot {
+    original: PathBuf,
+    content: String,
+    copy: Option<PathBuf>,
+}
+
+impl RecoverySnapshot {
+    pub fn preserve(&mut self, dir: &Path, original: &Path, content: &str) -> io::Result<PathBuf> {
+        if self.original == original
+            && self.content == content
+            && let Some(copy) = &self.copy
+            && fs::read_to_string(copy).is_ok_and(|saved| saved == content)
+        {
+            return Ok(copy.clone());
+        }
+        let copy = write_recovery_copy(dir, original, content)?;
+        self.original = original.to_path_buf();
+        self.content = content.to_string();
+        self.copy = Some(copy.clone());
+        Ok(copy)
+    }
+}
+
+fn recovery_name(original: &Path) -> std::ffi::OsString {
+    let mut name = std::ffi::OsString::from("content");
+    if let Some(ext) = original.extension() {
+        name.push(".");
+        name.push(ext);
+    }
+    name
+}
+
+fn write_recovery_copy(dir: &Path, original: &Path, content: &str) -> io::Result<PathBuf> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)?;
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S%.9f");
+    let id = format!(
+        "{stamp}-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let pending = dir.join(format!(".pending-{id}"));
+    let dest = dir.join(format!("recovery-{id}"));
+    builder.recursive(false).create(&pending)?;
+    let name = recovery_name(original);
+    let result = (|| {
+        for (name, bytes) in [
+            (name.clone(), content.as_bytes().to_vec()),
+            ("source.json".into(), serde_json::to_vec(original)?),
+        ] {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(pending.join(name))?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        #[cfg(unix)]
+        fs::File::open(&pending)?.sync_all()?;
+        fs::rename(&pending, &dest)?;
+        #[cfg(unix)]
+        fs::File::open(dir)?.sync_all()?;
+        Ok(dest.join(name))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&pending);
+    }
+    result
+}
+
+pub fn recovery_files(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<_> = entries
+        .flatten()
+        .filter_map(|entry| {
+            if !entry.file_name().to_string_lossy().starts_with("recovery-") {
+                return None;
+            }
+            let original: PathBuf =
+                serde_json::from_slice(&fs::read(entry.path().join("source.json")).ok()?).ok()?;
+            let path = entry.path().join(recovery_name(&original));
+            path.is_file().then_some(path)
+        })
+        .collect();
+    files.sort();
+    files
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{NoteBuffer, ScratchRoot};
+
+    #[test]
+    fn unsaved_text_survives_a_missing_vault_and_restart() {
+        let scratch = ScratchRoot::new("failed-save");
+        let original = scratch.0.join("unmounted/Notes/Example.md");
+        let dir = scratch.0.join("settings/recovery");
+        let mut snapshot = RecoverySnapshot::default();
+        let copy = snapshot.preserve(&dir, &original, "unsaved\r\n").unwrap();
+        assert_eq!(
+            snapshot.preserve(&dir, &original, "unsaved\r\n").unwrap(),
+            copy
+        );
+        drop(snapshot);
+        assert!(!original.parent().unwrap().exists());
+        assert_eq!(recovery_files(&dir), vec![copy.clone()]);
+        assert_eq!(fs::read_to_string(&copy).unwrap(), "unsaved\r\n");
+        let source: PathBuf =
+            serde_json::from_slice(&fs::read(copy.parent().unwrap().join("source.json")).unwrap())
+                .unwrap();
+        assert_eq!(source, original);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(copy).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_failure_is_reported_and_new_edits_get_a_new_copy() {
+        let scratch = ScratchRoot::new("recovery-retry");
+        let blocked = scratch.write("blocked", "not a directory");
+        let original = scratch.0.join("Notes/Example.json");
+        let mut snapshot = RecoverySnapshot::default();
+        assert!(snapshot.preserve(&blocked, &original, "first").is_err());
+        let dir = scratch.0.join("recovery");
+        let first = snapshot.preserve(&dir, &original, "first").unwrap();
+        let second = snapshot.preserve(&dir, &original, "second").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(fs::read_to_string(first).unwrap(), "first");
+        assert_eq!(fs::read_to_string(second).unwrap(), "second");
+        assert_eq!(recovery_files(&dir).len(), 2);
+    }
 
     #[test]
     fn conflicts_survive_closed_buffers_and_rediscovery() {
