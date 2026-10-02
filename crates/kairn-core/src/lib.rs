@@ -16,6 +16,7 @@
 //! bracketed.
 
 pub mod activity;
+mod atomic_file;
 pub mod blocks;
 pub mod buffer;
 pub mod file_lock;

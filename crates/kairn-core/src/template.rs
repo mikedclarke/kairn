@@ -175,6 +175,16 @@ mod tests {
     }
 
     #[test]
+    fn saving_an_unreadable_template_preserves_the_original_bytes() {
+        let root = ScratchRoot::new("template-unreadable");
+        let path = root.write("Notes/@Templates/Daily.md", "");
+        let original = b"---\ntitle: Daily\n---\n\xff";
+        fs::write(&path, original).unwrap();
+        assert!(save_daily_template(&root.0, "replacement\n").is_err());
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[test]
     fn strips_a_redundant_daily_title() {
         // A leading H1 (the date title) and the blank line under it go.
         assert_eq!(

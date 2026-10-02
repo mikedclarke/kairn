@@ -75,6 +75,7 @@ mod tests {
 
     #[test]
     fn retime_preserves_written_style() {
+        assert_eq!(retime_line("* [[Log 09:00]] 10:00 call".into(), 660, None).as_deref(), Some("* [[Log 09:00]] 11:00 call"));
         assert_eq!(retime_line("* call\u{00a0}09:00".into(), 600, None).as_deref(), Some("* call\u{00a0}10:00"));
         assert_eq!(
             retime_line("* 09:00 standup".into(), 600, None).as_deref(),

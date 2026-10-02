@@ -77,34 +77,18 @@ pub fn time_blocks(text: &str) -> Vec<TimeBlock> {
 /// 24-hour hour stays padded, and an existing range keeps its separator.
 /// `None` when the line has no time token to rewrite.
 pub fn retime_line(line: &str, start: NaiveTime, end: Option<NaiveTime>) -> Option<String> {
-    match parse::parse_line(line) {
-        Line::Task { state, .. } if state != TaskState::Cancelled => {}
-        Line::Bullet { .. } | Line::Text { .. } => {}
+    let spans = match parse::parse_line(line) {
+        Line::Task { state, spans } if state != TaskState::Cancelled => spans,
+        Line::Bullet { spans } | Line::Text { spans } => spans,
         _ => return None,
-    }
-    // Spans carry owned text, so the token is located in the raw line with
-    // the same scan `find_time` uses; the parse above only decides that
-    // this line kind is retimeable at all.
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let boundary =
-            i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b':';
-        if boundary
-            && bytes[i].is_ascii_digit()
-            && let Some((end_ix, ..)) = parse::parse_time_token(line, i)
+    };
+    let mut offset = parse::spans_start_col(line);
+    for (kind, text) in spans {
+        if searchable(kind)
+            && let Some((range, _, _)) = find_time(&text)
         {
-            // A time-shaped path segment inside a URL is not a schedule.
-            let word_start = line[..i].char_indices().rev()
-                .find(|(_, ch)| ch.is_whitespace())
-                .map_or(0, |(offset, ch)| offset + ch.len_utf8());
-            let word_end = line[i..]
-                .find(char::is_whitespace)
-                .map_or(line.len(), |w| i + w);
-            if line[word_start..word_end].contains("://") {
-                i = word_end;
-                continue;
-            }
+            let i = offset + range.start;
+            let end_ix = offset + range.end;
             let token = &line[i..end_ix];
             let lower = token.to_ascii_lowercase();
             let meridiem = lower.contains("am") || lower.contains("pm");
@@ -120,7 +104,7 @@ pub fn retime_line(line: &str, start: NaiveTime, end: Option<NaiveTime>) -> Opti
             }
             return Some(format!("{}{}{}", &line[..i], new_token, &line[end_ix..]));
         }
-        i += 1;
+        offset += text.len();
     }
     None
 }
@@ -333,5 +317,21 @@ mod tests {
             retime_line("* see https://example.com/10:30/x at 11:00", t(9, 0), None),
             Some("* see https://example.com/10:30/x at 9:00".into())
         );
+    }
+
+    #[test]
+    fn retiming_uses_the_same_span_as_the_timeline() {
+        for (line, expected) in [
+            ("* [[Log 09:00]] 10:00 call", "* [[Log 09:00]] 11:00 call"),
+            ("* [09:00](https://example.com/08:00) 10:00 call", "* [09:00](https://example.com/08:00) 11:00 call"),
+            ("  + [ ] [[日記 09:00]]\u{2003}**10:00** call", "  + [ ] [[日記 09:00]]\u{2003}**11:00** call"),
+            ("* @done(2026-08-07 09:00) 10:00 call", "* @done(2026-08-07 09:00) 11:00 call"),
+        ] {
+            assert_eq!(time_blocks(line)[0].start, t(10, 0));
+            let retimed = retime_line(line, t(11, 0), None).unwrap();
+            assert_eq!(retimed, expected);
+            assert_eq!(time_blocks(&retimed)[0].start, t(11, 0));
+        }
+        assert!(retime_line("* [[Only 09:00]]", t(11, 0), None).is_none());
     }
 }

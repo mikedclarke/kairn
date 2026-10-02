@@ -114,18 +114,15 @@ pub fn append_line_in_text(existing: &str, line: &str) -> (String, usize) {
 /// note). Returns whether the file was created.
 pub fn create_note_if_absent(path: &Path, content: &str) -> io::Result<bool> {
     let _lock = lock_for_create(path)?;
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error),
     }
-    match fs::OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(mut file) => {
-            use std::io::Write as _;
-            file.write_all(content.as_bytes())?;
-            Ok(true)
-        }
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-        Err(e) => Err(e),
-    }
+    crate::atomic_file::publish(path, false, |file| {
+        use std::io::Write;
+        file.write_all(content.as_bytes())
+    })
 }
 
 /// Replace a note under the shared lock. For snapshot-based edits, use
@@ -398,48 +395,10 @@ fn lock_for_create(path: &Path) -> io::Result<NoteLock> {
 }
 
 pub(crate) fn atomic_write(path: &Path, content: &str) -> io::Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let name = path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
-    // The temp name carries pid + counter so two running instances (or two
-    // quick writes) never collide on it.
-    let tmp = path.with_file_name(format!(
-        ".{}.kairn-tmp.{}.{}",
-        name.to_string_lossy(),
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed),
-    ));
-    let write = (|| {
-        {
-            use std::io::Write as _;
-            let mut file = fs::File::create(&tmp)?;
-            file.write_all(content.as_bytes())?;
-            // Rename is atomic for the *name*, not for the data behind it: with
-            // no fsync here a power cut can leave the renamed file holding
-            // stale or empty blocks, which is a silently lost edit rather than
-            // a half-written note.
-            file.sync_all()?;
-        }
-        // Rename replaces the inode; carry the original's permissions over
-        // so a private note (0600) doesn't silently become world-readable.
-        if let Ok(meta) = fs::metadata(path) {
-            fs::set_permissions(&tmp, meta.permissions())?;
-        }
-        fs::rename(&tmp, path)?;
-        // The new directory entry is durable only once the directory itself is
-        // synced. Not every platform allows opening a directory for that, so a
-        // failure here is not fatal.
-        if let Some(dir) = path.parent() {
-            let _ = fs::File::open(dir).and_then(|d| d.sync_all());
-        }
-        Ok(())
-    })();
-    if write.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    write
+    crate::atomic_file::publish(path, true, |file| {
+        use std::io::Write;
+        file.write_all(content.as_bytes())
+    }).map(|_| ())
 }
 
 /// Rewrite one line of a note's full text. `expected` is the line as it read
