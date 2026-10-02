@@ -2714,6 +2714,7 @@ dependencies = [
  "parking_lot",
  "portable-pty",
  "ropey 1.6.1",
+ "tempfile",
 ]
 
 [[package]]

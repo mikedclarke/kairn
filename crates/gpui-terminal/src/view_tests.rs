@@ -100,3 +100,61 @@ fn stalled_input_keeps_ui_responsive_and_reports_overflow(cx: &mut TestAppContex
     assert!(errors.borrow()[0].contains("buffer is full"));
     resume.send(()).unwrap();
 }
+
+#[gpui::test]
+fn non_web_links_disclose_the_target_and_require_confirmation(cx: &mut TestAppContext) {
+    let (_, cx) = cx.add_window_view(|_, _| EmptyView);
+    let terminal = cx.update(|window, cx| {
+        cx.new(|cx| {
+            TerminalView::new(
+                std::io::sink(),
+                std::io::empty(),
+                TerminalConfig::default(),
+                window,
+                cx,
+            )
+        })
+    });
+    for target in ["file:///tmp/example.txt", "example-app:open/item"] {
+        terminal.update_in(cx, |view, window, cx| {
+            view.state.process_bytes(
+                format!("\x1b[2J\x1b[H\x1b]8;;{target}\x1b\\Documentation\x1b]8;;\x1b\\")
+                    .as_bytes(),
+            );
+            *view.last_layout.lock() = Some((
+                gpui::point(gpui::px(0.), gpui::px(0.)),
+                gpui::px(10.),
+                gpui::px(20.),
+            ));
+            view.update_hovered_link(
+                gpui::point(gpui::px(5.), gpui::px(5.)),
+                &gpui::Modifiers::secondary_key(),
+                cx,
+            );
+            assert_eq!(view.hovered_link(), Some(target));
+            view.open_link(view.hovered_link().unwrap().to_owned(), window, cx);
+        });
+        assert!(cx.has_pending_prompt());
+        assert!(cx.pending_prompt().unwrap().1.contains(target));
+        assert_eq!(cx.opened_url(), None);
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(cx.opened_url(), None);
+    }
+    let target = "example-app:open/item";
+    terminal.update_in(cx, |view, window, cx| {
+        view.open_link(target.into(), window, cx)
+    });
+    cx.simulate_prompt_answer("Open link");
+    cx.run_until_parked();
+    assert_eq!(cx.opened_url().as_deref(), Some(target));
+    terminal.update_in(cx, |view, window, cx| {
+        view.open_link("https://example.com".into(), window, cx)
+    });
+    assert!(!cx.has_pending_prompt());
+    assert_eq!(cx.opened_url().as_deref(), Some("https://example.com"));
+    terminal.update_in(cx, |view, window, cx| {
+        view.open_link("https://example.com\nmalformed".into(), window, cx)
+    });
+    assert_eq!(cx.opened_url().as_deref(), Some("https://example.com"));
+}

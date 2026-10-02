@@ -51,7 +51,7 @@ use crate::colors::ColorPalette;
 use crate::event::{GpuiEventProxy, TerminalEvent};
 use crate::input::keystroke_to_bytes;
 use crate::pty_input::PtyWriter;
-use crate::links::{URL_REGEX, link_at_point};
+use crate::links::{URL_REGEX, is_web_link, link_at_point};
 use crate::render::TerminalRenderer;
 use crate::terminal::TerminalState;
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
@@ -419,6 +419,7 @@ pub struct TerminalView {
     _reader_task: Task<()>,
     _writer_task: Task<()>,
     input_error_callback: Option<InputErrorCallback>,
+    pty_logger: Option<Arc<crate::pty_log::PtyLogger>>,
 
     /// Callback to notify the PTY about size changes
     resize_callback: Option<Arc<ResizeCallback>>,
@@ -631,6 +632,7 @@ impl TerminalView {
             _reader_task: reader_task,
             _writer_task: writer_task,
             input_error_callback: None,
+            pty_logger,
             resize_callback: None,
             key_handler: None,
             bell_callback: None,
@@ -962,6 +964,37 @@ impl TerminalView {
         }
     }
 
+    /// The actual link destination under the modifier-held pointer.
+    pub fn hovered_link(&self) -> Option<&str> {
+        self.hovered_link.as_ref().map(|(uri, _, _)| uri.as_str())
+    }
+
+    pub fn diagnostics_status(&self) -> Option<&'static str> {
+        self.pty_logger.as_ref().map(|logger| logger.status())
+    }
+
+    fn open_link(&mut self, uri: String, window: &mut Window, cx: &mut Context<Self>) {
+        if uri.chars().any(char::is_control) {
+            return;
+        }
+        if is_web_link(&uri) {
+            cx.open_url(&uri);
+            return;
+        }
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Open this terminal link?",
+            Some(&format!("This link can open a file or another application.\n\n{uri}")),
+            &[PromptButton::cancel("Cancel"), PromptButton::new("Open link")],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if matches!(answer.await, Ok(1)) {
+                let _ = this.update_in(cx, |_, _, cx| cx.open_url(&uri));
+            }
+        }).detach();
+    }
+
     /// Modifier changes re-resolve the hovered link in place, so pressing or
     /// releasing the modifier updates the underline without pointer movement.
     fn on_modifiers_changed(
@@ -996,7 +1029,7 @@ impl TerminalView {
             && event.modifiers.secondary()
             && let Some((uri, _, _)) = self.link_at(event.position)
         {
-            cx.open_url(&uri);
+            self.open_link(uri, window, cx);
             return;
         }
 

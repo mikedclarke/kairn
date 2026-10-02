@@ -50,9 +50,19 @@ impl Workspace {
     }
 
     fn render_terminal_pane(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {
-        let pane = div().size_full().min_w(px(0.)).min_h(px(0.)).bg(t.term_bg);
+        let pane = div().id("terminal-pane").size_full().min_w(px(0.)).min_h(px(0.)).bg(t.term_bg);
         match self.sessions.get(self.active_session) {
-            Some(session) => pane.child(session.view.clone()),
+            Some(session) => {
+                let uri = session.view.read(cx).hovered_link().map(str::to_owned);
+                let diagnostics = session.view.read(cx).diagnostics_status();
+                pane.when_some(uri, |pane, uri| pane.tooltip(crate::ui::hover_hint(uri, None)))
+                    .flex().flex_col()
+                    .child(div().flex_1().min_h(px(0.)).child(session.view.clone()))
+                    .when_some(diagnostics, |pane, status| pane.child(
+                        div().px(px(8.)).py(px(4.)).text_size(t.ui_px(11.))
+                            .text_color(t.amber).child(status)
+                    ))
+            }
             None => pane.child(self.render_start_page(t, cx)),
         }
     }
@@ -1143,4 +1153,3 @@ fn spans_text(t: &KairnTheme, spans: &[Span]) -> StyledText {
 fn spans_el(t: &KairnTheme, spans: &[Span], base_color: gpui::Hsla) -> gpui::Div {
     div().text_color(base_color).child(spans_text(t, spans))
 }
-

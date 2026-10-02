@@ -12,6 +12,7 @@ mod session;
 mod settings_dialog;
 mod sidebar;
 mod theme;
+mod terminal_clipboard;
 mod ui;
 mod vault_state;
 mod workspace;

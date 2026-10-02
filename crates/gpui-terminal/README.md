@@ -14,6 +14,12 @@ top of upstream:
 - PTY input and query replies use a worker with a 1 MiB / 128-operation queue.
   Overflow rejects the whole operation and reports through `with_input_error_callback`.
   Bracketed pastes strip ESC characters and enqueue both guards with the payload.
+- Non-web links require confirmation; `hovered_link()` exposes the target for
+  the embedding app's tooltip.
+- `KAIRN_PTY_LOG=<directory>` enables output diagnostics. Input capture requires
+  `KAIRN_PTY_LOG_INPUT=1` and includes unechoed passwords. Logs use private
+  permissions, stop at 4 MiB each, and retain ten files without removing active
+  logs. `diagnostics_status()` exposes the logging state for the app's UI.
 
 Worth offering upstream once battle-tested.
 

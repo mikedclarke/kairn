@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use gpui::{AppContext, ClipboardItem, Context, Edges, Entity, SharedString, Task, WeakEntity, Window, px};
+use gpui::{AppContext, Context, Edges, Entity, SharedString, Task, WeakEntity, Window, px};
 use gpui_terminal::{TerminalConfig, TerminalView};
 use gpui_component::WindowExt as _;
 use parking_lot::Mutex;
@@ -206,6 +206,10 @@ pub fn spawn(
     let view = cx.new(|cx| {
         let terminal = TerminalView::new(writer, reader, config, window, cx);
         let focus = terminal.focus_handle().clone();
+        let clipboard = crate::terminal_clipboard::TerminalClipboard::new(move |window, cx| {
+            clipboard_workspace.upgrade().is_some_and(|workspace| workspace.read(cx).session_visible(id))
+                && window.is_window_active() && focus.is_focused(window)
+        });
         terminal
             .with_input_error_callback(|window, cx, error| {
                 window.push_notification(error.to_string(), cx);
@@ -226,16 +230,8 @@ pub fn spawn(
                     ws.set_session_title(id, title.into(), cx);
                 });
             })
-            // OSC 52: applications copy through the terminal (herdr's
-            // copy, tmux/vim yanks over SSH). Without this the copy
-            // silently does nothing.
             .with_clipboard_store_callback(move |window, cx, text| {
-                let visible = clipboard_workspace.upgrade().is_some_and(|workspace| {
-                    workspace.read(cx).session_visible(id)
-                });
-                if visible && window.is_window_active() && focus.is_focused(window) {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
-                }
+                clipboard.store(text, window, cx);
             })
     });
 
