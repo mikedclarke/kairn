@@ -6,6 +6,10 @@ gpui). Wired in via `[patch.crates-io]` in the root Cargo.toml.
 
 Local changes, kept deliberately small:
 
+- `src/platform/mac/metal_atlas.rs`: remove each evicted image's key even
+  while other images still share its texture. This matches the Linux atlas
+  and prevents stale keys and repeated decrements when image caches expire.
+
 - `src/text_system/line_wrapper.rs` and `src/text_system/line_layout.rs`
   (`compute_wrap_boundaries`, which duplicates the wrapper's logic): never
   record a wrap-boundary candidate directly before closing punctuation.

@@ -3459,6 +3459,7 @@ dependencies = [
  "gpui-component",
  "gpui-component-assets",
  "gpui-terminal",
+ "image",
  "kairn-core",
  "notify 8.2.0",
  "parking_lot",

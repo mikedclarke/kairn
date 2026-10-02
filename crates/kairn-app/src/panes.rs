@@ -666,7 +666,13 @@ impl Workspace {
                 // the open one ringed. This is the "pick image 1, 2 or 3"
                 // flow — click through, compare, tell the agent.
                 if self.library_siblings.len() > 1 {
-                    let mut strip = div().flex().flex_wrap().gap(px(8.));
+                    let mut strip = gpui::image_cache(crate::library_images::Thumbnails(
+                        (
+                            ElementId::from("library-thumbnails"),
+                            SharedString::from(path.parent().unwrap_or(&path).to_string_lossy().into_owned()),
+                        ).into(),
+                    ))
+                    .flex().flex_wrap().gap(px(8.));
                     for (i, sib) in self.library_siblings.iter().enumerate() {
                         let current = *sib == path;
                         let target = sib.clone();
@@ -703,6 +709,12 @@ impl Workspace {
                         );
                 }
                 body = body.child(facts_line).child(actions);
+                return gpui::image_cache(gpui::retain_all((
+                    ElementId::from("library-preview"),
+                    SharedString::from(path.to_string_lossy().into_owned()),
+                )))
+                .child(body)
+                .into_any_element();
             }
             FileKind::Text
                 if self

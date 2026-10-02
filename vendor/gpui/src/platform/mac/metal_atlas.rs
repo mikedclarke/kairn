@@ -59,7 +59,7 @@ impl PlatformAtlas for MetalAtlas {
 
     fn remove(&self, key: &AtlasKey) {
         let mut lock = self.0.lock();
-        let Some(id) = lock.tiles_by_key.get(key).map(|v| v.texture_id) else {
+        let Some(id) = lock.tiles_by_key.remove(key).map(|v| v.texture_id) else {
             return;
         };
 
@@ -81,7 +81,6 @@ impl PlatformAtlas for MetalAtlas {
 
             if texture.is_unreferenced() {
                 textures.free_list.push(id.index as usize);
-                lock.tiles_by_key.remove(key);
             } else {
                 *texture_slot = Some(texture);
             }
@@ -279,3 +278,66 @@ impl From<etagere::Rectangle> for Bounds<DevicePixels> {
 struct AssertSend<T>(T);
 
 unsafe impl<T> Send for AssertSend<T> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ImageId, RenderImageParams, size};
+
+    #[test]
+    fn removing_images_sharing_a_texture_clears_every_key() {
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let atlas = MetalAtlas::new(device);
+        let key = |id| {
+            AtlasKey::from(RenderImageParams {
+                image_id: ImageId(id),
+                frame_index: 0,
+            })
+        };
+        let insert = |key: &AtlasKey| {
+            atlas
+                .get_or_insert_with(key, &mut || {
+                    Ok(Some((
+                        size(DevicePixels(8), DevicePixels(8)),
+                        Cow::Owned(vec![0; 8 * 8 * 4]),
+                    )))
+                })
+                .unwrap()
+                .unwrap()
+        };
+
+        for cycle in 0..32 {
+            let first = key(cycle * 2);
+            let second = key(cycle * 2 + 1);
+            let first_tile = insert(&first);
+            let second_tile = insert(&second);
+            assert_eq!(first_tile.texture_id, second_tile.texture_id);
+
+            atlas.remove(&first);
+            assert!(!atlas.0.lock().tiles_by_key.contains_key(&first));
+            atlas.remove(&first);
+            assert_eq!(
+                atlas
+                    .0
+                    .lock()
+                    .texture(second_tile.texture_id)
+                    .live_atlas_keys,
+                1
+            );
+
+            atlas.remove(&second);
+            let state = atlas.0.lock();
+            assert!(state.tiles_by_key.is_empty());
+            assert!(
+                state
+                    .polychrome_textures
+                    .textures
+                    .iter()
+                    .all(Option::is_none)
+            );
+            assert_eq!(state.polychrome_textures.textures.len(), 1);
+        }
+    }
+}
