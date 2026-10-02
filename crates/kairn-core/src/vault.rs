@@ -737,7 +737,7 @@ mod tests {
         let root = ScratchRoot::new("scan-permissions");
         let calendar = root.0.join("Calendar");
         let permissions = fs::metadata(&calendar).unwrap().permissions();
-        fs::set_permissions(&calendar, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&calendar, fs::Permissions::from_mode(0o000)).unwrap();
         let can_read = fs::read_dir(&calendar).is_ok();
         let scan = VaultScan::new(&root.0);
         fs::set_permissions(&calendar, permissions).unwrap();
