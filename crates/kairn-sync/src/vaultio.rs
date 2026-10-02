@@ -97,16 +97,71 @@ impl HashCache for NoHashCache {
 
 pub struct VaultIo {
     root: PathBuf,
+    root_metadata: Option<std::fs::Metadata>,
+    #[cfg(unix)]
+    _root_handle: Option<std::fs::File>,
     /// The device label stamped into conflict-copy names, e.g. `IPHONE`.
     device_label: String,
 }
 
 impl VaultIo {
     pub fn new(root: impl Into<PathBuf>, device_label: impl Into<String>) -> Self {
+        let root = root.into();
+        #[cfg(unix)]
+        let handle = std::fs::File::open(&root).ok();
+        #[cfg(unix)]
+        let root_metadata = handle.as_ref().and_then(|file| file.metadata().ok());
+        #[cfg(not(unix))]
+        let root_metadata = std::fs::metadata(&root).ok();
         Self {
-            root: root.into(),
+            root,
+            root_metadata,
+            #[cfg(unix)]
+            _root_handle: handle,
             device_label: device_label.into(),
         }
+    }
+
+    pub fn validate_root(&self) -> io::Result<()> {
+        let current = std::fs::metadata(&self.root).map_err(|error| {
+            io::Error::new(error.kind(), format!("vault root is missing or unreadable: {}", self.root.display()))
+        })?;
+        if !current.is_dir() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "vault root is missing or not a directory"));
+        }
+        let Some(original) = &self.root_metadata else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "vault root was unavailable when sync started; restart sync after checking the folder"));
+        };
+        #[cfg(unix)]
+        let same = {
+            use std::os::unix::fs::MetadataExt;
+            original.dev() == current.dev() && original.ino() == current.ino()
+        };
+        #[cfg(not(unix))]
+        let same = original.created()? == current.created()?;
+        if !same {
+            return Err(io::Error::other("vault root changed; restart sync after checking the folder"));
+        }
+        Ok(())
+    }
+
+    fn ensure_parent(&self, path: &VaultPath) -> io::Result<()> {
+        self.validate_root()?;
+        let mut dir = self.root.clone();
+        let mut parts = path.0.split('/').peekable();
+        while let Some(part) = parts.next() {
+            if parts.peek().is_none() {
+                break;
+            }
+            self.validate_root()?;
+            dir.push(part);
+            match std::fs::create_dir(&dir) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.validate_root()
     }
 
     fn abs(&self, path: &VaultPath) -> PathBuf {
@@ -118,12 +173,14 @@ impl VaultIo {
     }
 
     pub fn read(&self, path: &VaultPath) -> io::Result<Vec<u8>> {
+        self.validate_root()?;
         std::fs::read(self.abs(path))
     }
 
     /// Read a file if it exists, returning `None` for a missing file (a clean
     /// "not there" rather than an error the caller must special-case).
     pub fn read_opt(&self, path: &VaultPath) -> io::Result<Option<Vec<u8>>> {
+        self.validate_root()?;
         read_opt_abs(&self.abs(path))
     }
 
@@ -140,15 +197,15 @@ impl VaultIo {
         before: &BeforeWrite,
     ) -> io::Result<bool> {
         let dest = self.abs(path);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        self.ensure_parent(path)?;
         let _lock = kairn_core::NoteLock::acquire(&dest)?;
         atomic_write(&dest, content, || {
+            self.validate_root()?;
             if !pre.holds(read_opt_abs(&dest)?.as_deref()) {
                 return Ok(false);
             }
             before(path);
+            self.validate_root()?;
             Ok(true)
         })
     }
@@ -162,6 +219,7 @@ impl VaultIo {
         pre: &Precondition,
         before: &BeforeWrite,
     ) -> io::Result<bool> {
+        self.validate_root()?;
         let dest = self.abs(path);
         if !dest.parent().is_some_and(Path::is_dir) {
             return Ok(pre.holds(None));
@@ -171,6 +229,7 @@ impl VaultIo {
             return Ok(false);
         }
         before(path);
+        self.validate_root()?;
         match std::fs::remove_file(&dest) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
@@ -225,6 +284,7 @@ impl VaultIo {
         content: &[u8],
         before: &BeforeWrite,
     ) -> io::Result<VaultPath> {
+        self.validate_root()?;
         let original_abs = self.abs(original);
         for existing in kairn_core::conflict_copies(&original_abs) {
             if existing.extension() != original_abs.extension() {
@@ -264,22 +324,11 @@ impl VaultIo {
     /// moved since `cache` last saw them. The startup and 30-minute safety scans
     /// and the push scan all run through this.
     pub fn scan_cached(&self, cache: &dyn HashCache) -> io::Result<Vec<ScannedFile>> {
-        // A vault root that isn't there is a hard error, never an empty vault:
-        // an unmounted volume or a mistyped path would otherwise read as "every
-        // file was deleted" and the push phase would tombstone the lot on every
-        // device (invariant §15.2).
-        if !self.root.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "vault root is missing or not a directory: {} (unmounted volume, or the wrong path?)",
-                    self.root.display()
-                ),
-            ));
-        }
+        self.validate_root()?;
         let mut out = Vec::new();
         let now_ns = now_ns();
         self.scan_dir(&self.root, cache, now_ns, &mut out)?;
+        self.validate_root()?;
         out.sort_by(|a, b| a.path.0.cmp(&b.path.0));
         Ok(out)
     }
@@ -682,6 +731,37 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, VaultPath::new("Notes/a.md"));
         assert_eq!(files[0].hash, hash_bytes(b"a"));
+    }
+
+    #[test]
+    fn a_write_cannot_recreate_a_vault_that_disappeared_after_reading() {
+        let s = Scratch::new("lost-root-write");
+        let root = s.0.join("vault");
+        std::fs::create_dir(&root).unwrap();
+        let io = VaultIo::new(&root, "MAC");
+        let path = VaultPath::new("Notes/deep/a.md");
+        assert!(io.read_opt(&path).unwrap().is_none());
+        std::fs::remove_dir(&root).unwrap();
+        assert!(io.write(&path, b"remote", &Precondition::Absent, &*noop()).is_err());
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn a_root_replaced_in_the_before_write_hook_aborts_replacement() {
+        let s = Scratch::new("root-at-rename");
+        let root = s.0.join("vault");
+        let old = s.0.join("old");
+        std::fs::create_dir(&root).unwrap();
+        let io = VaultIo::new(&root, "MAC");
+        let path = VaultPath::new("a.md");
+        io.write(&path, b"local", &Precondition::Absent, &*noop()).unwrap();
+        let hook = |_: &VaultPath| {
+            std::fs::rename(&root, &old).unwrap();
+            std::fs::create_dir(&root).unwrap();
+        };
+        assert!(io.write(&path, b"remote", &Precondition::Any, &hook).is_err());
+        assert_eq!(std::fs::read(old.join("a.md")).unwrap(), b"local");
+        assert!(!root.join("a.md").exists());
     }
 
     #[test]

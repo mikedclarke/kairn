@@ -66,6 +66,7 @@ impl SyncContext<'_> {
 
 /// Run one full cycle and return what it did.
 pub fn run_cycle(ctx: &SyncContext) -> Result<CycleReport> {
+    ctx.vault.validate_root()?;
     let mut report = CycleReport::default();
     pull(ctx, &mut report)?;
     if ctx.cancelled() {
@@ -84,6 +85,7 @@ pub fn run_cycle(ctx: &SyncContext) -> Result<CycleReport> {
         pull(ctx, &mut report)?;
     }
     let cursor = ctx.state.cursor()?;
+    ctx.vault.validate_root()?;
     // The ack is a report, not a handshake: re-sending an unchanged cursor tells
     // the server nothing it does not already know.
     if ctx.state.acked_cursor()? != Some(cursor) {
@@ -374,6 +376,7 @@ fn push_one(
     };
 
     for _ in 0..MAX_PUSH_RETRIES {
+        ctx.vault.validate_root()?;
         if ctx.cancelled() {
             return Ok(false);
         }
@@ -481,6 +484,7 @@ fn push_delete(
     base_rev: Rev,
     report: &mut CycleReport,
 ) -> Result<bool> {
+    ctx.vault.validate_root()?;
     let announce = ctx.announce();
     match ctx.transport.delete(path, base_rev)? {
         PutOutcome::Accepted { .. } => {
@@ -1425,17 +1429,40 @@ mod tests {
             mac.write(&format!("Notes/{n}.md"), "keep me\n");
         }
         mac.sync();
+        let remote = s.client("remote");
+        let pending = VaultPath::new("Notes/pending.md");
+        remote.put_blob(&pending, 0, &hash_bytes(b"pending\n"), b"pending\n").unwrap();
         let settled = s.journal_len();
+        let cursor = mac.state.cursor().unwrap();
 
         std::fs::remove_dir_all(&mac.root).unwrap();
         let err = mac.try_sync().unwrap_err().to_string();
         assert!(err.contains("vault root is missing"), "{err}");
+        assert!(!mac.root.exists());
+        assert_eq!(mac.state.cursor().unwrap(), cursor);
 
         // Nothing was tombstoned, so the other devices still have the notes.
         assert_eq!(s.journal_len(), settled);
         let phone = Device::new(&s, "phone");
         phone.sync();
         assert_eq!(phone.read("Notes/1.md").as_deref(), Some("keep me\n"));
+    }
+
+    #[test]
+    fn replacing_the_vault_root_cannot_push_deletions_or_receive_a_pending_pull() {
+        let server = FakeServer::new();
+        let local = Device::new(&server, "replaced-root");
+        local.write("Notes/keep.md", "keep\n");
+        local.sync();
+        let pending = VaultPath::new("Notes/pending.md");
+        server.client("remote").put_blob(&pending, 0, &hash_bytes(b"pending\n"), b"pending\n").unwrap();
+        let settled = server.journal_len();
+        std::fs::remove_dir_all(&local.root).unwrap();
+        std::fs::create_dir(&local.root).unwrap();
+        assert!(local.try_sync().unwrap_err().to_string().contains("vault root changed"));
+        assert_eq!(server.journal_len(), settled);
+        assert_eq!(std::fs::read_dir(&local.root).unwrap().count(), 0);
+        assert!(!server.head(&VaultPath::new("Notes/keep.md")).unwrap().deleted);
     }
 
     #[test]
