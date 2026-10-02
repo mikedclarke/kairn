@@ -16,6 +16,7 @@ use kairn_core::{
 use serde_json::json;
 
 mod carry;
+mod carry_transfer;
 
 /// Exit codes are part of the interface: scripts and agents branch on them.
 const EXIT_FAILED: u8 = 1;
@@ -273,7 +274,7 @@ Blank lines and rules after the block belong to the boundary and are kept.")]
     #[command(long_about = "\
 Move every overdue open task off past daily notes and into one day
 (today, or --to). Each task line is appended to the destination and
-deleted from its old day — never duplicated — with its stale `>date`
+deleted from its old day, with its stale `>date`
 token stripped, since the day it lands on dates it. A `**group**` header
 travels with its tasks: written once at the destination, deleted from
 the old day when nothing is left under it.
@@ -287,7 +288,11 @@ success: a clean morning prints one line and exits 0.
 Carry looks back 14 days by default, so a vault carrying years of old
 open tasks (an import, a long break) never floods today by accident;
 anything older is counted and reported, never silently dropped. --from
-moves the window: `--from 2025-01-01` carries the lot, deliberately.")]
+moves the window: `--from 2025-01-01` carries the lot, deliberately.
+
+An interrupted carry resumes with the same --to and --section. Its saved
+transfer plan prevents duplicate appends. If a file changed meanwhile,
+carry stops for review and keeps the plan in .kairn/local/carry.json.")]
     Carry {
         /// Day the tasks land on: today, tomorrow, or 2026-08-12
         #[arg(long, value_name = "WHEN", default_value = "today")]
@@ -946,6 +951,21 @@ fn cmd_carry(
     actor: &str,
     json: bool,
 ) -> Result<(), Failure> {
+    let failure = |error: std::io::Error| Failure::new(EXIT_FAILED, error.to_string());
+    let tasks = open_tasks_in_vault(root).require_complete()
+        .map_err(|error| Failure::new(EXIT_FAILED, error.to_string()))?;
+    if let Some(transfer) = carry_transfer::Transfer::pending(root).map_err(failure)? {
+        if !transfer.matches(dest, section) {
+            return Err(Failure::new(EXIT_FAILED, transfer.resume_hint()));
+        }
+        if dry_run {
+            print_carry_report(transfer.report(), true, true, json);
+        } else {
+            let report = transfer.apply().map_err(failure)?;
+            print_carry_report(&report, false, true, json);
+        }
+        return Ok(());
+    }
     let today = Local::now().date_naive();
     if dest < today {
         return Err(Failure::new(2, "carry moves tasks forward: --to must be today or later"));
@@ -953,8 +973,7 @@ fn cmd_carry(
     // The window guards against flooding today from an imported or long-idle
     // vault; what falls outside it is reported, never silently dropped.
     let cutoff = from.unwrap_or(today - Duration::days(14));
-    let overdue: Vec<TaskRef> = open_tasks_in_vault(root)
-        .require_complete().map_err(|error| Failure::new(EXIT_FAILED, error.to_string()))?
+    let overdue: Vec<TaskRef> = tasks
         .into_iter()
         .filter(|t| t.file_date.is_some_and(|d| d < today) && t.due < dest)
         .collect();
@@ -1033,103 +1052,40 @@ fn cmd_carry(
         }
         return Ok(());
     }
-    // The destination gains the block first, then the source lines go: a
-    // line that changes underneath the delete ends up duplicated, never
-    // lost, and the failure is reported.
-    let rule = Settings::load().daily_template_rule;
-    let dest_path = write::ensure_day_note(root, dest, &rule).map_err(|e| {
-        Failure::new(EXIT_FAILED, format!("could not write the daily note: {e}"))
-    })?;
-    let block = carry::destination_block(&moves);
-    match section {
-        Some(heading) => {
-            write::append_to_section(&dest_path, heading, &block).map(|_| ())
-        }
-        None => write::append_line(&dest_path, &block).map(|_| ()),
-    }
-    .map_err(|e| {
-        Failure::new(EXIT_FAILED, format!("could not write {}: {e}", dest_path.display()))
-    })?;
-    let mut by_file: HashMap<&PathBuf, Vec<&carry::Move>> = HashMap::new();
-    for m in &moves {
-        by_file.entry(&m.task.path).or_default().push(m);
-    }
-    let mut leftovers: Vec<String> = Vec::new();
-    for (path, mut file_moves) in by_file {
-        // Bottom-up so earlier removals never shift a later line's index.
-        file_moves.sort_by_key(|m| std::cmp::Reverse(m.task.line_idx));
-        for m in &file_moves {
-            match write::remove_line_on_disk(path, m.task.line_idx, &m.task.line) {
-                Ok(Some(_)) => {}
-                Ok(None) => leftovers
-                    .push(format!("{}: {}", rel(root, path), task_text(&m.task.line))),
-                Err(e) => {
-                    return Err(Failure::new(
-                        EXIT_FAILED,
-                        format!("could not update {}: {e}", path.display()),
-                    ));
-                }
-            }
-        }
-        let headers: Vec<&str> = {
-            let mut seen = Vec::new();
-            for m in &file_moves {
-                if let Some(h) = m.header.as_deref()
-                    && !seen.contains(&h)
-                {
-                    seen.push(h);
-                }
-            }
-            seen
-        };
-        if headers.is_empty() {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(path) else { continue };
-        let lines: Vec<&str> = text.lines().collect();
-        let emptied: Vec<usize> = lines
-            .iter()
-            .enumerate()
-            .filter(|(i, line)| {
-                headers.contains(line) && carry::header_now_empty(&lines, *i)
-            })
-            .map(|(i, _)| i)
-            .collect();
-        for i in emptied.iter().rev() {
-            if let Err(e) = write::remove_line_on_disk(path, *i, lines[*i]) {
-                eprintln!("kairn: could not remove an emptied group header: {e}");
-            }
-        }
-    }
-    for m in &moves {
-        log_write(root, actor, "carry", &dest_path, task_text(&m.carried_line));
-    }
-    for line in &leftovers {
-        eprintln!(
-            "kairn: carried but not removed (the line changed underneath): {line} — now in both notes, remove the old one by hand"
-        );
-    }
-    if json {
-        let body = json!({
-            "count": moves.len(),
-            "to": dest.format("%Y-%m-%d").to_string(),
-            "file": rel(root, &dest_path),
-            "dry_run": false,
-            "tasks": tasks_json,
-            "left_in_place": leftovers,
-            "older_than_window": older,
-        });
-        println!("{body}");
-    } else {
-        println!("carried {} tasks to {}", moves.len(), dest.format("%Y-%m-%d"));
-        for m in &moves {
-            let from = m.task.file_date.map_or_else(String::new, |d| {
-                d.format("%Y-%m-%d").to_string()
-            });
-            println!("  {from}  {}", task_text(&m.carried_line));
-        }
-    }
+    let dest_path = vault::daily_file(root, dest).unwrap_or_else(|| vault::daily_path(root, dest));
+    let report = carry_transfer::Report {
+        to: dest.format("%Y-%m-%d").to_string(),
+        file: dest_path.strip_prefix(root).map_err(|error| Failure::new(EXIT_FAILED, error.to_string()))?.to_owned(),
+        tasks: tasks_json,
+        older_than_window: older,
+    };
+    let transfer = carry_transfer::Transfer::prepare(
+        root, section, actor, &Settings::load().daily_template_rule, &moves, &texts, report,
+    ).map_err(failure)?;
+    let report = transfer.apply().map_err(failure)?;
+    print_carry_report(&report, false, false, json);
     Ok(())
+}
+
+fn print_carry_report(report: &carry_transfer::Report, dry_run: bool, resumed: bool, json: bool) {
+    if json {
+        println!("{}", json!({
+            "count": report.tasks.len(),
+            "to": report.to,
+            "file": report.file,
+            "dry_run": dry_run,
+            "resumed": resumed,
+            "tasks": report.tasks,
+            "left_in_place": [],
+            "older_than_window": report.older_than_window,
+        }));
+    } else {
+        let action = if dry_run { "would resume carrying" } else { "carried" };
+        println!("{action} {} tasks to {}", report.tasks.len(), report.to);
+        for task in &report.tasks {
+            println!("  {}  {}", task["from"].as_str().unwrap_or_default(), task["text"].as_str().unwrap_or_default());
+        }
+    }
 }
 
 fn cmd_recent(root: &Path, days: u64, json: bool) -> Result<(), Failure> {

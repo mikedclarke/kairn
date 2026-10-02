@@ -78,11 +78,18 @@ pub fn append_line(path: &Path, line: &str) -> io::Result<usize> {
 }
 
 fn append_line_locked(path: &Path, line: &str) -> io::Result<usize> {
-    let mut text = match fs::read_to_string(path) {
+    let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
     };
+    let (text, idx) = append_line_in_text(&text, line);
+    atomic_write(path, &text)?;
+    Ok(idx)
+}
+
+pub fn append_line_in_text(existing: &str, line: &str) -> (String, usize) {
+    let mut text = existing.to_owned();
     let idx = text.lines().count();
     let crlf = text.contains("\r\n");
     let ending = if crlf { "\r\n" } else { "\n" };
@@ -99,11 +106,7 @@ fn append_line_locked(path: &Path, line: &str) -> io::Result<usize> {
     if trailing_newline {
         text.push_str(ending);
     }
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    atomic_write(path, &text)?;
-    Ok(idx)
+    (text, idx)
 }
 
 /// Create a note only if nothing exists at `path`; an existing file is left
@@ -718,6 +721,12 @@ pub fn append_to_section(path: &Path, section: &str, text: &str) -> io::Result<u
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
     };
+    let (out, idx) = append_to_section_in_text(&existing, section, text);
+    atomic_write(path, &out)?;
+    Ok(idx)
+}
+
+pub fn append_to_section_in_text(existing: &str, section: &str, text: &str) -> (String, usize) {
     let lines: Vec<&str> = existing.lines().collect();
     let Some(idx) = section_insert_idx(&lines, section) else {
         let heading = if section.trim_start().starts_with('#') {
@@ -730,7 +739,8 @@ pub fn append_to_section(path: &Path, section: &str, text: &str) -> io::Result<u
         } else {
             format!("\n{heading}\n{text}")
         };
-        return append_line_locked(path, &block).map(|idx| idx + block.lines().count() - text.lines().count());
+        let (out, idx) = append_line_in_text(existing, &block);
+        return (out, idx + block.lines().count() - text.lines().count());
     };
     let crlf = existing.contains("\r\n");
     let ending = if crlf { "\r\n" } else { "\n" };
@@ -753,11 +763,7 @@ pub fn append_to_section(path: &Path, section: &str, text: &str) -> io::Result<u
             out.pop();
         }
     }
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    atomic_write(path, &out)?;
-    Ok(idx)
+    (out, idx)
 }
 
 /// Where a section created by [`edit_section_in_text`] goes when the note
