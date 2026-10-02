@@ -3512,6 +3512,7 @@ dependencies = [
  "parking_lot",
  "portable-pty",
  "serde_json",
+ "tempfile",
  "trash",
  "ureq",
 ]

@@ -39,6 +39,9 @@ ureq = "2"
 # permission prompt.
 trash = "5"
 
+[dev-dependencies]
+tempfile = "3"
+
 # cargo-packager: bundles the app for distribution (.app/.dmg on macOS,
 # .deb/.AppImage on Linux). macOS signing + notarization live in
 # scripts/package-macos.sh, not here, so cargo-packager builds an unsigned

@@ -208,8 +208,12 @@ def extract_reply(text: str):
 
 
 def run_kairn(kairn: Path, args, vault: Path):
+    options = args[:args.index("--")] if "--" in args else args
+    if any(arg == "--root" or arg.startswith("--root=") for arg in options):
+        return 2, "", "The evaluation harness owns --root; use the provided vault."
     proc = subprocess.run(
-        [str(kairn)] + args,
+        [str(kairn.resolve()), "--root", str(vault)] + args,
+        cwd=vault,
         capture_output=True,
         text=True,
         timeout=60,
