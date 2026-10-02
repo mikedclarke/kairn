@@ -20,20 +20,15 @@ restating the same fact twice; no em dashes. Rewrite to this standard before rel
 
 ## Fixed
 
-- Sync stops when its vault disappears or is replaced, before a pull can recreate it or push deletions.
-
-- Sync preserves conflict copies before replacing notes and reuses them when a failed sync is retried.
-
-- App, CLI and sync writes share a lock across reading and replacement; busy files refuse the write for retry.
-
 <!-- Bugs that no longer happen. -->
 
+- Deferred sync pulls persist across restarts and keep sync in an error state until applied or superseded.
+- Sync stops when its vault disappears or is replaced, before a pull can recreate it or push deletions.
+- Sync preserves conflict copies before replacing notes and reuses them when a failed sync is retried.
+- App, CLI and sync writes share a lock across reading and replacement; busy files refuse the write for retry.
+
 - The process-only notes folder override remains active after closing Settings.
-
 - Library text and code saves merge external changes and preserve conflicting edits as separate copies.
-
 - Failed saves preserve unsaved text in a local recovery folder and display its location.
-
 - Undoing a moved block after an external edit and handling Unicode text no longer cause note operations to panic.
-
 - Conflicting note edits are saved as recovery copies that survive closing the app, and simultaneous line insertions keep both additions.

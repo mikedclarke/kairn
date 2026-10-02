@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::hash::hash_bytes;
 use crate::ignore::is_ignored;
@@ -100,9 +100,26 @@ pub fn run_cycle(ctx: &SyncContext) -> Result<CycleReport> {
 
 // ---- pull ----------------------------------------------------------------
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PullOutcome {
+    Applied,
+    Deferred,
+}
+
+fn record_entry(ctx: &SyncContext, entry: &crate::types::JournalEntry, report: &mut CycleReport) -> Result<()> {
+    let outcome = match apply_entry(ctx, entry, report) {
+        Ok(outcome) => outcome,
+        Err(error) if error.downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) => PullOutcome::Deferred,
+        Err(error) => return Err(error),
+    };
+    ctx.state.record_pull(entry, outcome == PullOutcome::Deferred)
+}
+
 fn pull(ctx: &SyncContext, report: &mut CycleReport) -> Result<()> {
+    let retry: HashSet<_> = ctx.state.pending_pulls()?.into_iter().map(|entry| entry.seq).collect();
     loop {
-        let cursor = ctx.state.cursor()?;
+        let cursor = ctx.state.pull_cursor()?;
         let page = ctx.transport.changes(cursor, PAGE_LIMIT)?;
         if page.entries.is_empty() {
             break;
@@ -111,23 +128,29 @@ fn pull(ctx: &SyncContext, report: &mut CycleReport) -> Result<()> {
             if ctx.cancelled() {
                 return Ok(());
             }
-            apply_entry(ctx, entry, report)?;
-            // Cursor moves only after the entry is fully applied to disk+state.
-            ctx.state.set_cursor(entry.seq)?;
+            record_entry(ctx, entry, report)?;
         }
         if !page.has_more {
             break;
         }
     }
+    for entry in ctx.state.pending_pulls()? {
+        if ctx.cancelled() {
+            return Ok(());
+        }
+        if retry.contains(&entry.seq) {
+            record_entry(ctx, &entry, report)?;
+        }
+    }
+    let pending = ctx.state.pending_pulls()?.len();
+    if pending != 0 {
+        bail!("{pending} remote changes are pending verification or a safe local write; sync will retry");
+    }
     Ok(())
 }
 
-/// Fetch a blob and check the bytes against the hash the journal (or a CAS
-/// outcome) promised. `None` means "skip this entry": either the rev's blob is
-/// no longer retained (spec §11) or the server handed back bytes that are not
-/// what it said they were. Both would otherwise wedge the cycle on the same
-/// entry forever, so they are reported and stepped over — the whole safety model
-/// rests on these hashes, so unverified bytes never reach the vault.
+/// Unverified or pruned revisions remain pending until they can be fetched
+/// safely or a newer journal entry supersedes them.
 fn fetch_verified(
     ctx: &SyncContext,
     path: &VaultPath,
@@ -138,7 +161,7 @@ fn fetch_verified(
         Ok(bytes) => {
             if &hash_bytes(&bytes) != expect {
                 (ctx.emit)(SyncEvent::Error(format!(
-                    "skipped {path} rev {rev}: the server's bytes do not match the hash it \
+                    "deferred {path} rev {rev}: the server's bytes do not match the hash it \
                      published for them"
                 )));
                 return Ok(None);
@@ -147,8 +170,8 @@ fn fetch_verified(
         }
         Err(TransportError::NotFound) => {
             (ctx.emit)(SyncEvent::Error(format!(
-                "skipped {path} rev {rev}: the server no longer keeps that revision's content \
-                 (pruned). Any later change to this file still syncs normally."
+                "deferred {path} rev {rev}: the server no longer keeps that revision's content \
+                 (pruned). Waiting for a retry or a newer revision."
             )));
             Ok(None)
         }
@@ -156,14 +179,10 @@ fn fetch_verified(
     }
 }
 
-/// A write resolved against a pre-image that is no longer what is on disk:
-/// something outside the engine (the app, Syncthing on a bridged folder) wrote
-/// the file while we were on the network. Leave it alone — the push phase later
-/// in this same cycle sees a dirty file and resolves it through the merge rules
-/// instead of clobbering it (invariant §15.1).
+/// Keep the newer local bytes and retry the remote entry next cycle.
 fn changed_underneath(ctx: &SyncContext, path: &VaultPath) {
     (ctx.emit)(SyncEvent::Error(format!(
-        "{path} changed on disk mid-cycle; left as it is and resolved from its new content"
+        "{path} changed on disk mid-cycle; left as it is for retry"
     )));
 }
 
@@ -171,7 +190,7 @@ fn apply_entry(
     ctx: &SyncContext,
     entry: &crate::types::JournalEntry,
     report: &mut CycleReport,
-) -> Result<()> {
+) -> Result<PullOutcome> {
     let path = &entry.path;
     // Server-supplied paths are untrusted: refuse anything that would resolve
     // outside the vault before it ever reaches the filesystem (spec trust model).
@@ -179,10 +198,10 @@ fn apply_entry(
         (ctx.emit)(SyncEvent::Error(format!(
             "refused unsafe sync path: {path}"
         )));
-        return Ok(());
+        return Ok(PullOutcome::Applied);
     }
     if is_ignored(path) {
-        return Ok(());
+        return Ok(PullOutcome::Applied);
     }
     let local = ctx.vault.read_opt(path)?;
     let st = ctx.state.file_state(path)?;
@@ -198,7 +217,7 @@ fn apply_entry(
         && s.rev == entry.rev
         && s.baseline_hash == entry.hash
     {
-        return Ok(());
+        return Ok(PullOutcome::Applied);
     }
 
     // Older than the rev we already hold for this path: a push-side merge in an
@@ -207,13 +226,13 @@ fn apply_entry(
     if let Some(s) = &st
         && entry.rev < s.rev
     {
-        return Ok(());
+        return Ok(PullOutcome::Applied);
     }
 
     if entry.deleted {
         // A tombstone for something we neither hold nor track: nothing to do.
         if local.is_none() && st.is_none() {
-            return Ok(());
+            return Ok(PullOutcome::Applied);
         }
         // Delete locally only when the local copy is clean; a dirty local file
         // keeps its edits and the push phase resurrects it via CAS (delete/edit
@@ -222,17 +241,17 @@ fn apply_entry(
             let pre = Precondition::from_local(local.as_deref());
             if !ctx.vault.delete(path, &pre, &announce)? {
                 changed_underneath(ctx, path);
-                return Ok(());
+                return Ok(PullOutcome::Deferred);
             }
             ctx.state.remove_file_state(path)?;
             report.deleted_local += 1;
         }
-        return Ok(());
+        return Ok(PullOutcome::Applied);
     }
 
     let remote_hash = match &entry.hash {
         Some(h) => h.clone(),
-        None => return Ok(()), // malformed non-tombstone; nothing to apply
+        None => return Ok(PullOutcome::Deferred),
     };
 
     // Already hold these exact bytes (our own echo, an identical write via the
@@ -242,11 +261,11 @@ fn apply_entry(
     {
         ctx.state
             .record_synced(path, entry.rev, bytes, path.is_markdown())?;
-        return Ok(());
+        return Ok(PullOutcome::Applied);
     }
 
     let Some(remote) = fetch_verified(ctx, path, entry.rev, &remote_hash)? else {
-        return Ok(());
+        return Ok(PullOutcome::Deferred);
     };
 
     // What the file must still hold when the rename lands. The read above and
@@ -258,12 +277,12 @@ fn apply_entry(
         // Clean pull: adopt the remote content wholesale.
         if !ctx.vault.write(path, &remote, &pre, &announce)? {
             changed_underneath(ctx, path);
-            return Ok(());
+            return Ok(PullOutcome::Deferred);
         }
         ctx.state
             .record_synced(path, entry.rev, &remote, path.is_markdown())?;
         report.pulled += 1;
-        return Ok(());
+        return Ok(PullOutcome::Applied);
     }
 
     // Conflict: local is dirty and remote differs. Resolve, keeping the remote
@@ -275,7 +294,7 @@ fn apply_entry(
         Resolution::Write { content, .. } => {
             if !ctx.vault.write(path, &content, &pre, &announce)? {
                 changed_underneath(ctx, path);
-                return Ok(());
+                return Ok(PullOutcome::Deferred);
             }
             ctx.state
                 .record_synced(path, entry.rev, &remote, path.is_markdown())?;
@@ -290,7 +309,7 @@ fn apply_entry(
                 .write_conflict_copy(path, &conflict_copy, &announce)?;
             if !ctx.vault.write(path, &content, &pre, &announce)? {
                 changed_underneath(ctx, path);
-                return Ok(());
+                return Ok(PullOutcome::Deferred);
             }
             (ctx.emit)(SyncEvent::ConflictCopyCreated {
                 original: path.clone(),
@@ -301,7 +320,7 @@ fn apply_entry(
             report.conflicts += 1;
         }
     }
-    Ok(())
+    Ok(PullOutcome::Applied)
 }
 
 // ---- push ----------------------------------------------------------------
@@ -947,7 +966,7 @@ mod tests {
                     b"remote\n", entry.rev, &Precondition::Unchanged(hash_bytes(b"local\n")),
                     &ctx.announce(), &mut report).map(|_| ())
             } else {
-                apply_entry(&ctx, &entry, &mut report)
+                apply_entry(&ctx, &entry, &mut report).map(|_| ())
             };
             assert!(result.is_err());
             assert_eq!(local.read(&path.0).as_deref(), Some("local\n"));
@@ -987,7 +1006,7 @@ mod tests {
                         b"remote\n", entry.rev, &Precondition::Unchanged(hash_bytes(b"local\n")),
                         &ctx.announce(), &mut report).map(|_| ())
                 } else {
-                    apply_entry(ctx, &entry, &mut report)
+                    apply_entry(ctx, &entry, &mut report).map(|_| ())
                 }
             };
             assert!(apply(&ctx).is_err());
@@ -1573,9 +1592,8 @@ mod tests {
     #[test]
     fn a_write_landing_during_the_fetch_is_not_clobbered() {
         // The bridge shares its folder with Syncthing (spec §3 Phase B), so a
-        // file can appear between the engine reading a path and renaming remote
-        // content over it. The pre-image check turns that into a conflict, which
-        // the push phase resolves the honest way.
+        // file can appear between reading a path and replacing it. Preserve it
+        // now and resolve the deferred remote change on the next cycle.
         let s = FakeServer::new();
         let seed = Device::new(&s, "seed");
         seed.write("Notes/a.md", "from the server\n");
@@ -1604,9 +1622,10 @@ mod tests {
             d
         };
 
-        dest.sync();
-
-        // The pull refused to land over bytes it had never seen...
+        assert!(dest.try_sync().is_err());
+        assert_eq!(dest.read("Notes/a.md").as_deref(), Some("typed here, mid-cycle\n"));
+        assert_eq!(dest.state.pending_pulls().unwrap().len(), 1);
+        assert_eq!(dest.state.cursor().unwrap(), 0);
         let errors = dest.errors();
         assert!(
             errors
@@ -1614,8 +1633,8 @@ mod tests {
                 .any(|m| m.contains("changed on disk mid-cycle")),
             "{errors:?}"
         );
-        // ...and the remote content wins the file the honest way (spec §8),
-        // with the text that landed mid-cycle kept as a conflict copy.
+        dest.sync();
+        assert!(dest.state.pending_pulls().unwrap().is_empty());
         assert_eq!(
             dest.read("Notes/a.md").as_deref(),
             Some("from the server\n")
@@ -1624,6 +1643,52 @@ mod tests {
             dest.conflict_copies("Notes/a.md"),
             vec!["typed here, mid-cycle\n".to_string()]
         );
+    }
+
+    #[test]
+    fn a_refused_pull_retries_even_when_local_content_returns_to_baseline() {
+        let server = FakeServer::new();
+        let source = Device::new(&server, "source");
+        source.write("Notes/a.md", "base\n");
+        source.sync();
+        let mut dest = Device::new(&server, "dest");
+        dest.sync();
+        dest.write("Notes/a.md", "local\n");
+        source.write("Notes/a.md", "remote\n");
+        source.sync();
+        dest.client = Box::new(WriteDuringFetch {
+            inner: server.client("dest"), path: dest.root.join("Notes/a.md"),
+            content: b"base\n".to_vec(), fired: std::sync::atomic::AtomicBool::new(false),
+        });
+        assert!(dest.try_sync().is_err());
+        assert_eq!(dest.read("Notes/a.md").as_deref(), Some("base\n"));
+        assert_eq!(dest.state.cursor().unwrap(), 1);
+        assert_eq!(dest.state.pull_cursor().unwrap(), 2);
+        assert_eq!(server.ack_of("dest"), 1);
+        dest.sync();
+        assert_eq!(dest.read("Notes/a.md").as_deref(), Some("remote\n"));
+        assert!(dest.state.pending_pulls().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_pruned_latest_revision_remains_pending_until_a_newer_revision_lands() {
+        let server = FakeServer::new();
+        let source = Device::new(&server, "source");
+        source.write("Notes/a.md", "v1\n");
+        source.sync();
+        let dest = Device::with_transport(&server, "dest", |inner| Box::new(PrunedRev {
+            inner, path: VaultPath::new("Notes/a.md"), rev: 1,
+        }));
+        for _ in 0..2 {
+            assert!(dest.try_sync().is_err());
+            assert_eq!(dest.state.pending_pulls().unwrap().len(), 1);
+            assert_eq!(dest.state.cursor().unwrap(), 0);
+        }
+        source.write("Notes/a.md", "v2\n");
+        source.sync();
+        dest.sync();
+        assert_eq!(dest.read("Notes/a.md").as_deref(), Some("v2\n"));
+        assert!(dest.state.pending_pulls().unwrap().is_empty());
     }
 
     #[test]

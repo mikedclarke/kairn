@@ -407,6 +407,40 @@ mod tests {
     }
 
     #[test]
+    fn unverified_pulls_survive_restart_and_keep_status_in_error_until_repaired() {
+        use crate::hash::hash_bytes;
+        let server = FakeServer::new();
+        let fx = Fixture::new("retry");
+        let client = server.client("source");
+        let first = VaultPath::new("a.md");
+        let hash = hash_bytes(b"first\n");
+        client.put_blob(&first, 0, &hash, b"first\n").unwrap();
+        client.put_blob(&VaultPath::new("b.md"), 0, &hash_bytes(b"second\n"), b"second\n").unwrap();
+        server.replace_blob(&hash, b"corrupt");
+        {
+            let engine = fx.engine(&server, "retry");
+            assert!(engine.sync_now().is_err());
+            assert!(engine.status().last_error.unwrap().contains("pending"));
+            assert!(engine.status().last_cycle.is_none());
+            let inner = engine.shared.inner.lock().unwrap();
+            assert_eq!(inner.state.pending_pulls().unwrap().len(), 1);
+            assert_eq!(inner.state.pull_cursor().unwrap(), 2);
+            assert_eq!(inner.state.cursor().unwrap(), 0);
+        }
+        let engine = fx.engine(&server, "retry");
+        assert!(engine.sync_now().is_err());
+        assert!(engine.status().last_error.is_some());
+        assert!(!fx.root.join("a.md").exists());
+        assert_eq!(std::fs::read(fx.root.join("b.md")).unwrap(), b"second\n");
+        assert_eq!(server.ack_of("retry"), 0);
+        server.replace_blob(&hash, b"first\n");
+        assert_eq!(engine.sync_now().unwrap().cursor, 2);
+        assert_eq!(std::fs::read(fx.root.join("a.md")).unwrap(), b"first\n");
+        assert!(engine.status().last_error.is_none());
+        assert!(engine.shared.inner.lock().unwrap().state.pending_pulls().unwrap().is_empty());
+    }
+
+    #[test]
     fn start_then_stop_runs_at_least_one_cycle_and_reports_running() {
         let server = FakeServer::new();
         let fx = Fixture::new("mac");
