@@ -13,12 +13,16 @@
 //! before the rename, and a scan refuses to report an empty vault when the root
 //! is simply not there.
 
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local};
+use cap_fs_ext::DirExt;
+use cap_std::fs::Dir;
+use crate::vault_fs;
 
 use crate::hash::hash_bytes;
 use crate::ignore::is_ignored;
@@ -97,9 +101,7 @@ impl HashCache for NoHashCache {
 
 pub struct VaultIo {
     root: PathBuf,
-    root_metadata: Option<std::fs::Metadata>,
-    #[cfg(unix)]
-    _root_handle: Option<std::fs::File>,
+    root_handle: Option<Dir>,
     /// The device label stamped into conflict-copy names, e.g. `IPHONE`.
     device_label: String,
 }
@@ -107,81 +109,64 @@ pub struct VaultIo {
 impl VaultIo {
     pub fn new(root: impl Into<PathBuf>, device_label: impl Into<String>) -> Self {
         let root = root.into();
-        #[cfg(unix)]
-        let handle = std::fs::File::open(&root).ok();
-        #[cfg(unix)]
-        let root_metadata = handle.as_ref().and_then(|file| file.metadata().ok());
-        #[cfg(not(unix))]
-        let root_metadata = std::fs::metadata(&root).ok();
+        let root_handle = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).ok();
         Self {
             root,
-            root_metadata,
-            #[cfg(unix)]
-            _root_handle: handle,
+            root_handle,
             device_label: device_label.into(),
         }
     }
 
     pub fn validate_root(&self) -> io::Result<()> {
-        let current = std::fs::metadata(&self.root).map_err(|error| {
-            io::Error::new(error.kind(), format!("vault root is missing or unreadable: {}", self.root.display()))
-        })?;
-        if !current.is_dir() {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "vault root is missing or not a directory"));
-        }
-        let Some(original) = &self.root_metadata else {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "vault root was unavailable when sync started; restart sync after checking the folder"));
+        let current = Dir::open_ambient_dir(&self.root, cap_std::ambient_authority())
+            .map_err(|error| io::Error::new(error.kind(),
+                format!("vault root is missing or unreadable: {}", self.root.display())))?;
+        let Some(original) = &self.root_handle else {
+            return Err(io::Error::new(io::ErrorKind::NotFound,
+                "vault root was unavailable when sync started; restart sync after checking the folder"));
         };
-        #[cfg(unix)]
-        let same = {
-            use std::os::unix::fs::MetadataExt;
-            original.dev() == current.dev() && original.ino() == current.ino()
-        };
-        #[cfg(not(unix))]
-        let same = original.created()? == current.created()?;
-        if !same {
+        if !vault_fs::same_directory(original, &current)? {
             return Err(io::Error::other("vault root changed; restart sync after checking the folder"));
         }
         Ok(())
     }
 
-    fn ensure_parent(&self, path: &VaultPath) -> io::Result<()> {
+    fn parent(&self, path: &VaultPath, create: bool) -> io::Result<(Dir, String)> {
         self.validate_root()?;
-        let mut dir = self.root.clone();
-        let mut parts = path.0.split('/').peekable();
-        while let Some(part) = parts.next() {
-            if parts.peek().is_none() {
-                break;
-            }
-            self.validate_root()?;
-            dir.push(part);
-            match std::fs::create_dir(&dir) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => {}
-                Err(error) => return Err(error),
-            }
-        }
-        self.validate_root()
+        vault_fs::parent(self.root_handle.as_ref().unwrap(), path, create)
     }
 
+    fn validate_parent(&self, path: &VaultPath, original: &Dir) -> io::Result<()> {
+        let (current, _) = self.parent(path, false)?;
+        if !vault_fs::same_directory(original, &current)? {
+            return Err(io::Error::other("vault directory changed during sync; retry the operation"));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn abs(&self, path: &VaultPath) -> PathBuf {
         self.root.join(&path.0)
     }
 
     pub fn exists(&self, path: &VaultPath) -> bool {
-        self.abs(path).is_file()
+        self.parent(path, false).and_then(|(dir, name)| vault_fs::open(&dir, &name)).is_ok()
     }
 
     pub fn read(&self, path: &VaultPath) -> io::Result<Vec<u8>> {
-        self.validate_root()?;
-        std::fs::read(self.abs(path))
+        self.read_opt(path)?.ok_or_else(|| io::ErrorKind::NotFound.into())
     }
 
-    /// Read a file if it exists, returning `None` for a missing file (a clean
-    /// "not there" rather than an error the caller must special-case).
+    /// Read an existing file, refusing symlinks in any component.
     pub fn read_opt(&self, path: &VaultPath) -> io::Result<Option<Vec<u8>>> {
-        self.validate_root()?;
-        read_opt_abs(&self.abs(path))
+        match self.parent(path, false) {
+            Ok((dir, name)) => vault_fs::read_opt(&dir, &name),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.validate_root()?;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Atomically write `content` to `path`, creating parent folders as needed,
@@ -196,16 +181,15 @@ impl VaultIo {
         pre: &Precondition,
         before: &BeforeWrite,
     ) -> io::Result<bool> {
-        let dest = self.abs(path);
-        self.ensure_parent(path)?;
-        let _lock = kairn_core::NoteLock::acquire(&dest)?;
-        atomic_write(&dest, content, || {
-            self.validate_root()?;
-            if !pre.holds(read_opt_abs(&dest)?.as_deref()) {
+        let (dir, name) = self.parent(path, true)?;
+        let _lock = vault_fs::lock(&dir, &name)?;
+        vault_fs::atomic_write(&dir, &name, content, || {
+            self.validate_parent(path, &dir)?;
+            if !pre.holds(vault_fs::read_opt(&dir, &name)?.as_deref()) {
                 return Ok(false);
             }
             before(path);
-            self.validate_root()?;
+            self.validate_parent(path, &dir)?;
             Ok(true)
         })
     }
@@ -219,21 +203,24 @@ impl VaultIo {
         pre: &Precondition,
         before: &BeforeWrite,
     ) -> io::Result<bool> {
-        self.validate_root()?;
-        let dest = self.abs(path);
-        if !dest.parent().is_some_and(Path::is_dir) {
-            return Ok(pre.holds(None));
-        }
-        let _lock = kairn_core::NoteLock::acquire(&dest)?;
-        if !pre.holds(read_opt_abs(&dest)?.as_deref()) {
+        let (dir, name) = match self.parent(path, false) {
+            Ok(parent) => parent,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.validate_root()?;
+                return Ok(pre.holds(None));
+            }
+            Err(error) => return Err(error),
+        };
+        let _lock = vault_fs::lock(&dir, &name)?;
+        if !pre.holds(vault_fs::read_opt(&dir, &name)?.as_deref()) {
             return Ok(false);
         }
         before(path);
-        self.validate_root()?;
-        match std::fs::remove_file(&dest) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
-            Err(e) => Err(e),
+        self.validate_parent(path, &dir)?;
+        match dir.remove_file(&name) {
+            Ok(()) => { vault_fs::sync_directory(&dir)?; Ok(true) }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error),
         }
     }
 
@@ -284,32 +271,45 @@ impl VaultIo {
         content: &[u8],
         before: &BeforeWrite,
     ) -> io::Result<VaultPath> {
-        self.validate_root()?;
-        let original_abs = self.abs(original);
-        for existing in kairn_core::conflict_copies(&original_abs) {
-            if existing.extension() != original_abs.extension() {
-                continue;
+        let (dir, name) = self.parent(original, true)?;
+        let original_name = Path::new(&name);
+        let prefix = format!("{}.sync-conflict-", original_name.file_stem().unwrap().to_string_lossy());
+        let mut copies = Vec::new();
+        for entry in dir.entries()? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            if entry.file_type()?.is_file()
+                && file_name.to_str().is_some_and(|name| name.starts_with(&prefix))
+                && Path::new(&file_name).extension() == original_name.extension()
+            {
+                copies.push(file_name.to_str().unwrap().to_owned());
             }
-            let _lock = kairn_core::NoteLock::acquire(&existing)?;
-            if read_opt_abs(&existing)?.as_deref() == Some(content) {
-                sync_copy(&existing)?;
-                if let Some(copy) = self.rel_of(&existing) {
-                    return Ok(copy);
-                }
+        }
+        copies.sort();
+        for name in copies {
+            let _lock = vault_fs::lock(&dir, &name)?;
+            if vault_fs::read_opt(&dir, &name)?.as_deref() == Some(content) {
+                self.validate_parent(original, &dir)?;
+                vault_fs::open(&dir, &name)?.sync_all()?;
+                vault_fs::sync_directory(&dir)?;
+                return Ok(match original.0.rsplit_once('/') {
+                    Some((parent, _)) => VaultPath(format!("{parent}/{name}")),
+                    None => VaultPath(name),
+                });
             }
         }
         let now = Local::now();
         for nth in 1..=1000 {
             let copy = self.conflict_copy_path(original, now, nth);
             if self.write(&copy, content, &Precondition::Absent, before)? {
-                sync_copy(&self.abs(&copy))?;
+                self.sync_copy(&copy)?;
                 return Ok(copy);
             }
             // A copy already sitting there with exactly this text *is* this
             // copy: a retried resolution should not leave the same losing text
             // twice over.
-            if read_opt_abs(&self.abs(&copy))?.as_deref() == Some(content) {
-                sync_copy(&self.abs(&copy))?;
+            if self.read_opt(&copy)?.as_deref() == Some(content) {
+                self.sync_copy(&copy)?;
                 return Ok(copy);
             }
         }
@@ -317,6 +317,12 @@ impl VaultIo {
             io::ErrorKind::AlreadyExists,
             format!("no free conflict-copy name beside {original}"),
         ))
+    }
+
+    fn sync_copy(&self, path: &VaultPath) -> io::Result<()> {
+        let (dir, name) = self.parent(path, false)?;
+        vault_fs::open(&dir, &name)?.sync_all()?;
+        vault_fs::sync_directory(&dir)
     }
 
     /// Walk the vault, returning every syncable file with its hash and size
@@ -327,7 +333,7 @@ impl VaultIo {
         self.validate_root()?;
         let mut out = Vec::new();
         let now_ns = now_ns();
-        self.scan_dir(&self.root, cache, now_ns, &mut out)?;
+        self.scan_dir(self.root_handle.as_ref().unwrap(), "", cache, now_ns, &mut out)?;
         self.validate_root()?;
         out.sort_by(|a, b| a.path.0.cmp(&b.path.0));
         Ok(out)
@@ -340,41 +346,45 @@ impl VaultIo {
 
     fn scan_dir(
         &self,
-        dir: &Path,
+        dir: &Dir,
+        prefix: &str,
         cache: &dyn HashCache,
         now_ns: i64,
         out: &mut Vec<ScannedFile>,
     ) -> io::Result<()> {
-        for entry in std::fs::read_dir(dir)? {
+        for entry in dir.entries()? {
             let entry = entry?;
-            let abs = entry.path();
-            let Some(rel) = self.rel_of(&abs) else {
-                continue;
-            };
-            // Prune ignored directories and files up front (spec §4), which also
-            // skips our own `.kairn-tmp.` files mid-rename.
-            if is_ignored(&rel) {
-                continue;
+            let name = entry.file_name().into_string()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "vault file name is not UTF-8"))?;
+            let rel = VaultPath(if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") });
+            if is_ignored(&rel) { continue; }
+            if !rel.is_safe() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "vault file name cannot be synced"));
             }
             let ft = entry.file_type()?;
             if ft.is_dir() {
-                self.scan_dir(&abs, cache, now_ns, out)?;
+                let child = dir.open_dir_nofollow(&name)?;
+                self.scan_dir(&child, &rel.0, cache, now_ns, out)?;
+                self.validate_root()?;
+                let current = vault_fs::directory(self.root_handle.as_ref().unwrap(), &rel, false)?;
+                if !vault_fs::same_directory(&child, &current)? {
+                    return Err(io::Error::other("vault directory changed during scan"));
+                }
             } else if ft.is_file() {
-                out.push(self.scan_file(&abs, rel, cache, now_ns)?);
+                out.push(self.scan_file(vault_fs::open(dir, &name)?, rel, cache, now_ns)?);
             }
-            // Symlinks are neither followed nor synced in v1.
         }
         Ok(())
     }
 
     fn scan_file(
         &self,
-        abs: &Path,
+        mut file: std::fs::File,
         rel: VaultPath,
         cache: &dyn HashCache,
         now_ns: i64,
     ) -> io::Result<ScannedFile> {
-        let meta = std::fs::metadata(abs)?;
+        let meta = file.metadata()?;
         let size = meta.len();
         let mtime = mtime_ns(&meta);
         if let Some(mtime) = mtime
@@ -387,7 +397,8 @@ impl VaultIo {
                 size,
             });
         }
-        let bytes = std::fs::read(abs)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
         let hash = hash_bytes(&bytes);
         if let Some(mtime) = mtime {
             cache.remember(&rel, bytes.len() as u64, mtime, &hash);
@@ -399,36 +410,6 @@ impl VaultIo {
         })
     }
 
-    /// The vault-relative, forward-slashed path of an absolute path under the
-    /// root, or `None` if it is outside the root.
-    fn rel_of(&self, abs: &Path) -> Option<VaultPath> {
-        let rel = abs.strip_prefix(&self.root).ok()?;
-        let mut parts = Vec::new();
-        for comp in rel.components() {
-            match comp {
-                std::path::Component::Normal(s) => parts.push(s.to_string_lossy().into_owned()),
-                _ => return None,
-            }
-        }
-        Some(VaultPath(parts.join("/")))
-    }
-}
-
-fn sync_copy(path: &Path) -> io::Result<()> {
-    std::fs::File::open(path)?.sync_all()?;
-    #[cfg(unix)]
-    if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)?.sync_all()?;
-    }
-    Ok(())
-}
-
-fn read_opt_abs(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
 }
 
 /// Nanoseconds since the epoch, negative before it. `i64` runs to the year 2262
@@ -446,59 +427,6 @@ fn now_ns() -> i64 {
 
 fn mtime_ns(meta: &std::fs::Metadata) -> Option<i64> {
     meta.modified().ok().and_then(to_ns)
-}
-
-/// Atomic write shared with `kairn_core`'s pattern: a hidden temp file carrying
-/// pid + counter (so two writers never collide), original permissions carried
-/// over, then rename. `before_rename` fires in the gap between the temp write
-/// and the rename that makes the change visible, and returning `false` from it
-/// abandons the write (the temp file is cleaned up and nothing is replaced).
-fn atomic_write(
-    path: &Path,
-    content: &[u8],
-    before_rename: impl FnOnce() -> io::Result<bool>,
-) -> io::Result<bool> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let name = path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
-    let tmp = path.with_file_name(format!(
-        ".{}.kairn-tmp.{}.{}",
-        name.to_string_lossy(),
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed),
-    ));
-    let write = (|| {
-        {
-            use std::io::Write as _;
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(content)?;
-            // Durable before the rename: rename is atomic for *naming*, not for
-            // the data behind it. Without this fsync a power cut can leave the
-            // renamed file holding stale bytes while the state DB (which does
-            // fsync) records the new baseline, and the next cycle would push
-            // that stale content back over the remote as a silent revert.
-            f.sync_all()?;
-        }
-        if let Ok(meta) = std::fs::metadata(path) {
-            std::fs::set_permissions(&tmp, meta.permissions())?;
-        }
-        if !before_rename()? {
-            return Ok(false);
-        }
-        std::fs::rename(&tmp, path)?;
-        // The directory entry the rename created is itself only durable once the
-        // directory is synced. Not every platform allows opening a directory for
-        // that, so a failure here is not fatal.
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
-        }
-        Ok(true)
-    })();
-    if !matches!(write, Ok(true)) {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    write
 }
 
 #[cfg(test)]
@@ -564,6 +492,89 @@ mod tests {
         );
         assert_eq!(io.read(&p).unwrap(), b"hello");
         assert!(io.exists(&p));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_parents_refuse_reads_writes_deletes_and_conflict_copies() {
+        let vault = Scratch::new("contained");
+        let outside = Scratch::new("outside");
+        std::fs::write(outside.0.join("a.md"), b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside.0, vault.0.join("Notes")).unwrap();
+        let io = VaultIo::new(&vault.0, "DEVICE");
+        let existing = VaultPath::new("Notes/a.md");
+        assert!(io.read(&existing).is_err());
+        assert!(io.read_opt(&existing).is_err());
+        assert!(!io.exists(&existing));
+        assert!(io.write(&existing, b"replacement", &Precondition::Any, &*noop()).is_err());
+        assert!(io.write(&VaultPath::new("Notes/new/sub.md"), b"new", &Precondition::Absent, &*noop()).is_err());
+        assert!(io.delete(&existing, &Precondition::Any, &*noop()).is_err());
+        assert!(io.write_conflict_copy(&existing, b"conflict", &*noop()).is_err());
+        assert!(io.scan().unwrap().is_empty());
+        assert_eq!(std::fs::read(outside.0.join("a.md")).unwrap(), b"outside");
+        assert_eq!(std::fs::read_dir(&outside.0).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_files_and_lock_sidecars_are_never_followed() {
+        let vault = Scratch::new("leaf-links");
+        let outside = Scratch::new("leaf-target");
+        let target = outside.0.join("a.md");
+        std::fs::write(&target, b"outside").unwrap();
+        std::os::unix::fs::symlink(&target, vault.0.join("a.md")).unwrap();
+        let io = VaultIo::new(&vault.0, "DEVICE");
+        let path = VaultPath::new("a.md");
+        assert!(io.read(&path).is_err());
+        assert!(io.write(&path, b"replacement", &Precondition::Any, &*noop()).is_err());
+        assert!(io.delete(&path, &Precondition::Any, &*noop()).is_err());
+        std::os::unix::fs::symlink(&target, vault.0.join(".b.md.kairn-lock")).unwrap();
+        assert!(io.write(&VaultPath::new("b.md"), b"new", &Precondition::Absent, &*noop()).is_err());
+        assert_eq!(std::fs::read(target).unwrap(), b"outside");
+        assert!(!vault.0.join("b.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_swapped_for_a_symlink_before_commit_aborts_without_touching_the_target() {
+        for delete in [false, true] {
+            let vault = Scratch::new("parent-swap");
+            let outside = Scratch::new("swap-target");
+            std::fs::create_dir(vault.0.join("Notes")).unwrap();
+            std::fs::write(vault.0.join("Notes/a.md"), b"inside").unwrap();
+            std::fs::write(outside.0.join("a.md"), b"outside").unwrap();
+            let io = VaultIo::new(&vault.0, "DEVICE");
+            let hook = |_: &VaultPath| {
+                std::fs::rename(vault.0.join("Notes"), vault.0.join("old")).unwrap();
+                std::os::unix::fs::symlink(&outside.0, vault.0.join("Notes")).unwrap();
+            };
+            let path = VaultPath::new("Notes/a.md");
+            let result = if delete {
+                io.delete(&path, &Precondition::Any, &hook)
+            } else {
+                io.write(&path, b"replacement", &Precondition::Any, &hook)
+            };
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(outside.0.join("a.md")).unwrap(), b"outside");
+            assert_eq!(std::fs::read(vault.0.join("old/a.md")).unwrap(), b"inside");
+            assert!(std::fs::read_dir(vault.0.join("old")).unwrap().all(|entry|
+                !entry.unwrap().file_name().to_string_lossy().contains(".kairn-tmp.")));
+            assert_eq!(std::fs::read_dir(&outside.0).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn filesystem_operations_reject_unsafe_paths_even_without_a_cycle() {
+        let vault = Scratch::new("unsafe-path");
+        let io = VaultIo::new(&vault.0, "DEVICE");
+        for path in ["../outside.md", "/outside.md", "Notes/../outside.md", "Notes\\outside.md"] {
+            let path = VaultPath::new(path);
+            assert!(io.read_opt(&path).is_err());
+            assert!(io.write(&path, b"new", &Precondition::Any, &*noop()).is_err());
+            assert!(io.delete(&path, &Precondition::Any, &*noop()).is_err());
+            assert!(io.write_conflict_copy(&path, b"copy", &*noop()).is_err());
+        }
+        assert_eq!(std::fs::read_dir(&vault.0).unwrap().count(), 0);
     }
 
     #[test]

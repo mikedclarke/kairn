@@ -17,6 +17,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 blake3 = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
+cap-std = "4.0.3"
+cap-fs-ext = "4.0.3"
 
 # The concrete HTTP transport (spec §10), behind the `http` feature. `ureq` is a
 # blocking, runtime-free client so the engine stays async-free and cross-compiles

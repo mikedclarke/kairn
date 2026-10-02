@@ -25,6 +25,7 @@ pub mod state;
 pub mod transport;
 pub mod types;
 pub mod vaultio;
+mod vault_fs;
 #[cfg(feature = "http")]
 mod wake;
 
