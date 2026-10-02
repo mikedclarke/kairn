@@ -38,14 +38,15 @@ class VaultBoundaryTests(unittest.TestCase):
 
     def test_harness_supplies_root_and_keeps_literal_payloads(self):
         with tempfile.TemporaryDirectory() as directory:
-            vault = Path(directory)
+            vault = Path(directory).resolve()
+            executable = vault / "bin" / "kairn"
             with patch.object(evaluation.subprocess, "run") as run:
                 run.return_value.returncode = 0
                 run.return_value.stdout = "ok"
                 run.return_value.stderr = ""
                 args = ["capture", "--", "--root=literal text"]
-                self.assertEqual(evaluation.run_kairn(Path("/bin/kairn"), args, vault), (0, "ok", ""))
-                self.assertEqual(run.call_args.args[0], ["/bin/kairn", "--root", str(vault)] + args)
+                self.assertEqual(evaluation.run_kairn(executable, args, vault), (0, "ok", ""))
+                self.assertEqual(run.call_args.args[0], [str(executable), "--root", str(vault)] + args)
                 self.assertEqual(run.call_args.kwargs["cwd"], vault)
 
 
