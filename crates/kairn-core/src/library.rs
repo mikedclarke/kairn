@@ -270,6 +270,7 @@ pub fn create_library_file(dir: &Path, name: &str) -> io::Result<PathBuf> {
         format!("{name}.md")
     };
     let path = dir.join(&file_name);
+    let _lock = crate::NoteLock::acquire(&path)?;
     if path.exists() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -306,6 +307,8 @@ pub fn rename_library_path(path: &Path, name: &str) -> io::Result<PathBuf> {
     if dest == path {
         return Ok(dest);
     }
+    let _source_lock = crate::NoteLock::acquire(path)?;
+    let _dest_lock = crate::NoteLock::acquire(&dest)?;
     if dest.exists() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -340,6 +343,8 @@ pub fn move_library_path(path: &Path, dest_dir: &Path) -> io::Result<PathBuf> {
             "can't move a folder into itself",
         ));
     }
+    let _source_lock = crate::NoteLock::acquire(path)?;
+    let _dest_lock = crate::NoteLock::acquire(&dest)?;
     if dest.exists() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,

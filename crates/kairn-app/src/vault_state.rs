@@ -99,7 +99,10 @@ fn notes_event_relevant(event: &notify::Event, self_writes: &SelfWrites) -> bool
             (watched_in_kairn || !p.components().any(|c| c.as_os_str() == ".kairn"))
                 && !p
                     .file_name()
-                    .is_some_and(|n| n.to_string_lossy().contains(".kairn-tmp"))
+                    .is_some_and(|n| {
+                        let name = n.to_string_lossy();
+                        name.contains(".kairn-tmp") || name.ends_with(".kairn-lock")
+                    })
                 && !is_recent_self_write(self_writes, p)
         })
 }
@@ -851,7 +854,7 @@ impl Workspace {
                 // rather than clobbering. Tree moves finalize their own
                 // tree/view fix-up, not the note-oriented finish below.
                 if dest.exists() && !src.exists() {
-                    match std::fs::rename(&dest, &src) {
+                    match notes::rename_path(&dest, &src) {
                         Ok(()) => {
                             self.vault_history.push_undone(VaultOp::PathMove {
                                 ms,
@@ -941,7 +944,7 @@ impl Workspace {
                 // Re-apply the move src -> dest, same verification contract as
                 // the undo above; finalizes its own tree/view fix-up.
                 if src.exists() && !dest.exists() {
-                    match std::fs::rename(&src, &dest) {
+                    match notes::rename_path(&src, &dest) {
                         Ok(()) => {
                             self.vault_history.push_redone(VaultOp::PathMove {
                                 ms,
@@ -2292,6 +2295,8 @@ mod watcher_event_tests {
     fn ignored_subtrees_stay_dropped() {
         let writes = SelfWrites::default();
         let modify = EventKind::Modify(ModifyKind::Data(DataChange::Any));
+        assert!(!notes_event_relevant(&event(modify, "/vault/Notes/.a.md.kairn-lock"), &writes));
+        assert!(!library_event_relevant(&event(modify, "/lib/.a.rs.kairn-lock"), &writes));
         assert!(!notes_event_relevant(&event(modify, "/vault/.kairn/state.json"), &writes));
         let modify = EventKind::Modify(ModifyKind::Data(DataChange::Any));
         assert!(notes_event_relevant(&event(modify, "/vault/.kairn/activity.jsonl"), &writes));

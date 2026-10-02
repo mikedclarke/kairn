@@ -20,7 +20,7 @@ macOS and Linux. Not Electron.
 If you work with coding agents, your day is split between terminals where the agents run and notes where the plans, context, and decisions live.
 
 Kairn puts them on one surface. Notes are plain markdown on disk, so an agent needs
-no importer, sync bridge, or API key to read them. The `kairn` CLI gives agents tasks, capture, search, and backlinks with JSON output and honest exit codes. And every write, human or agent, goes through the same atomic merge, so an agent editing a note you have open cannot destroy your work.
+no importer, sync bridge, or API key to read them. The `kairn` CLI gives agents tasks, capture, search, and backlinks with JSON output and honest exit codes. The app, CLI, and sync share a write lock; editor saves merge changes and preserve conflicting text in separate files.
 
 No cloud, no accounts, no database. Just a folder of markdown.
 
@@ -35,7 +35,7 @@ No cloud, no accounts, no database. Just a folder of markdown.
 - Linked mentions under every note: each line elsewhere that links to it
 - Full editing: selection, clipboard, undo/redo, IME, list continuation, drag handles to reorder lines
 - Organise the sidebar by dragging: drop a note or folder onto another folder to move it, with the target highlighted as you hover and undo on the move
-- Autosave with atomic, never-clobber writes: every save three-way merges against the file on disk, so external edits (agents, sync, other editors) are never lost, and genuine collisions surface in a banner instead of silently dropping text
+- Autosave merges against the file on disk and preserves conflicting text in visible recovery copies. Kairn writers lock from read through replacement; other editors do not take this lock, so avoid simultaneous saves from external tools.
 - A watched notes folder: changes from outside the app appear live
 - Honest failure states: an unmounted notes folder blocks the pane rather than showing a convincing empty vault; sync conflict copies get a banner with one-click open
 
@@ -66,7 +66,7 @@ No cloud, no accounts, no database. Just a folder of markdown.
 
 - The `kairn` CLI is the agent surface: read, search, and append to notes, edit single lines safely, work tasks (list, add, complete, carry forward), all with `--json` output and stable exit codes designed for models reading `--help`
 - Every CLI write is logged to `.kairn/activity.jsonl` in the vault (so it syncs), and the app shows the feed live in an Agents sidebar section, with named actors via `--actor` / `$KAIRN_ACTOR`
-- Same core, same write safety: agents go through the identical never-clobber paths as the editor
+- Same core and write lock: CLI edits coordinate with the editor and sync
 
 ![The kairn CLI writing to notes while the Agents sidebar and the note update the moment each command runs](docs/agents.gif)
 
@@ -118,8 +118,9 @@ today, tomorrow, and yesterday. Global flags: `--root <dir>` (or `$KAIRN_ROOT`),
 `--json`, `--actor <name>`. Exit codes are part of the interface: 0 success, 1 failure,
 2 bad usage, 3 no match, 4 ambiguous (nothing was changed).
 
-Writes never clobber: every edit re-verifies the target line against the file on disk
-and refuses rather than guesses, appends are atomic, and `carry` previews with
+Line edits re-verify their target against the file on disk and refuse ambiguous
+matches. Kairn writers share a lock and replace files atomically; a busy file returns
+an error so the caller can retry. `carry` previews with
 `--dry-run` and only looks back 14 days unless told otherwise. `section` rewrites one
 heading's block (the heading through the line before the next heading of the same or
 higher level) as a unit and writes nothing when the block already matches, so a script

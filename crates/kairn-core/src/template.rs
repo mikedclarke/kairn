@@ -43,12 +43,17 @@ pub fn daily_template_body(root: &Path) -> String {
 /// destroy it.
 pub fn save_daily_template(root: &Path, body: &str) -> std::io::Result<()> {
     let path = daily_template_path(root);
-    let existing = fs::read_to_string(&path).unwrap_or_default();
-    let frontmatter = &existing[..existing.len() - strip_frontmatter(&existing).len()];
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    fs::write(&path, format!("{frontmatter}{body}"))
+    let lock = crate::NoteLock::acquire(&path)?;
+    let existing = match lock.read_text() {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    let frontmatter = &existing[..existing.len() - strip_frontmatter(&existing).len()];
+    lock.write_text(&format!("{frontmatter}{body}"))
 }
 
 /// The daily-note template body to seed a new day with: the same read and

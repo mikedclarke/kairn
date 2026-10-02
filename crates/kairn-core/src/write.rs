@@ -1,7 +1,5 @@
-//! Disk writes, all never-clobber: every path re-reads the file it is about
-//! to change and verifies (or safely relocates) what it expects to find
-//! there, so an edit rendered from a stale snapshot can't destroy content
-//! written meanwhile. All writes are atomic (temp file + rename).
+//! Note edits lock across reading and atomic replacement. Line edits verify
+//! or relocate their expected text; buffer saves reconcile their baseline.
 
 use std::fs;
 use std::io;
@@ -10,6 +8,7 @@ use std::path::{Path, PathBuf};
 use chrono::{Local, NaiveDate};
 
 use crate::blocks::section_end_line as section_end_insert_idx;
+use crate::file_lock::NoteLock;
 use crate::tasks::toggle_task_line;
 use crate::vault::{daily_file, daily_path};
 
@@ -74,6 +73,11 @@ pub fn capture(
 /// newline and line-ending conventions are preserved. Returns the index the
 /// appended text starts at.
 pub fn append_line(path: &Path, line: &str) -> io::Result<usize> {
+    let _lock = lock_for_create(path)?;
+    append_line_locked(path, line)
+}
+
+fn append_line_locked(path: &Path, line: &str) -> io::Result<usize> {
     let mut text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
@@ -106,6 +110,7 @@ pub fn append_line(path: &Path, line: &str) -> io::Result<usize> {
 /// untouched (a wiki link in a synced note must never overwrite a real
 /// note). Returns whether the file was created.
 pub fn create_note_if_absent(path: &Path, content: &str) -> io::Result<bool> {
+    let _lock = lock_for_create(path)?;
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
@@ -120,12 +125,10 @@ pub fn create_note_if_absent(path: &Path, content: &str) -> io::Result<bool> {
     }
 }
 
-/// Write a note's full content atomically (temp file + rename, permissions
-/// preserved). The whole-buffer save path: callers own staleness protection
-/// via `NoteBuffer::reconcile`, which is the only sanctioned route here for
-/// content that was edited from a snapshot.
+/// Replace a note under the shared lock. For snapshot-based edits, use
+/// [`save_text`] or hold a [`NoteLock`] across reconciliation and replacement.
 pub fn write_note(path: &Path, content: &str) -> io::Result<()> {
-    atomic_write(path, content)
+    NoteLock::acquire(path)?.write_text(content)
 }
 
 pub struct TextSave {
@@ -134,6 +137,7 @@ pub struct TextSave {
 }
 
 pub fn save_text(path: &Path, baseline: &str, local: &str) -> io::Result<TextSave> {
+    let _lock = NoteLock::acquire(path)?;
     let disk = fs::read_to_string(path)?;
     let merged = crate::merge3(
         &baseline.replace("\r\n", "\n"),
@@ -161,8 +165,10 @@ pub fn save_text(path: &Path, baseline: &str, local: &str) -> io::Result<TextSav
 /// `Notes/@Trash/`) and the copy is renamed into its place. A note that
 /// vanished, leaving only the copy, is simply recreated by the rename.
 pub fn adopt_conflict_copy(root: &Path, note: &Path, copy: &Path) -> io::Result<()> {
+    let _note_lock = NoteLock::acquire(note)?;
+    let _copy_lock = NoteLock::acquire(copy)?;
     if note.exists() {
-        trash_note(root, note)?;
+        trash_note_locked(root, note)?;
     }
     fs::rename(copy, note)
 }
@@ -189,6 +195,11 @@ fn checked_stem(stem: &str) -> io::Result<&str> {
 /// soft-delete convention; nothing here ever hard-deletes. A name collision
 /// in the trash gets a numbered suffix. Returns where the note ended up.
 pub fn trash_note(root: &Path, path: &Path) -> io::Result<PathBuf> {
+    let _lock = NoteLock::acquire(path)?;
+    trash_note_locked(root, path)
+}
+
+fn trash_note_locked(root: &Path, path: &Path) -> io::Result<PathBuf> {
     let trash = root.join("Notes").join("@Trash");
     if path.starts_with(&trash) {
         return Err(io::Error::new(
@@ -204,15 +215,18 @@ pub fn trash_note(root: &Path, path: &Path) -> io::Result<PathBuf> {
     let ext = path.extension().map(|e| e.to_string_lossy().into_owned());
     let mut dest = trash.join(name);
     let mut n = 2;
+    let mut dest_lock = NoteLock::acquire(&dest)?;
     while dest.exists() {
         let candidate = match &ext {
             Some(ext) => format!("{stem} {n}.{ext}"),
             None => format!("{stem} {n}"),
         };
         dest = trash.join(candidate);
+        dest_lock = NoteLock::acquire(&dest)?;
         n += 1;
     }
     fs::rename(path, &dest)?;
+    drop(dest_lock);
     Ok(dest)
 }
 
@@ -226,6 +240,8 @@ pub fn rename_note(path: &Path, new_stem: &str) -> io::Result<PathBuf> {
     if dest == path {
         return Ok(dest);
     }
+    let _source_lock = NoteLock::acquire(path)?;
+    let _dest_lock = NoteLock::acquire(&dest)?;
     if dest.exists() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -256,6 +272,8 @@ pub fn move_note(path: &Path, dest_dir: &Path) -> io::Result<PathBuf> {
             "can't move a folder into itself",
         ));
     }
+    let _source_lock = NoteLock::acquire(path)?;
+    let _dest_lock = NoteLock::acquire(&dest)?;
     if dest.exists() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -264,6 +282,18 @@ pub fn move_note(path: &Path, dest_dir: &Path) -> io::Result<PathBuf> {
     }
     fs::rename(path, &dest)?;
     Ok(dest)
+}
+
+pub fn rename_path(path: &Path, dest: &Path) -> io::Result<()> {
+    if path == dest {
+        return Ok(());
+    }
+    let _source_lock = NoteLock::acquire(path)?;
+    let _dest_lock = NoteLock::acquire(dest)?;
+    if dest.exists() {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "destination already exists"));
+    }
+    fs::rename(path, dest)
 }
 
 /// Create a note named by the user inside `dir`, seeded with a title
@@ -357,7 +387,14 @@ fn sanitize_title_stem(title: &str) -> Option<String> {
     (!cleaned.is_empty()).then(|| cleaned.to_string())
 }
 
-fn atomic_write(path: &Path, content: &str) -> io::Result<()> {
+fn lock_for_create(path: &Path) -> io::Result<NoteLock> {
+    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        fs::create_dir_all(dir)?;
+    }
+    NoteLock::acquire(path)
+}
+
+pub(crate) fn atomic_write(path: &Path, content: &str) -> io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let name = path
@@ -475,6 +512,7 @@ pub fn replace_line_on_disk(
     expected: &str,
     new_line: &str,
 ) -> io::Result<Option<usize>> {
+    let _lock = NoteLock::acquire(path)?;
     let text = fs::read_to_string(path)?;
     let Some((new_text, idx)) =
         edit_line_in_text(&text, line_idx, expected, |_| Some(new_line.to_string()))
@@ -539,6 +577,7 @@ pub fn remove_line_on_disk(
     line_idx: usize,
     expected: &str,
 ) -> io::Result<Option<usize>> {
+    let _lock = NoteLock::acquire(path)?;
     let text = fs::read_to_string(path)?;
     let Some((new_text, idx)) = remove_line_in_text(&text, line_idx, expected) else {
         return Ok(None);
@@ -553,6 +592,7 @@ pub fn remove_line_on_disk(
 /// Line-ending and trailing-newline conventions are preserved. Returns the
 /// line index the block landed at.
 pub fn insert_block_at_line(path: &Path, line_idx: usize, block: &str) -> io::Result<usize> {
+    let _lock = lock_for_create(path)?;
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
@@ -595,6 +635,7 @@ pub fn insert_block_at_line(path: &Path, line_idx: usize, block: &str) -> io::Re
 /// index the block was removed from; `Ok(None)` when the block is gone or
 /// ambiguous and nothing was written.
 pub fn remove_block_lines(path: &Path, block: &str) -> io::Result<Option<usize>> {
+    let _lock = NoteLock::acquire(path)?;
     let text = fs::read_to_string(path)?;
     let lines: Vec<&str> = text.lines().collect();
     let block_lines: Vec<&str> = block.lines().collect();
@@ -671,6 +712,7 @@ fn section_insert_idx(lines: &[&str], section: &str) -> Option<usize> {
 /// marks, as a `## ` heading otherwise — and the text follows it. A missing
 /// file is created. Returns the index the text starts at.
 pub fn append_to_section(path: &Path, section: &str, text: &str) -> io::Result<usize> {
+    let _lock = lock_for_create(path)?;
     let existing = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
@@ -688,7 +730,7 @@ pub fn append_to_section(path: &Path, section: &str, text: &str) -> io::Result<u
         } else {
             format!("\n{heading}\n{text}")
         };
-        return append_line(path, &block).map(|idx| idx + block.lines().count() - text.lines().count());
+        return append_line_locked(path, &block).map(|idx| idx + block.lines().count() - text.lines().count());
     };
     let crlf = existing.contains("\r\n");
     let ending = if crlf { "\r\n" } else { "\n" };
@@ -949,6 +991,7 @@ pub fn edit_section_on_disk(
     heading: &str,
     edit: &SectionEdit,
 ) -> io::Result<Result<SectionChange, SectionMiss>> {
+    let _lock = lock_for_create(path)?;
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(e)
@@ -985,6 +1028,7 @@ pub fn insert_block_at_top(
     template_rule: &str,
 ) -> io::Result<PathBuf> {
     let path = ensure_day_note(root, date, template_rule)?;
+    let _lock = lock_for_create(&path)?;
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
@@ -1017,6 +1061,7 @@ pub fn insert_block_under_heading(
     expected: &str,
     block: &str,
 ) -> io::Result<Option<usize>> {
+    let _lock = NoteLock::acquire(path)?;
     let text = fs::read_to_string(path)?;
     let lines: Vec<&str> = text.lines().collect();
     let idx = if lines.get(heading_line_idx).is_some_and(|l| *l == expected) {
@@ -1118,6 +1163,7 @@ pub fn join_lines_on_disk(
     expected_second: &str,
     replacement: &str,
 ) -> io::Result<Option<usize>> {
+    let _lock = NoteLock::acquire(path)?;
     let text = fs::read_to_string(path)?;
     let Some((new_text, idx)) =
         join_lines_in_text(&text, first_idx, expected_first, expected_second, replacement)
@@ -1139,6 +1185,7 @@ pub fn move_line_on_disk(
     expected: &str,
     before_idx: usize,
 ) -> io::Result<Option<usize>> {
+    let _lock = NoteLock::acquire(path)?;
     let text = fs::read_to_string(path)?;
     let lines: Vec<&str> = text.lines().collect();
     let from = if lines.get(from_idx).is_some_and(|l| *l == expected) {
@@ -1186,6 +1233,7 @@ pub fn reschedule_task_on_disk(
     expected: &str,
     due: NaiveDate,
 ) -> io::Result<bool> {
+    let _lock = NoteLock::acquire(path)?;
     let text = fs::read_to_string(path)?;
     let Some((new_text, _)) = edit_line_in_text(&text, line_idx, expected, |line| {
         crate::tasks::reschedule_task_line(line, due)
@@ -1202,6 +1250,7 @@ pub fn reschedule_task_on_disk(
 /// written. The write is atomic (temp file + rename). Returns whether a
 /// change was applied.
 pub fn toggle_task_on_disk(path: &Path, line_idx: usize, expected: &str) -> io::Result<bool> {
+    let _lock = NoteLock::acquire(path)?;
     let text = fs::read_to_string(path)?;
     let Some(new_text) = toggle_task_in_text(&text, line_idx, expected) else {
         return Ok(false);

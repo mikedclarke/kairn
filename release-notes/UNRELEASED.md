@@ -20,6 +20,8 @@ restating the same fact twice; no em dashes. Rewrite to this standard before rel
 
 ## Fixed
 
+- App, CLI and sync writes share a lock across reading and replacement; busy files refuse the write for retry.
+
 <!-- Bugs that no longer happen. -->
 
 - The process-only notes folder override remains active after closing Settings.

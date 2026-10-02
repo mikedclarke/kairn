@@ -18,6 +18,7 @@
 pub mod activity;
 pub mod blocks;
 pub mod buffer;
+pub mod file_lock;
 pub mod library;
 pub mod links;
 pub mod merge;
@@ -34,6 +35,7 @@ pub mod write;
 pub use activity::*;
 pub use blocks::*;
 pub use buffer::*;
+pub use file_lock::*;
 pub use library::*;
 pub use links::*;
 pub use merge::*;

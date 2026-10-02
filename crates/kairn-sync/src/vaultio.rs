@@ -143,6 +143,7 @@ impl VaultIo {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let _lock = kairn_core::NoteLock::acquire(&dest)?;
         atomic_write(&dest, content, || {
             if !pre.holds(read_opt_abs(&dest)?.as_deref()) {
                 return Ok(false);
@@ -162,6 +163,10 @@ impl VaultIo {
         before: &BeforeWrite,
     ) -> io::Result<bool> {
         let dest = self.abs(path);
+        if !dest.parent().is_some_and(Path::is_dir) {
+            return Ok(pre.holds(None));
+        }
+        let _lock = kairn_core::NoteLock::acquire(&dest)?;
         if !pre.holds(read_opt_abs(&dest)?.as_deref()) {
             return Ok(false);
         }
@@ -528,6 +533,25 @@ mod tests {
         assert!(io.write(&p, b"merged", &fresh, &*noop()).unwrap());
         assert_eq!(io.read(&p).unwrap(), b"merged");
         assert_eq!(io.scan().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sync_holds_the_shared_lock_through_the_before_write_hook() {
+        let s = Scratch::new("shared-lock");
+        let io = VaultIo::new(&s.0, "MAC");
+        let p = VaultPath::new("Notes/a.md");
+        io.write(&p, b"base\n", &Precondition::Absent, &*noop()).unwrap();
+        let hook = |_: &VaultPath| {
+            let error = kairn_core::append_line(&io.abs(&p), "concurrent").unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        };
+        assert!(io.write(&p, b"remote\n", &Precondition::Any, &hook).unwrap());
+        kairn_core::append_line(&io.abs(&p), "concurrent").unwrap();
+        assert_eq!(io.read(&p).unwrap(), b"remote\nconcurrent\n");
+        let lock = kairn_core::NoteLock::acquire(&io.abs(&p)).unwrap();
+        assert_eq!(io.delete(&p, &Precondition::Any, &*noop()).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock);
+        drop(lock);
     }
 
     #[test]

@@ -465,7 +465,14 @@ impl NoteEditor {
             self.save_error = None;
             return true;
         }
-        match std::fs::read_to_string(&self.path) {
+        let lock = match notes::NoteLock::acquire(&self.path) {
+            Ok(lock) => lock,
+            Err(error) => {
+                self.save_failed(format!("Could not lock this note for saving: {error}"), cx);
+                return false;
+            }
+        };
+        match lock.read_text() {
             Ok(disk) => {
                 if !self.reconcile_from_disk(&disk, cx) {
                     return false;
@@ -485,7 +492,7 @@ impl NoteEditor {
         } else {
             self.buffer.text().to_string()
         };
-        match notes::write_note(&self.path, &out) {
+        match lock.write_text(&out) {
             Ok(()) => {
                 self.buffer.mark_saved();
                 self.save_error = None;

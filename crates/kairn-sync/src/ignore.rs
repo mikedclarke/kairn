@@ -33,7 +33,7 @@ fn is_ignored_component(comp: &str) -> bool {
     }
     // The engine's own atomic-write temp files (`.{name}.kairn-tmp.{pid}.{n}`,
     // matching write.rs): never treat one mid-rename as a real change.
-    if comp.contains(".kairn-tmp.") {
+    if comp.contains(".kairn-tmp.") || comp.ends_with(".kairn-lock") {
         return true;
     }
     false
@@ -86,6 +86,7 @@ mod tests {
     #[test]
     fn editor_and_atomic_write_temp_files_are_excluded() {
         assert!(ignored("Notes/.#open.md"));
+        assert!(ignored("Notes/.Example.md.kairn-lock"));
         assert!(ignored("Notes/~$doc.md"));
         assert!(ignored("Notes/draft.tmp"));
         assert!(ignored("Calendar/.20260808.md.kairn-tmp.4321.7"));
