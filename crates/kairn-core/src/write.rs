@@ -137,8 +137,22 @@ pub struct TextSave {
 }
 
 pub fn save_text(path: &Path, baseline: &str, local: &str) -> io::Result<TextSave> {
+    save_text_impl(path, baseline, local, false)
+}
+
+/// Save a local-first note, allowing an explicitly edited missing note to be created.
+pub fn save_note_text(path: &Path, baseline: &str, local: &str) -> io::Result<TextSave> {
+    save_text_impl(path, baseline, local, true)
+}
+
+fn save_text_impl(path: &Path, baseline: &str, local: &str, create: bool) -> io::Result<TextSave> {
+    if create && let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
     let _lock = NoteLock::acquire(path)?;
-    let disk = fs::read_to_string(path)?;
+    let disk = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if create && e.kind() == io::ErrorKind::NotFound => baseline.to_owned(),
+        Err(e) => return Err(e),
+    };
     let merged = crate::merge3(
         &baseline.replace("\r\n", "\n"),
         &disk.replace("\r\n", "\n"),
@@ -154,7 +168,7 @@ pub fn save_text(path: &Path, baseline: &str, local: &str) -> io::Result<TextSav
     } else {
         merged.text
     };
-    if text != disk {
+    if text != disk || (create && !path.exists()) {
         atomic_write(path, &text)?;
     }
     Ok(TextSave { text, conflict_copy })

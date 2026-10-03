@@ -42,3 +42,22 @@ mod tests {
         assert_eq!(r.conflicts, vec!["ours".to_string()]);
     }
 }
+
+
+#[derive(uniffi::Record)]
+pub struct NoteSaveResult {
+    pub saved: bool,
+    pub text: String,
+    pub conflict_copy: Option<String>,
+    pub error: Option<String>,
+}
+
+/// The shared lock, conflict preservation and durable write are one operation.
+#[uniffi::export]
+pub fn save_note_text(path: String, baseline: String, text: String) -> NoteSaveResult {
+    match kairn_core::write::save_note_text(std::path::Path::new(&path), &baseline, &text) {
+        Ok(saved) => NoteSaveResult { saved: true, text: saved.text,
+            conflict_copy: saved.conflict_copy.map(|p| p.to_string_lossy().into_owned()), error: None },
+        Err(e) => NoteSaveResult { saved: false, text, conflict_copy: None, error: Some(e.to_string()) },
+    }
+}
