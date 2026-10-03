@@ -72,6 +72,7 @@ pub fn run_cycle(ctx: &SyncContext) -> Result<CycleReport> {
     if ctx.cancelled() {
         return Ok(report);
     }
+    if ctx.config.publish_directories { crate::directories::publish(ctx)?; }
     let accepted = push(ctx, &mut report)?;
     if ctx.cancelled() {
         return Ok(report);
@@ -84,6 +85,7 @@ pub fn run_cycle(ctx: &SyncContext) -> Result<CycleReport> {
     if accepted {
         pull(ctx, &mut report)?;
     }
+    crate::directories::reconcile(ctx.vault)?;
     let cursor = ctx.state.cursor()?;
     ctx.vault.validate_root()?;
     // The ack is a report, not a handshake: re-sending an unchanged cursor tells
@@ -933,6 +935,53 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn directory_migration_retires_only_absent_desktop_folders() {
+        let server = FakeServer::new();
+        let desktop = Device::new(&server, "folders-desktop");
+        let phone = Device::new(&server, "folders-phone");
+        desktop.write("Notes/Removed/Nested/example.md", "old");
+        desktop.write("Notes/Retained/last.md", "last");
+        desktop.sync(); phone.sync();
+        std::fs::remove_dir_all(desktop.root.join("Notes/Removed")).unwrap();
+        desktop.delete("Notes/Retained/last.md");
+        desktop.sync(); phone.sync();
+        // Model a pre-lock legacy client and a newly created intentional folder.
+        std::fs::remove_dir_all(phone.root.join("Notes/Removed")).unwrap();
+        std::fs::create_dir_all(phone.root.join("Notes/Removed/Nested")).unwrap();
+        std::fs::create_dir_all(desktop.root.join("Notes/IntentionalEmpty")).unwrap();
+        desktop.config.borrow_mut().publish_directories = true;
+        desktop.sync(); phone.sync();
+        assert!(!phone.exists("Notes/Removed"));
+        assert!(phone.exists("Notes/Retained"));
+        let catalog: crate::directories::Catalog = serde_json::from_str(&phone.read(crate::directories::CATALOG).unwrap()).unwrap();
+        assert!(catalog.present.contains("Notes/IntentionalEmpty"));
+        assert!(catalog.retired.contains("Notes/Removed/Nested"));
+        // A local edit and explicit empty-folder intent both prevent cleanup.
+        phone.write("Notes/Removed/draft.md", "unsynced");
+        phone.write("Notes/Removed/Nested/.kairn-keep", "");
+        crate::directories::reconcile(&phone.vault).unwrap();
+        assert_eq!(phone.read("Notes/Removed/draft.md").as_deref(), Some("unsynced"));
+        assert!(phone.exists("Notes/Removed/Nested/.kairn-keep"));
+        // Recreated directories stop being retired on the next publication.
+        std::fs::create_dir_all(desktop.root.join("Notes/Removed/Nested")).unwrap();
+        desktop.sync();
+        let catalog: crate::directories::Catalog = serde_json::from_str(&desktop.read(crate::directories::CATALOG).unwrap()).unwrap();
+        assert!(!catalog.retired.contains("Notes/Removed"));
+    }
+
+    #[test]
+    fn retired_directory_cleanup_keeps_lock_sidecars_and_unrelated_empty_folders() {
+        let server = FakeServer::new();
+        let phone = Device::new(&server, "folder-locks");
+        phone.write("Notes/Old/.note.md.kairn-lock", "");
+        std::fs::create_dir_all(phone.root.join("Notes/LocalEmpty")).unwrap();
+        phone.write(crate::directories::CATALOG, r#"{"version":1,"present":[],"retired":["Notes/Old"]}"#);
+        crate::directories::reconcile(&phone.vault).unwrap();
+        assert!(phone.exists("Notes/Old/.note.md.kairn-lock"));
+        assert!(phone.exists("Notes/LocalEmpty"));
     }
 
     #[test]

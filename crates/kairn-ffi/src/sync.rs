@@ -165,6 +165,7 @@ impl FfiSyncEngine {
             Box::new(move |e: SyncEvent| listener.on_event(e.into()));
         let inner = SyncEngine::new(
             EngineConfig {
+                publish_directories: false,
                 vault_root: vault_root.into(),
                 state_db: state_db.into(),
                 device_label,
@@ -266,3 +267,6 @@ mod tests {
         }
     }
 }
+
+#[uniffi::export]
+pub fn sync_build_revision() -> String { env!("KAIRN_BUILD_REVISION").to_owned() }

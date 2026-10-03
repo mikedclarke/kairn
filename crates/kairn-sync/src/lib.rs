@@ -15,6 +15,7 @@
 //! WebSocket transport lands with the server.
 
 pub mod cycle;
+pub mod directories;
 pub mod engine;
 pub mod hash;
 #[cfg(feature = "http")]

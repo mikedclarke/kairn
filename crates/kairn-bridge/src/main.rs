@@ -28,7 +28,7 @@ use kairn_sync::types::{CycleReport, SyncEvent};
 
 /// Mirror a notes folder to a Kairn sync server (headless bridge mode).
 #[derive(Parser, Debug)]
-#[command(name = "kairn-bridge", version, about)]
+#[command(name = "kairn-bridge", version = concat!(env!("CARGO_PKG_VERSION"), " ", env!("KAIRN_BUILD_REVISION")), about)]
 struct Args {
     /// The notes folder to sync (the vault root).
     #[arg(long, value_name = "DIR")]
@@ -72,6 +72,10 @@ struct Args {
     #[arg(long)]
     allow_bulk_delete: bool,
 
+    /// Publish authoritative Notes directory retirement metadata (one bridge only).
+    #[arg(long)]
+    publish_directories: bool,
+
     /// Run a single cycle and exit (useful for a one-off push or a smoke test).
     #[arg(long)]
     once: bool,
@@ -103,6 +107,7 @@ fn main() -> Result<()> {
     let transport = HttpTransport::new(args.server.clone(), args.vault.clone(), token);
     let engine = SyncEngine::new(
         EngineConfig {
+            publish_directories: args.publish_directories,
             vault_root: notes.clone(),
             state_db,
             device_label: args.device_label.clone(),

@@ -160,6 +160,46 @@ impl VaultIo {
         self.root.join(&path.0)
     }
 
+    pub fn note_directories(&self) -> io::Result<std::collections::BTreeSet<String>> {
+        self.validate_root()?;
+        let mut found = std::collections::BTreeSet::new();
+        fn walk(dir: &Dir, prefix: &str, found: &mut std::collections::BTreeSet<String>) -> io::Result<()> {
+            for entry in dir.entries()? {
+                let entry = entry?;
+                let name = entry.file_name().into_string().map_err(|_| io::Error::other("non-UTF8 directory"))?;
+                let path = format!("{prefix}/{name}");
+                if name.starts_with('.') || name.starts_with('@') { continue; }
+                if entry.file_type()?.is_symlink() { return Err(io::Error::other("directory catalog refuses symlinks")); }
+                if entry.file_type()?.is_dir() {
+                    found.insert(path.clone());
+                    walk(&dir.open_dir_nofollow(&name)?, &path, found)?;
+                }
+            }
+            Ok(())
+        }
+        let root = self.root_handle.as_ref().unwrap();
+        let notes = root.open_dir_nofollow("Notes")?;
+        walk(&notes, "Notes", &mut found)?;
+        self.validate_root()?;
+        Ok(found)
+    }
+
+    pub fn remove_empty_directory(&self, path: &VaultPath) -> io::Result<()> {
+        let (parent, name) = match self.parent(path, false) {
+            Ok(p) => p,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        self.validate_parent(path, &parent)?;
+        // rmdir is atomic and refuses files, symlinks, nonempty directories and
+        // lock-only directories. Never unlink persistent lock sidecars.
+        match parent.remove_dir(&name) {
+            Ok(()) => vault_fs::sync_directory(&parent),
+            Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn exists(&self, path: &VaultPath) -> bool {
         self.parent(path, false).and_then(|(dir, name)| vault_fs::open(&dir, &name)).is_ok()
     }

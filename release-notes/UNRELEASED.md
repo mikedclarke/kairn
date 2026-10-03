@@ -25,6 +25,9 @@ restating the same fact twice; no em dashes. Rewrite to this standard before rel
 
 <!-- Bugs that no longer happen. -->
 
+- Sync can retire deleted desktop Notes folders without removing unsynced content or intentional empty folders.
+- Mobile note saves share the core's merge lock and preserve edits when a write fails.
+
 - Hidden terminals process output and exits while preserving the active session and editor focus.
 - Stalled terminal input no longer blocks the app, and bracketed paste strips embedded escape sequences.
 - CLI installation and evaluation scripts handle special characters in paths safely.

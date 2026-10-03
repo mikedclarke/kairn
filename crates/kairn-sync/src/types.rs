@@ -158,6 +158,9 @@ pub struct CycleReport {
 /// knob: the defaults are what a vault should run with.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncConfig {
+    /// Only the designated desktop bridge publishes directory retirement metadata.
+    #[serde(default)]
+    pub publish_directories: bool,
     /// Allow a single cycle to push deletes for an unbounded number of paths.
     /// Off by default: a vault that suddenly reads as mostly-deleted is an
     /// unmounted volume, a re-pointed root, or a half-populated folder far more

@@ -47,6 +47,7 @@ const SAFETY_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 /// Where one vault's engine lives and how it labels itself.
 pub struct EngineConfig {
+    pub publish_directories: bool,
     /// The vault root (the notes folder).
     pub vault_root: PathBuf,
     /// The device's sync-state database, kept outside the vault (spec §6).
@@ -152,6 +153,7 @@ impl SyncEngine {
                 status: Mutex::new(SyncStatus::default()),
                 emit: on_event,
                 config: SyncConfig {
+                    publish_directories: config.publish_directories,
                     allow_bulk_delete: config.allow_bulk_delete,
                 },
                 cancel: AtomicBool::new(false),
@@ -406,6 +408,7 @@ mod tests {
         ) -> Result<SyncEngine> {
             SyncEngine::new(
                 EngineConfig {
+                    publish_directories: false,
                     vault_root: root.to_path_buf(),
                     state_db: self.state_db.clone(),
                     device_label: label.to_uppercase(),
@@ -672,6 +675,7 @@ mod tests {
         let counted = cycles.clone();
         let engine = SyncEngine::new(
             EngineConfig {
+                publish_directories: false,
                 vault_root: fx.root.clone(),
                 state_db: fx.state_db.clone(),
                 device_label: "MAC".into(),
