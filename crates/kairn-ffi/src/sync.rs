@@ -74,6 +74,9 @@ pub enum FfiSyncEvent {
     CycleFinished { report: SyncCycleReport },
     ConflictCopyCreated { original: String, copy: String },
     AboutToWrite { path: String },
+    /// A file the cycle wrote or deleted has landed; the path now holds the
+    /// new bytes (or is gone). Sent after the rename, never before.
+    Wrote { path: String },
     Error { message: String },
 }
 
@@ -86,6 +89,9 @@ impl From<SyncEvent> for FfiSyncEvent {
                 copy: copy.to_string(),
             },
             SyncEvent::AboutToWrite(path) => Self::AboutToWrite {
+                path: path.to_string(),
+            },
+            SyncEvent::Wrote(path) => Self::Wrote {
                 path: path.to_string(),
             },
             SyncEvent::Error(message) => Self::Error { message },
@@ -183,6 +189,11 @@ impl FfiSyncEngine {
                     vault_id,
                     token,
                 }),
+                // The activity log is rewritten whole by the desktop many times
+                // a day and the phone never reads it: declining it keeps a
+                // catch-up from spending its time on a large file nobody here
+                // looks at.
+                local_ignore: vec![".kairn/activity.jsonl".to_owned()],
             },
             Box::new(transport),
             on_event,
@@ -212,8 +223,12 @@ impl FfiSyncEngine {
     /// `sync_now()` at the moments that demand a cycle (app-foreground,
     /// background-fetch/push). Returns immediately; the cycles run on the
     /// engine's own thread.
-    pub fn start(&self) {
-        self.inner.start();
+    ///
+    /// Returns `true` when this call started the worker, whose own first cycle
+    /// then runs at once on a fresh connection (so a foreground handler need
+    /// not queue a second one), and `false` when a worker was already running.
+    pub fn start(&self) -> bool {
+        self.inner.start()
     }
 
     /// Stop the background worker, waiting for the in-flight cycle to reach its

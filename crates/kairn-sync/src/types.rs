@@ -167,6 +167,25 @@ pub struct SyncConfig {
     /// often than it is a real mass delete, and those tombstones propagate to
     /// every device (invariant §15.2).
     pub allow_bulk_delete: bool,
+    /// Paths this device declines: exact vault-relative paths, or a prefix when
+    /// the string ends in `/`. A declined path is never fetched, written,
+    /// uploaded or deleted by this device, here or on the server; whatever is on
+    /// disk at that path is left exactly as it is.
+    #[serde(default)]
+    pub local_ignore: Vec<String>,
+}
+
+impl SyncConfig {
+    /// Whether this device declines `path` (see [`SyncConfig::local_ignore`]).
+    pub fn declines(&self, path: &VaultPath) -> bool {
+        self.local_ignore.iter().any(|rule| {
+            if rule.ends_with('/') {
+                path.0.starts_with(rule.as_str())
+            } else {
+                path.0 == *rule
+            }
+        })
+    }
 }
 
 /// A snapshot of engine state for the host UI (spec §14).
@@ -191,6 +210,11 @@ pub enum SyncEvent {
         copy: VaultPath,
     },
     AboutToWrite(VaultPath),
+    /// A file the cycle wrote or deleted has landed: sent after the rename (or
+    /// the unlink), never before, so a host that re-reads the path sees the new
+    /// bytes. Lets the host show a pulled note the moment it arrives rather
+    /// than when the whole cycle finishes.
+    Wrote(VaultPath),
     Error(String),
 }
 

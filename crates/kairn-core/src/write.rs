@@ -137,15 +137,24 @@ pub struct TextSave {
 }
 
 pub fn save_text(path: &Path, baseline: &str, local: &str) -> io::Result<TextSave> {
-    save_text_impl(path, baseline, local, false)
+    save_text_impl(path, baseline, local, false, crate::merge3)
 }
 
 /// Save a local-first note, allowing an explicitly edited missing note to be created.
+/// Lines both sides inserted at one point are both kept ([`crate::merge3_keep_both`]):
+/// this is the phone's save path, where another device appending to the same
+/// note while it is open is the everyday case rather than a conflict.
 pub fn save_note_text(path: &Path, baseline: &str, local: &str) -> io::Result<TextSave> {
-    save_text_impl(path, baseline, local, true)
+    save_text_impl(path, baseline, local, true, crate::merge3_keep_both)
 }
 
-fn save_text_impl(path: &Path, baseline: &str, local: &str, create: bool) -> io::Result<TextSave> {
+fn save_text_impl(
+    path: &Path,
+    baseline: &str,
+    local: &str,
+    create: bool,
+    merge: fn(&str, &str, &str) -> crate::Merged,
+) -> io::Result<TextSave> {
     if create && let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
     let _lock = NoteLock::acquire(path)?;
     let disk = match fs::read_to_string(path) {
@@ -153,7 +162,7 @@ fn save_text_impl(path: &Path, baseline: &str, local: &str, create: bool) -> io:
         Err(e) if create && e.kind() == io::ErrorKind::NotFound => baseline.to_owned(),
         Err(e) => return Err(e),
     };
-    let merged = crate::merge3(
+    let merged = merge(
         &baseline.replace("\r\n", "\n"),
         &disk.replace("\r\n", "\n"),
         &local.replace("\r\n", "\n"),
@@ -1267,6 +1276,23 @@ mod tests {
         fs::write(&path, [0xff]).unwrap();
         assert!(save_text(&path, "first", "local").is_err());
         assert_eq!(fs::read(path).unwrap(), [0xff]);
+    }
+
+    #[test]
+    fn the_phone_save_keeps_both_insertions_and_the_desktop_save_is_unchanged() {
+        let root = ScratchRoot::new("text-save-keep-both");
+        let base = "### Daily Notes\nMorning walk\n";
+        let disk = "### Daily Notes\nMorning walk\nFrom the desk\nStand-up at ten\n";
+        let local = "### Daily Notes\nMorning walk\nStand-up at ten\nBought stamps\n";
+        let path = root.write("Calendar/20261110.md", disk);
+        let saved = save_note_text(&path, base, local).unwrap();
+        assert_eq!(saved.text, "### Daily Notes\nMorning walk\nFrom the desk\nStand-up at ten\nBought stamps\n");
+        assert!(saved.conflict_copy.is_none());
+        assert_eq!(fs::read_to_string(&path).unwrap(), saved.text);
+
+        let path = root.write("Calendar/20261111.md", disk);
+        let saved = save_text(&path, base, local).unwrap();
+        assert_eq!(saved.text, crate::merge3(base, disk, local).text);
     }
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {

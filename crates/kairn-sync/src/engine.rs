@@ -68,6 +68,9 @@ pub struct EngineConfig {
     /// watcher and timer alone; without the `http` feature the value is
     /// carried but no listener is built.
     pub remote_wake: Option<RemoteWakeConfig>,
+    /// Paths this device declines to sync: exact vault-relative paths, or a
+    /// prefix when the string ends in `/` (see [`SyncConfig::local_ignore`]).
+    pub local_ignore: Vec<String>,
 }
 
 /// The mutable half, guarded so a cycle never overlaps itself. A cycle is
@@ -75,7 +78,6 @@ pub struct EngineConfig {
 struct Inner {
     state: StateStore,
     vault: VaultIo,
-    transport: Box<dyn Transport>,
     next_full_scan: Instant,
     _vault_lock: std::fs::File,
 }
@@ -86,6 +88,9 @@ struct Inner {
 /// released: a listener that calls back into the engine then blocks nothing.
 struct Shared {
     inner: Mutex<Inner>,
+    /// Outside the cycle lock (a transport is `Sync`), so `start()` can drop
+    /// pooled connections without waiting out a cycle another thread is in.
+    transport: Box<dyn Transport>,
     status: Mutex<SyncStatus>,
     emit: Box<dyn Fn(SyncEvent) + Send + Sync>,
     config: SyncConfig,
@@ -146,15 +151,16 @@ impl SyncEngine {
                 inner: Mutex::new(Inner {
                     state,
                     vault,
-                    transport,
                     next_full_scan: Instant::now(),
                     _vault_lock: vault_lock,
                 }),
+                transport,
                 status: Mutex::new(SyncStatus::default()),
                 emit: on_event,
                 config: SyncConfig {
                     publish_directories: config.publish_directories,
                     allow_bulk_delete: config.allow_bulk_delete,
+                    local_ignore: config.local_ignore,
                 },
                 cancel: AtomicBool::new(false),
                 invalidate_scan: AtomicBool::new(true),
@@ -189,11 +195,18 @@ impl SyncEngine {
     /// Start the background worker: an immediate cycle, then cycles on watcher
     /// wakes (desktop), remote wakes from the server's freshness socket, and
     /// the safety timer. Idempotent — a second call while running does nothing.
-    pub fn start(&self) {
+    ///
+    /// Returns whether this call started a worker (`false`: one was already
+    /// running), so a host can treat the worker's first cycle as its own
+    /// foreground cycle instead of queueing a second one behind it. A real
+    /// start drops the transport's pooled connections before that first cycle:
+    /// a socket kept from before the host was suspended can be dead.
+    pub fn start(&self) -> bool {
         let mut w = self.worker.lock().unwrap();
         if w.is_some() {
-            return;
+            return false;
         }
+        self.shared.transport.reset_connections();
         *self.wake.0.lock().unwrap() = WakeState::default();
         self.shared.cancel.store(false, Ordering::SeqCst);
         self.shared.invalidate_scan.store(true, Ordering::SeqCst);
@@ -204,6 +217,7 @@ impl SyncEngine {
         let handle = std::thread::spawn(move || worker_loop(shared, wake, root, remote));
         *w = Some(Worker { handle });
         self.shared.status.lock().unwrap().running = true;
+        true
     }
 
     /// Stop the background worker and wait for it to finish. Idempotent. iOS
@@ -245,7 +259,7 @@ fn run_once(shared: &Shared, force_scan: bool) -> Result<CycleReport> {
         }
         let cancel = || shared.cancel.load(Ordering::SeqCst);
         let ctx = SyncContext {
-            transport: guard.transport.as_ref(),
+            transport: shared.transport.as_ref(),
             state: &guard.state,
             vault: &guard.vault,
             emit: &*shared.emit,
@@ -416,6 +430,7 @@ mod tests {
                     vault_id: Some("default".into()),
                     allow_bulk_delete: false,
                     remote_wake: None,
+                    local_ignore: Vec::new(),
                 },
                 Box::new(server.client(label)),
                 Box::new(|_e| {}),
@@ -687,6 +702,7 @@ mod tests {
                     vault_id: "default".into(),
                     token: "tok".into(),
                 }),
+                local_ignore: Vec::new(),
             },
             Box::new(server.client("mac")),
             Box::new(move |e| {
@@ -723,6 +739,77 @@ mod tests {
 
         engine.stop();
         server_thread.join().unwrap();
+    }
+
+    /// A transport that counts `reset_connections` calls and otherwise passes
+    /// straight through to the fake server.
+    struct ResetCounting {
+        inner: crate::fakeserver::FakeClient,
+        resets: Arc<AtomicU64>,
+    }
+
+    impl Transport for ResetCounting {
+        fn changes(&self, since: crate::types::Seq, limit: u32) -> crate::transport::TransportResult<crate::types::ChangesPage> {
+            self.inner.changes(since, limit)
+        }
+        fn get_blob(&self, path: &VaultPath, rev: Option<crate::types::Rev>) -> crate::transport::TransportResult<Vec<u8>> {
+            self.inner.get_blob(path, rev)
+        }
+        fn put_blob(
+            &self,
+            path: &VaultPath,
+            base_rev: crate::types::Rev,
+            hash: &crate::types::ContentHash,
+            content: &[u8],
+        ) -> crate::transport::TransportResult<crate::types::PutOutcome> {
+            self.inner.put_blob(path, base_rev, hash, content)
+        }
+        fn delete(&self, path: &VaultPath, base_rev: crate::types::Rev) -> crate::transport::TransportResult<crate::types::PutOutcome> {
+            self.inner.delete(path, base_rev)
+        }
+        fn ack(&self, cursor: crate::types::Seq) -> crate::transport::TransportResult<()> {
+            self.inner.ack(cursor)
+        }
+        fn reset_connections(&self) {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn start_reports_whether_it_started_a_worker_and_resets_connections_only_then() {
+        let server = FakeServer::new();
+        let fx = Fixture::new("reset");
+        let resets = Arc::new(AtomicU64::new(0));
+        let engine = SyncEngine::new(
+            EngineConfig {
+                publish_directories: false,
+                vault_root: fx.root.clone(),
+                state_db: fx.state_db.clone(),
+                device_label: "PHONE".into(),
+                server_url: Some("http://sync.example:8787".into()),
+                vault_id: Some("default".into()),
+                allow_bulk_delete: false,
+                remote_wake: None,
+                local_ignore: Vec::new(),
+            },
+            Box::new(ResetCounting { inner: server.client("phone"), resets: resets.clone() }),
+            Box::new(|_e| {}),
+        )
+        .unwrap();
+
+        assert_eq!(resets.load(Ordering::SeqCst), 0);
+        assert!(engine.start(), "the first start starts a worker");
+        assert_eq!(resets.load(Ordering::SeqCst), 1);
+        assert!(!engine.start(), "a second start finds one running");
+        assert_eq!(resets.load(Ordering::SeqCst), 1, "the no-op start leaves the pool alone");
+        // A plain cycle never resets the pool.
+        engine.sync_now().unwrap();
+        assert_eq!(resets.load(Ordering::SeqCst), 1);
+
+        engine.stop();
+        assert!(engine.start(), "a start after a stop starts a worker again");
+        assert_eq!(resets.load(Ordering::SeqCst), 2);
+        engine.stop();
     }
 
     #[test]

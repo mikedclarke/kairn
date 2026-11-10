@@ -1,15 +1,17 @@
 //! Turning a collision into a decision (spec §8). A conflict exists when a
 //! pulled change or a rejected push meets a locally dirty file (local differs
 //! from baseline and remote differs from baseline). Markdown goes through
-//! `kairn_core::merge3` — the same three-way merge the editor's save path uses,
-//! so sync and the editor resolve identically and the disk/remote side wins a
-//! collided hunk. Everything else is last-writer-wins with a conflict copy.
+//! `kairn_core::merge3_keep_both` — the editor's three-way merge, except that
+//! two sides inserting lines at the same point keep both rather than conflict
+//! (the phone's save path uses the same rule) — so the disk/remote side wins
+//! a region both sides changed. Everything else is last-writer-wins with a
+//! conflict copy.
 //!
 //! This module is pure: it decides *what* bytes go where; `vaultio` performs the
 //! writes. That keeps the honest-not-lossy floor (invariant §15.2) provable
 //! here in isolation.
 
-use kairn_core::merge3;
+use kairn_core::merge3_keep_both;
 
 /// The decision for one file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,25 +30,38 @@ pub enum Resolution {
 }
 
 /// Resolve a markdown collision. `baseline` is the last-synced text if it is
-/// still retained; `None` means the baseline is gone, so a three-way merge
-/// isn't possible and the code degrades safely (spec §6): identical sides pass
-/// clean, differing sides conflict with the remote winning.
-pub fn resolve_markdown(baseline: Option<&str>, remote: &str, local: &str) -> Resolution {
+/// still retained. `never_synced` says this device has no record of the path
+/// at all (it created the file before ever seeing the server's copy): then
+/// there is no shared history to lose, and the file merges against an empty
+/// baseline, which keeps the remote text and adds the local lines it lacks.
+/// A missing baseline for a path the device *has* synced means the baseline
+/// is gone, so the code degrades safely (spec §6): identical sides pass clean,
+/// differing sides conflict with the remote winning.
+pub fn resolve_markdown(
+    baseline: Option<&str>,
+    remote: &str,
+    local: &str,
+    never_synced: bool,
+) -> Resolution {
     if remote == local {
         return Resolution::Write {
             content: remote.as_bytes().to_vec(),
             merged_clean: true,
         };
     }
-    let Some(baseline) = baseline else {
-        // No baseline to merge against: keep the remote head, preserve the
-        // local text as a conflict copy rather than guess a merge.
-        return Resolution::WriteWithConflict {
-            content: remote.as_bytes().to_vec(),
-            conflict_copy: local.as_bytes().to_vec(),
-        };
+    let baseline = match baseline {
+        Some(baseline) => baseline,
+        None if never_synced => "",
+        None => {
+            // No baseline to merge against: keep the remote head, preserve the
+            // local text as a conflict copy rather than guess a merge.
+            return Resolution::WriteWithConflict {
+                content: remote.as_bytes().to_vec(),
+                conflict_copy: local.as_bytes().to_vec(),
+            };
+        }
     };
-    let merged = merge3(baseline, remote, local);
+    let merged = merge3_keep_both(baseline, remote, local);
     if merged.conflicts.is_empty() {
         Resolution::Write {
             content: merged.text.into_bytes(),
@@ -97,7 +112,7 @@ mod tests {
         let base = "top\nmiddle\nbottom\n";
         let remote = "top\nmiddle\nbottom\n* agent task\n";
         let local = "top edited\nmiddle\nbottom\n";
-        let r = resolve_markdown(Some(base), remote, local);
+        let r = resolve_markdown(Some(base), remote, local, false);
         assert_eq!(
             r,
             Resolution::Write {
@@ -109,7 +124,7 @@ mod tests {
 
     #[test]
     fn same_line_markdown_collision_keeps_remote_and_copies_local() {
-        let r = resolve_markdown(Some("x\n"), "x remote\n", "x local\n");
+        let r = resolve_markdown(Some("x\n"), "x remote\n", "x local\n", false);
         let Resolution::WriteWithConflict {
             content,
             conflict_copy,
@@ -124,7 +139,7 @@ mod tests {
 
     #[test]
     fn identical_sides_are_clean_even_without_a_baseline() {
-        let r = resolve_markdown(None, "same\n", "same\n");
+        let r = resolve_markdown(None, "same\n", "same\n", false);
         assert_eq!(
             r,
             Resolution::Write {
@@ -136,12 +151,36 @@ mod tests {
 
     #[test]
     fn missing_baseline_conflicts_rather_than_guesses() {
-        let r = resolve_markdown(None, "remote\n", "local\n");
+        let r = resolve_markdown(None, "remote\n", "local\n", false);
         assert_eq!(
             r,
             Resolution::WriteWithConflict {
                 content: b"remote\n".to_vec(),
                 conflict_copy: b"local\n".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_never_synced_file_keeps_the_remote_text_and_adds_its_own_lines() {
+        let r = resolve_markdown(None, "# Day\nfrom remote\n", "# Day\nfrom here\n", true);
+        assert_eq!(
+            r,
+            Resolution::Write {
+                content: b"# Day\nfrom remote\nfrom here\n".to_vec(),
+                merged_clean: true,
+            }
+        );
+    }
+
+    #[test]
+    fn two_insertions_at_one_point_keep_both() {
+        let r = resolve_markdown(Some("a\n"), "a\nremote\nshared\n", "a\nshared\nlocal\n", false);
+        assert_eq!(
+            r,
+            Resolution::Write {
+                content: b"a\nremote\nshared\nlocal\n".to_vec(),
+                merged_clean: true,
             }
         );
     }
@@ -161,7 +200,7 @@ mod tests {
     #[test]
     fn no_real_difference_writes_clean() {
         assert!(matches!(
-            resolve_markdown(Some("a\n"), "a\n", "a\n"),
+            resolve_markdown(Some("a\n"), "a\n", "a\n", false),
             Resolution::Write {
                 merged_clean: true,
                 ..

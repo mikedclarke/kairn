@@ -117,6 +117,8 @@ fn main() -> Result<()> {
             // The bridge drives its own poll loop below rather than
             // the engine's worker, so the freshness socket has nothing to wake.
             remote_wake: None,
+            // The bridge holds the whole vault: it declines nothing.
+            local_ignore: Vec::new(),
         },
         Box::new(transport),
         Box::new(on_event),
@@ -267,7 +269,7 @@ fn on_event(e: SyncEvent) {
             ));
         }
         SyncEvent::Error(msg) => log(&format!("engine error: {msg}")),
-        SyncEvent::CycleFinished(_) | SyncEvent::AboutToWrite(_) => {}
+        SyncEvent::CycleFinished(_) | SyncEvent::AboutToWrite(_) | SyncEvent::Wrote(_) => {}
     }
 }
 

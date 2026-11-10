@@ -180,6 +180,37 @@ impl StateStore {
         Ok(())
     }
 
+    /// Record a whole batch of journal entries as still owed, in one
+    /// transaction: the same bookkeeping as [`Self::record_pull`] with
+    /// `deferred` set, for each entry. The read position moves to the highest
+    /// seq in the batch while the applied cursor stays below the oldest entry
+    /// still owed, so a crash before any of them is applied loses nothing.
+    pub fn record_pending_pulls(&self, entries: &[JournalEntry]) -> Result<()> {
+        let Some(highest) = entries.iter().map(|e| e.seq).max() else {
+            return Ok(());
+        };
+        let read_cursor = self.pull_cursor()?.max(highest);
+        let tx = self.conn.unchecked_transaction()?;
+        for entry in entries {
+            tx.execute(
+                "INSERT INTO pending_pulls (path, seq, entry) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(path) DO UPDATE SET seq = excluded.seq, entry = excluded.entry
+                 WHERE excluded.seq >= pending_pulls.seq",
+                params![entry.path.0, entry.seq, serde_json::to_string(entry)?],
+            )?;
+        }
+        let oldest: Option<Seq> = tx.query_row("SELECT MIN(seq) FROM pending_pulls", [], |row| row.get(0))?;
+        let cursor = oldest.map_or(read_cursor, |seq| read_cursor.min(seq.saturating_sub(1)));
+        for (key, value) in [("pull_cursor", read_cursor), ("cursor", cursor)] {
+            tx.execute(
+                "INSERT INTO meta (k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                params![key, value.to_string()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// The cursor last reported to the server, so a cycle that changed nothing
     /// can skip the ack and stay at one round trip (spec §7).
     pub fn acked_cursor(&self) -> Result<Option<Seq>> {
@@ -507,6 +538,36 @@ mod tests {
         s.record_pull(&newer, false).unwrap();
         assert!(s.pending_pulls().unwrap().is_empty());
         assert_eq!(s.cursor().unwrap(), 3);
+    }
+
+    #[test]
+    fn a_pending_batch_commits_atomically_and_holds_the_cursor_below_its_oldest_entry() {
+        let s = StateStore::open_in_memory().unwrap();
+        let entry = |seq, path: &str| JournalEntry {
+            seq, path: vp(path), rev: 1, hash: Some(hash_bytes(path.as_bytes())),
+            deleted: false, device_id: DeviceId("test".into()),
+        };
+        let batch = vec![entry(4, "Notes/a.md"), entry(9, "Notes/b.md"), entry(7, "Notes/c.md")];
+        s.set_read_only(true).unwrap();
+        assert!(s.record_pending_pulls(&batch).is_err());
+        assert!(s.pending_pulls().unwrap().is_empty());
+        assert_eq!(s.pull_cursor().unwrap(), 0);
+        s.set_read_only(false).unwrap();
+
+        s.record_pending_pulls(&batch).unwrap();
+        assert_eq!(s.pending_pulls().unwrap().len(), 3);
+        assert_eq!(s.pull_cursor().unwrap(), 9);
+        assert_eq!(s.cursor().unwrap(), 3);
+        // Applying the oldest lets the cursor move up to the next one owed.
+        s.record_pull(&batch[0], false).unwrap();
+        assert_eq!(s.cursor().unwrap(), 6);
+        s.record_pull(&batch[2], false).unwrap();
+        s.record_pull(&batch[1], false).unwrap();
+        assert_eq!(s.cursor().unwrap(), 9);
+        assert!(s.pending_pulls().unwrap().is_empty());
+        // An empty batch writes nothing.
+        s.record_pending_pulls(&[]).unwrap();
+        assert_eq!(s.cursor().unwrap(), 9);
     }
 
     /// A scratch directory that cleans itself up.

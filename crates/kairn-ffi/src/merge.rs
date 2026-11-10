@@ -24,9 +24,31 @@ pub fn merge3(base: String, disk: String, ours: String) -> MergeResult {
     }
 }
 
+/// Slot the lines a user typed over a placeholder note (`seed`, a blank day's
+/// template, edited into `edited`) into the real note that has since arrived
+/// (`disk`), each under its heading, instead of merging two unrelated versions.
+/// An untouched or empty `edited` returns `disk` unchanged. See
+/// [`kairn_core::adopt_seeded`].
+#[uniffi::export]
+pub fn adopt_seeded_text(seed: String, edited: String, disk: String) -> String {
+    kairn_core::adopt_seeded(&seed, &edited, &disk)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adopt_seeded_text_places_typed_lines_under_their_heading() {
+        let seed = "### Todays Tasks\n\n### Daily Notes\n\n";
+        let edited = "### Todays Tasks\n\n### Daily Notes\n* Buy stamps\n\n";
+        let disk = "### Daily Notes\nMorning walk\n\n### Desk\n- Sorted the post\n";
+        assert_eq!(
+            adopt_seeded_text(seed.into(), edited.into(), disk.into()),
+            "### Daily Notes\nMorning walk\n* Buy stamps\n\n### Desk\n- Sorted the post\n"
+        );
+        assert_eq!(adopt_seeded_text(seed.into(), seed.into(), disk.into()), disk);
+    }
 
     #[test]
     fn non_conflicting_edits_combine() {

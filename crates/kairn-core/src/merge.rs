@@ -17,6 +17,24 @@ pub struct Merged {
 /// side is returned as a conflict. Line endings are the caller's problem:
 /// this operates on `\n` only.
 pub fn merge3(base: &str, disk: &str, ours: &str) -> Merged {
+    merge_with(base, disk, ours, false)
+}
+
+/// [`merge3`], except where both sides only inserted lines at the same point
+/// (a collided region whose base side is empty): there the result is disk's
+/// inserted lines followed by ours', leaving out any of our lines that are
+/// byte-identical to a line disk inserted there, and keeping our blank lines
+/// only between our kept non-blank lines. Two insertions are never a conflict.
+/// A region where either side changed or removed base lines resolves exactly
+/// as in [`merge3`] (disk wins, ours reported).
+///
+/// This is for paths where both sides adding lines is the normal case (two
+/// devices writing into one daily note), not for the desktop editor's saves.
+pub fn merge3_keep_both(base: &str, disk: &str, ours: &str) -> Merged {
+    merge_with(base, disk, ours, true)
+}
+
+fn merge_with(base: &str, disk: &str, ours: &str, keep_both: bool) -> Merged {
     if disk == base || disk == ours {
         return Merged { text: ours.to_string(), conflicts: Vec::new() };
     }
@@ -50,11 +68,11 @@ pub fn merge3(base: &str, disk: &str, ours: &str) -> Merged {
         .collect();
 
     for (ai, aj, ak) in anchors {
-        resolve(&b[bi..ai], &d[dj..aj], &o[ok..ak], &mut out, &mut conflicts);
+        resolve(&b[bi..ai], &d[dj..aj], &o[ok..ak], keep_both, &mut out, &mut conflicts);
         out.push(b[ai]);
         (bi, dj, ok) = (ai + 1, aj + 1, ak + 1);
     }
-    resolve(&b[bi..], &d[dj..], &o[ok..], &mut out, &mut conflicts);
+    resolve(&b[bi..], &d[dj..], &o[ok..], keep_both, &mut out, &mut conflicts);
 
     let trailing_newline = if ours.ends_with('\n') == base.ends_with('\n') {
         disk.ends_with('\n')
@@ -73,6 +91,7 @@ fn resolve<'a>(
     base: &[&'a str],
     disk: &[&'a str],
     ours: &[&'a str],
+    keep_both: bool,
     out: &mut Vec<&'a str>,
     conflicts: &mut Vec<String>,
 ) {
@@ -80,6 +99,20 @@ fn resolve<'a>(
         out.extend_from_slice(ours);
     } else if ours == base {
         out.extend_from_slice(disk);
+    } else if base.is_empty() && keep_both {
+        out.extend_from_slice(disk);
+        // Our lines disk already inserted here are not typed twice; our blank
+        // lines survive only as spacing between lines we actually keep.
+        let kept: Vec<bool> = ours.iter().map(|l| !is_blank(l) && !disk.contains(l)).collect();
+        if let (Some(first), Some(last)) =
+            (kept.iter().position(|k| *k), kept.iter().rposition(|k| *k))
+        {
+            for (i, line) in ours.iter().enumerate().take(last + 1).skip(first) {
+                if kept[i] || is_blank(line) {
+                    out.push(line);
+                }
+            }
+        }
     } else if base.is_empty() {
         out.extend_from_slice(disk);
         out.extend_from_slice(ours);
@@ -91,6 +124,124 @@ fn resolve<'a>(
             conflicts.push(ours.join("\n"));
         }
     }
+}
+
+fn is_blank(line: &str) -> bool {
+    line.trim().is_empty()
+}
+
+/// Slot the lines a user typed over a placeholder note into the real note that
+/// has since arrived, instead of merging two unrelated versions of the file.
+///
+/// `seed` is the placeholder the editor showed (a blank day's template),
+/// `edited` what the user turned it into, and `disk` the real note. The user's
+/// lines are those a line diff from `seed` to `edited` shows as inserted, plus
+/// the new form of any seed line they changed; seed lines they deleted are
+/// ignored. Each run of those lines goes to the end of the section on `disk`
+/// whose heading matches the nearest seed heading above it in `edited` (after
+/// trimming and dropping `==` highlight marks): after the section's last
+/// non-blank line, before the next heading of any level. Lines with no such
+/// heading, or whose heading `disk` lacks, are appended after one blank line.
+/// `disk`'s line endings and trailing newline are kept. An untouched or empty
+/// `edited` returns `disk` as it is.
+pub fn adopt_seeded(seed: &str, edited: &str, disk: &str) -> String {
+    if edited == seed || edited.is_empty() {
+        return disk.to_string();
+    }
+    let seed = seed.replace("\r\n", "\n");
+    let edited = edited.replace("\r\n", "\n");
+    let s: Vec<&str> = seed.split_terminator('\n').collect();
+    let e: Vec<&str> = edited.split_terminator('\n').collect();
+    let mut from_seed = vec![false; e.len()];
+    for (_, j) in lcs_pairs(&s, &e) {
+        from_seed[j] = true;
+    }
+
+    // Runs of the user's lines, each under the nearest seed heading above it.
+    let mut groups: Vec<(Option<&str>, Vec<&str>)> = vec![(None, Vec::new())];
+    for (line, seeded) in e.iter().zip(&from_seed) {
+        if !seeded {
+            groups.last_mut().expect("one group always").1.push(line);
+        } else if is_heading(line) {
+            groups.push((Some(line), Vec::new()));
+        }
+    }
+
+    let crlf = disk.contains("\r\n");
+    let normalized = disk.replace("\r\n", "\n");
+    let trailing_newline = normalized.ends_with('\n');
+    let mut lines: Vec<&str> = normalized.split_terminator('\n').collect();
+    let mut changed = false;
+    for (heading, group) in &groups {
+        let Some(first) = group.iter().position(|l| !is_blank(l)) else {
+            continue;
+        };
+        let last = group.iter().rposition(|l| !is_blank(l)).expect("a non-blank line");
+        // A line the note already holds is not added again, so adopting the
+        // same typed text twice (a stale draft restored after its lines had
+        // landed) cannot double it.
+        let group: Vec<&str> = group[first..=last]
+            .iter()
+            .copied()
+            .filter(|l| is_blank(l) || !lines.contains(l))
+            .collect();
+        let Some(first) = group.iter().position(|l| !is_blank(l)) else {
+            continue;
+        };
+        let last = group.iter().rposition(|l| !is_blank(l)).expect("a non-blank line");
+        let group = &group[first..=last];
+        changed = true;
+        match heading.and_then(|h| section_end(&lines, h)) {
+            Some(at) => {
+                lines.splice(at..at, group.iter().copied());
+            }
+            None => {
+                if lines.last().is_some_and(|l| !is_blank(l)) {
+                    lines.push("");
+                }
+                lines.extend_from_slice(group);
+            }
+        }
+    }
+    if !changed {
+        return disk.to_string();
+    }
+    let ending = if crlf { "\r\n" } else { "\n" };
+    let mut text = lines.join(ending);
+    if trailing_newline && !lines.is_empty() {
+        text.push_str(ending);
+    }
+    text
+}
+
+/// A heading line: one or more `#` then a space.
+fn is_heading(line: &str) -> bool {
+    let rest = line.trim_start_matches('#');
+    rest.len() < line.len() && rest.starts_with(' ')
+}
+
+/// A heading's identity for matching across versions: trimmed, with `==`
+/// highlight marks removed.
+fn heading_key(line: &str) -> String {
+    line.trim().replace("==", "").trim().to_string()
+}
+
+/// Where lines appended to the section headed `heading` go in `lines`: after
+/// the section's last non-blank line, before the next heading of any level or
+/// the end. `None` when `lines` has no such heading.
+fn section_end(lines: &[&str], heading: &str) -> Option<usize> {
+    let key = heading_key(heading);
+    let start = lines.iter().position(|l| is_heading(l) && heading_key(l) == key)?;
+    let next = lines[start + 1..]
+        .iter()
+        .position(|l| is_heading(l))
+        .map_or(lines.len(), |i| start + 1 + i);
+    Some(
+        lines[start + 1..next]
+            .iter()
+            .rposition(|l| !is_blank(l))
+            .map_or(start + 1, |i| start + 2 + i),
+    )
 }
 
 /// Matched line pairs of a longest common subsequence of `a` and `b`,
@@ -248,5 +399,164 @@ mod tests {
         assert_eq!(m.text, "a\nb");
         let m = merge3("a\n", "a\n", "a\n");
         assert_eq!(m.text, "a\n");
+    }
+
+    #[test]
+    fn adopting_the_same_typed_lines_twice_adds_them_once() {
+        let seed = "### Todays Tasks\n\n### Daily Notes\n\n";
+        let edited = "### Todays Tasks\n\n### Daily Notes\nRang the plumber\nBoiler part is ordered\n";
+        let disk = "### Todays Tasks\n* Post the letter\n\n### Daily Notes\n\n### Desk\n- Waiting on you: 0\n";
+        let once = adopt_seeded(seed, edited, disk);
+        assert!(once.contains("### Daily Notes\nRang the plumber\nBoiler part is ordered\n"), "{once}");
+        assert_eq!(adopt_seeded(seed, edited, &once), once);
+    }
+
+    // ---- merge3_keep_both --------------------------------------------------
+
+    #[test]
+    fn keep_both_keeps_two_insertions_at_one_point_disk_first_without_duplicates() {
+        let base = "### Notes\nfirst\n\n### Desk\n";
+        let disk = "### Notes\nfirst\nfrom disk\nshared line\n\n### Desk\n";
+        let ours = "### Notes\nfirst\nshared line\nfrom ours\n\n### Desk\n";
+        let m = merge3_keep_both(base, disk, ours);
+        assert_eq!(m.text, "### Notes\nfirst\nfrom disk\nshared line\nfrom ours\n\n### Desk\n");
+        assert!(m.conflicts.is_empty());
+    }
+
+    #[test]
+    fn keep_both_keeps_our_blank_lines_only_between_our_kept_lines() {
+        let base = "a\n";
+        let disk = "a\nd\n";
+        let ours = "a\n\no1\n\no2\n\n";
+        let m = merge3_keep_both(base, disk, ours);
+        assert_eq!(m.text, "a\nd\no1\n\no2\n");
+        assert!(m.conflicts.is_empty());
+        // Nothing of ours but blank lines and lines disk already has: disk alone.
+        let m = merge3_keep_both("a\n", "a\nd\n", "a\n\nd\n");
+        assert_eq!(m.text, "a\nd\n");
+        assert!(m.conflicts.is_empty());
+    }
+
+    #[test]
+    fn keep_both_on_an_empty_base_is_disk_then_our_new_lines() {
+        let disk = "### Todays Tasks\n* Water the plants\n\n### Daily Notes\n";
+        let ours = "### Daily Notes\nPicked up the parcel\n";
+        let m = merge3_keep_both("", disk, ours);
+        assert_eq!(m.text, "### Todays Tasks\n* Water the plants\n\n### Daily Notes\nPicked up the parcel\n");
+        assert!(m.conflicts.is_empty());
+    }
+
+    #[test]
+    fn keep_both_leaves_a_same_line_collision_exactly_as_merge3() {
+        for (base, disk, ours) in [
+            ("x\n", "x disk\n", "x ours\n"),
+            ("keep\ndoomed\nkeep2\n", "keep\nkeep2\n", "keep\ndoomed but edited\nkeep2\n"),
+            ("a\ngone\nb\n", "a\ngone edited\nb\n", "a\nb\n"),
+        ] {
+            let plain = merge3(base, disk, ours);
+            let both = merge3_keep_both(base, disk, ours);
+            assert_eq!(both.text, plain.text, "{base:?}");
+            assert_eq!(both.conflicts, plain.conflicts, "{base:?}");
+        }
+        let m = merge3_keep_both("x\n", "x disk\n", "x ours\n");
+        assert_eq!(m.text, "x disk\n");
+        assert_eq!(m.conflicts, vec!["x ours".to_string()]);
+    }
+
+    #[test]
+    fn keep_both_leaves_adjacent_non_colliding_edits_exactly_as_merge3() {
+        for (base, disk, ours) in [
+            ("top\nmiddle\nbottom\n", "top\nmiddle\nbottom\n* new agent task\n", "top edited\nmiddle\nbottom\n"),
+            ("a\nb\nc\n", "A\nb\nc\n", "a\nB\nc\n"),
+            ("a\nb\n", "a\nB\n", "a\nb\n"),
+        ] {
+            let plain = merge3(base, disk, ours);
+            let both = merge3_keep_both(base, disk, ours);
+            assert_eq!(both.text, plain.text, "{base:?}");
+            assert_eq!(both.conflicts, plain.conflicts, "{base:?}");
+        }
+        // Edits to neighbouring lines that do not touch the same line merge.
+        let m = merge3_keep_both("a
+b
+c
+d
+", "A
+b
+c
+d
+", "a
+b
+c
+D
+");
+        assert_eq!(m.text, "A
+b
+c
+D
+");
+        assert!(m.conflicts.is_empty());
+    }
+
+    // ---- adopt_seeded ------------------------------------------------------
+
+    const SEED: &str = "### Todays Tasks\n\n### Daily Notes\n\n";
+
+    #[test]
+    fn typed_lines_on_a_blank_day_land_at_the_end_of_their_section() {
+        let edited = "### Todays Tasks\n\n### Daily Notes\n* Call the plumber about the leak\n* Buy stamps\n\n";
+        let disk = "### Todays Tasks\n* Water the plants\n\n### Daily Notes\nMorning walk by the river\n\n### Desk\n- Sorted the post\n- Reviewed the garden plan\n";
+        assert_eq!(
+            adopt_seeded(SEED, edited, disk),
+            "### Todays Tasks\n* Water the plants\n\n### Daily Notes\nMorning walk by the river\n* Call the plumber about the leak\n* Buy stamps\n\n### Desk\n- Sorted the post\n- Reviewed the garden plan\n"
+        );
+    }
+
+    #[test]
+    fn a_highlighted_heading_on_disk_still_matches() {
+        let edited = "### Todays Tasks\n\n### Daily Notes\n* Buy stamps\n\n";
+        let disk = "### Todays Tasks\n\n### ==Daily Notes==\nMorning walk\n\n### Desk\n- Sorted the post\n";
+        assert_eq!(
+            adopt_seeded(SEED, edited, disk),
+            "### Todays Tasks\n\n### ==Daily Notes==\nMorning walk\n* Buy stamps\n\n### Desk\n- Sorted the post\n"
+        );
+    }
+
+    #[test]
+    fn a_heading_missing_on_disk_appends_after_one_blank_line() {
+        let edited = "### Todays Tasks\n\n### Daily Notes\n* Buy stamps\n\n";
+        let disk = "### Todays Tasks\n* Water the plants\n\n### Desk\n- Sorted the post\n";
+        assert_eq!(
+            adopt_seeded(SEED, edited, disk),
+            "### Todays Tasks\n* Water the plants\n\n### Desk\n- Sorted the post\n\n* Buy stamps\n"
+        );
+    }
+
+    #[test]
+    fn an_untouched_or_empty_seed_returns_disk_unchanged() {
+        let disk = "### Todays Tasks\r\n* Water the plants\r\n";
+        assert_eq!(adopt_seeded(SEED, SEED, disk), disk);
+        assert_eq!(adopt_seeded(SEED, "", disk), disk);
+    }
+
+    #[test]
+    fn adoption_keeps_disk_line_endings_and_trailing_newline_state() {
+        let edited = "### Todays Tasks\n* Water the plants\n\n### Daily Notes\n\n";
+        let disk = "### Todays Tasks\r\nMorning walk\r\n\r\n### Desk";
+        assert_eq!(
+            adopt_seeded(SEED, edited, disk),
+            "### Todays Tasks\r\nMorning walk\r\n* Water the plants\r\n\r\n### Desk"
+        );
+        // Lines typed above the first heading form a group with no heading.
+        let edited = "Before anything\n### Todays Tasks\n\n### Daily Notes\n\n";
+        assert_eq!(
+            adopt_seeded(SEED, edited, "### Desk\n- Sorted the post\n"),
+            "### Desk\n- Sorted the post\n\nBefore anything\n"
+        );
+        // A seed line the user changed counts as theirs; one they deleted is ignored.
+        let edited = "### Todays Tasks\n\n### Daily Notes (call day)\n";
+        assert_eq!(
+            adopt_seeded(SEED, edited, "### Todays Tasks\n* Water the plants\n"),
+            "### Todays Tasks\n* Water the plants\n### Daily Notes (call day)\n"
+        );
     }
 }
