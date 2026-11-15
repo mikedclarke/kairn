@@ -75,6 +75,11 @@ impl FakeServer {
         self.state.lock().unwrap().offline = offline;
     }
 
+    #[cfg(test)]
+    pub(crate) fn replace_blob(&self, hash: &ContentHash, content: &[u8]) {
+        self.state.lock().unwrap().blobs.insert(hash.clone(), content.to_vec());
+    }
+
     /// The current head of a path, for assertions.
     pub fn head(&self, path: &VaultPath) -> Option<FileHead> {
         let g = self.state.lock().unwrap();

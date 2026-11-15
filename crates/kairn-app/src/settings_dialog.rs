@@ -470,6 +470,8 @@ impl SettingsEditor {
             .upgrade()
             .map(|ws| home_relative(&ws.read(cx).notes_root))
             .unwrap_or_default();
+        let root_overridden = self.workspace.upgrade()
+            .is_some_and(|ws| ws.read(cx).notes_root_override.is_some());
 
         let strip_button = |id: &'static str, label: &'static str, mode: &'static str| {
             let btn = Button::new(id).label(label);
@@ -591,10 +593,14 @@ impl SettingsEditor {
                         )
                     }),
             )
-            .child(div().min_w_0().text_size(px(11.)).opacity(0.55).child(format!(
-                "Currently {resolved}; a change lands on Save. A NotePlan-style folder \
-                 works as-is; Calendar/, Notes/ and .kairn/ are created if missing."
-            )))
+            .child(div().min_w_0().text_size(px(11.)).opacity(0.55).child(
+                if root_overridden {
+                    format!("Using {resolved} for this session (KAIRN_ROOT). Folder changes apply on a launch without this override.")
+                } else {
+                    format!("Currently {resolved}; a change lands on Save. A NotePlan-style folder \
+                        works as-is; Calendar/, Notes/ and .kairn/ are created if missing.")
+                }
+            ))
             .child(Self::section("Week strip above notes"))
             .child(
                 h_flex()

@@ -83,7 +83,7 @@
 //!         cx.spawn(async move |cx| {
 //!             cx.open_window(Default::default(), |window, cx| {
 //!                 let terminal = cx.new(|cx| {
-//!                     TerminalView::new(writer, reader, config, cx)
+//!                     TerminalView::new(writer, reader, config, window, cx)
 //!                         .with_resize_callback(resize_callback)
 //!                         .with_exit_callback(|_, cx| cx.quit())
 //!                 });
@@ -344,6 +344,7 @@ pub mod event;
 pub mod input;
 mod links;
 pub mod mouse;
+pub mod pty_input;
 pub mod pty_log;
 pub mod render;
 pub mod terminal;

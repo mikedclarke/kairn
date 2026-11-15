@@ -5,18 +5,26 @@
 //!
 //! The cycle is built entirely from [`Transport`] calls and local state, and it
 //! never reimplements merging: markdown collisions go through
-//! [`crate::resolve`], which delegates to `kairn_core::merge3`.
+//! [`crate::resolve`], which delegates to `kairn_core::merge3_keep_both`.
+//!
+//! The pull applies only the latest journal entry per path. Every write is
+//! per file and conditional, so the order between paths carries no meaning,
+//! and an older entry for a path that has a newer one would only be
+//! overwritten: it is never fetched and never written.
 
-use std::collections::HashSet;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::hash::hash_bytes;
 use crate::ignore::is_ignored;
 use crate::resolve::{Resolution, resolve_binary, resolve_markdown};
 use crate::state::StateStore;
 use crate::transport::{Transport, TransportError};
-use crate::types::{ContentHash, CycleReport, PutOutcome, Rev, SyncConfig, SyncEvent, VaultPath};
+use crate::types::{
+    ContentHash, CycleReport, JournalEntry, PutOutcome, Rev, SyncConfig, SyncEvent, VaultPath,
+};
 use crate::vaultio::{Precondition, VaultIo};
 
 /// A page of journal entries per `changes` request. Files are tiny; a large page
@@ -59,6 +67,12 @@ impl SyncContext<'_> {
         move |p: &VaultPath| (self.emit)(SyncEvent::AboutToWrite(p.clone()))
     }
 
+    /// Tell the host a write or delete of `path` has landed: fired after the
+    /// rename or unlink, never before, so the path already holds the new bytes.
+    fn landed(&self, path: &VaultPath) {
+        (self.emit)(SyncEvent::Wrote(path.clone()));
+    }
+
     fn cancelled(&self) -> bool {
         (self.cancel)()
     }
@@ -66,11 +80,13 @@ impl SyncContext<'_> {
 
 /// Run one full cycle and return what it did.
 pub fn run_cycle(ctx: &SyncContext) -> Result<CycleReport> {
+    ctx.vault.validate_root()?;
     let mut report = CycleReport::default();
     pull(ctx, &mut report)?;
     if ctx.cancelled() {
         return Ok(report);
     }
+    if ctx.config.publish_directories { crate::directories::publish(ctx)?; }
     let accepted = push(ctx, &mut report)?;
     if ctx.cancelled() {
         return Ok(report);
@@ -83,7 +99,9 @@ pub fn run_cycle(ctx: &SyncContext) -> Result<CycleReport> {
     if accepted {
         pull(ctx, &mut report)?;
     }
+    crate::directories::reconcile(ctx.vault)?;
     let cursor = ctx.state.cursor()?;
+    ctx.vault.validate_root()?;
     // The ack is a report, not a handshake: re-sending an unchanged cursor tells
     // the server nothing it does not already know.
     if ctx.state.acked_cursor()? != Some(cursor) {
@@ -98,34 +116,99 @@ pub fn run_cycle(ctx: &SyncContext) -> Result<CycleReport> {
 
 // ---- pull ----------------------------------------------------------------
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PullOutcome {
+    Applied,
+    Deferred,
+}
+
+fn record_entry(ctx: &SyncContext, entry: &JournalEntry, report: &mut CycleReport) -> Result<()> {
+    let outcome = match apply_entry(ctx, entry, report) {
+        Ok(outcome) => outcome,
+        Err(error) if error.downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) => PullOutcome::Deferred,
+        Err(error) => return Err(error),
+    };
+    ctx.state.record_pull(entry, outcome == PullOutcome::Deferred)
+}
+
 fn pull(ctx: &SyncContext, report: &mut CycleReport) -> Result<()> {
+    // Read the whole backlog first (journal rows only, no blobs), together with
+    // whatever an earlier cycle still owes, keeping the latest entry per path.
+    let mut heads: HashMap<VaultPath, JournalEntry> = HashMap::new();
+    for entry in ctx.state.pending_pulls()? {
+        keep_head(&mut heads, entry);
+    }
+    let mut since = ctx.state.pull_cursor()?;
     loop {
-        let cursor = ctx.state.cursor()?;
-        let page = ctx.transport.changes(cursor, PAGE_LIMIT)?;
-        if page.entries.is_empty() {
-            break;
+        if ctx.cancelled() {
+            return Ok(());
         }
-        for entry in &page.entries {
-            if ctx.cancelled() {
-                return Ok(());
-            }
-            apply_entry(ctx, entry, report)?;
-            // Cursor moves only after the entry is fully applied to disk+state.
-            ctx.state.set_cursor(entry.seq)?;
+        let page = ctx.transport.changes(since, PAGE_LIMIT)?;
+        let Some(last) = page.entries.last() else {
+            break;
+        };
+        since = since.max(last.seq);
+        for entry in page.entries {
+            keep_head(&mut heads, entry);
         }
         if !page.has_more {
             break;
         }
     }
+    let mut heads: Vec<JournalEntry> = heads.into_values().collect();
+    // Owe every head before applying any: the read position moves past the
+    // whole backlog while the applied cursor stays below the oldest head not
+    // yet applied, so a crash anywhere below leaves the rest to the next cycle.
+    ctx.state.record_pending_pulls(&heads)?;
+    heads.sort_by(apply_order);
+    for entry in &heads {
+        if ctx.cancelled() {
+            return Ok(());
+        }
+        record_entry(ctx, entry, report)?;
+    }
+    let pending = ctx.state.pending_pulls()?.len();
+    if pending != 0 {
+        bail!("{pending} remote changes are pending verification or a safe local write; sync will retry");
+    }
     Ok(())
 }
 
-/// Fetch a blob and check the bytes against the hash the journal (or a CAS
-/// outcome) promised. `None` means "skip this entry": either the rev's blob is
-/// no longer retained (spec §11) or the server handed back bytes that are not
-/// what it said they were. Both would otherwise wedge the cycle on the same
-/// entry forever, so they are reported and stepped over — the whole safety model
-/// rests on these hashes, so unverified bytes never reach the vault.
+/// Keep `entry` if it is the latest seen for its path; an older entry for the
+/// same path is superseded and dropped.
+fn keep_head(heads: &mut HashMap<VaultPath, JournalEntry>, entry: JournalEntry) {
+    match heads.get(&entry.path) {
+        Some(held) if held.seq >= entry.seq => {}
+        _ => {
+            heads.insert(entry.path.clone(), entry);
+        }
+    }
+}
+
+/// The order a pull applies its heads in, so what the user opens first lands
+/// first: daily and other period notes (markdown under `Calendar/`) by file
+/// name descending, so today comes before yesterday; then other markdown,
+/// newest change first; then everything else, oldest change first. A
+/// tombstone sorts with its path's class. This is about latency only: each
+/// path's write is independent and conditional, so no order is unsafe.
+fn apply_order(a: &JournalEntry, b: &JournalEntry) -> Ordering {
+    fn class(entry: &JournalEntry) -> u8 {
+        match (entry.path.is_markdown(), entry.path.0.starts_with("Calendar/")) {
+            (true, true) => 0,
+            (true, false) => 1,
+            (false, _) => 2,
+        }
+    }
+    class(a).cmp(&class(b)).then_with(|| match class(a) {
+        0 => b.path.file_name().cmp(a.path.file_name()).then_with(|| b.path.cmp(&a.path)),
+        1 => b.seq.cmp(&a.seq),
+        _ => a.seq.cmp(&b.seq),
+    })
+}
+
+/// Unverified or pruned revisions remain pending until they can be fetched
+/// safely or a newer journal entry supersedes them.
 fn fetch_verified(
     ctx: &SyncContext,
     path: &VaultPath,
@@ -136,7 +219,7 @@ fn fetch_verified(
         Ok(bytes) => {
             if &hash_bytes(&bytes) != expect {
                 (ctx.emit)(SyncEvent::Error(format!(
-                    "skipped {path} rev {rev}: the server's bytes do not match the hash it \
+                    "deferred {path} rev {rev}: the server's bytes do not match the hash it \
                      published for them"
                 )));
                 return Ok(None);
@@ -145,8 +228,8 @@ fn fetch_verified(
         }
         Err(TransportError::NotFound) => {
             (ctx.emit)(SyncEvent::Error(format!(
-                "skipped {path} rev {rev}: the server no longer keeps that revision's content \
-                 (pruned). Any later change to this file still syncs normally."
+                "deferred {path} rev {rev}: the server no longer keeps that revision's content \
+                 (pruned). Waiting for a retry or a newer revision."
             )));
             Ok(None)
         }
@@ -154,22 +237,18 @@ fn fetch_verified(
     }
 }
 
-/// A write resolved against a pre-image that is no longer what is on disk:
-/// something outside the engine (the app, Syncthing on a bridged folder) wrote
-/// the file while we were on the network. Leave it alone — the push phase later
-/// in this same cycle sees a dirty file and resolves it through the merge rules
-/// instead of clobbering it (invariant §15.1).
+/// Keep the newer local bytes and retry the remote entry next cycle.
 fn changed_underneath(ctx: &SyncContext, path: &VaultPath) {
     (ctx.emit)(SyncEvent::Error(format!(
-        "{path} changed on disk mid-cycle; left as it is and resolved from its new content"
+        "{path} changed on disk mid-cycle; left as it is for retry"
     )));
 }
 
 fn apply_entry(
     ctx: &SyncContext,
-    entry: &crate::types::JournalEntry,
+    entry: &JournalEntry,
     report: &mut CycleReport,
-) -> Result<()> {
+) -> Result<PullOutcome> {
     let path = &entry.path;
     // Server-supplied paths are untrusted: refuse anything that would resolve
     // outside the vault before it ever reaches the filesystem (spec trust model).
@@ -177,10 +256,12 @@ fn apply_entry(
         (ctx.emit)(SyncEvent::Error(format!(
             "refused unsafe sync path: {path}"
         )));
-        return Ok(());
+        return Ok(PullOutcome::Applied);
     }
-    if is_ignored(path) {
-        return Ok(());
+    // A path this device declines is settled without a fetch or a write, and
+    // whatever sits on disk there is left exactly as it is.
+    if is_ignored(path) || ctx.config.declines(path) {
+        return Ok(PullOutcome::Applied);
     }
     let local = ctx.vault.read_opt(path)?;
     let st = ctx.state.file_state(path)?;
@@ -196,7 +277,7 @@ fn apply_entry(
         && s.rev == entry.rev
         && s.baseline_hash == entry.hash
     {
-        return Ok(());
+        return Ok(PullOutcome::Applied);
     }
 
     // Older than the rev we already hold for this path: a push-side merge in an
@@ -205,13 +286,13 @@ fn apply_entry(
     if let Some(s) = &st
         && entry.rev < s.rev
     {
-        return Ok(());
+        return Ok(PullOutcome::Applied);
     }
 
     if entry.deleted {
         // A tombstone for something we neither hold nor track: nothing to do.
         if local.is_none() && st.is_none() {
-            return Ok(());
+            return Ok(PullOutcome::Applied);
         }
         // Delete locally only when the local copy is clean; a dirty local file
         // keeps its edits and the push phase resurrects it via CAS (delete/edit
@@ -220,17 +301,20 @@ fn apply_entry(
             let pre = Precondition::from_local(local.as_deref());
             if !ctx.vault.delete(path, &pre, &announce)? {
                 changed_underneath(ctx, path);
-                return Ok(());
+                return Ok(PullOutcome::Deferred);
+            }
+            if local.is_some() {
+                ctx.landed(path);
             }
             ctx.state.remove_file_state(path)?;
             report.deleted_local += 1;
         }
-        return Ok(());
+        return Ok(PullOutcome::Applied);
     }
 
     let remote_hash = match &entry.hash {
         Some(h) => h.clone(),
-        None => return Ok(()), // malformed non-tombstone; nothing to apply
+        None => return Ok(PullOutcome::Deferred),
     };
 
     // Already hold these exact bytes (our own echo, an identical write via the
@@ -240,11 +324,11 @@ fn apply_entry(
     {
         ctx.state
             .record_synced(path, entry.rev, bytes, path.is_markdown())?;
-        return Ok(());
+        return Ok(PullOutcome::Applied);
     }
 
     let Some(remote) = fetch_verified(ctx, path, entry.rev, &remote_hash)? else {
-        return Ok(());
+        return Ok(PullOutcome::Deferred);
     };
 
     // What the file must still hold when the rename lands. The read above and
@@ -256,25 +340,28 @@ fn apply_entry(
         // Clean pull: adopt the remote content wholesale.
         if !ctx.vault.write(path, &remote, &pre, &announce)? {
             changed_underneath(ctx, path);
-            return Ok(());
+            return Ok(PullOutcome::Deferred);
         }
+        ctx.landed(path);
         ctx.state
             .record_synced(path, entry.rev, &remote, path.is_markdown())?;
         report.pulled += 1;
-        return Ok(());
+        return Ok(PullOutcome::Applied);
     }
 
     // Conflict: local is dirty and remote differs. Resolve, keeping the remote
     // head as the new baseline so a merge that differs from remote is pushed.
     let local_bytes = local.expect("dirty implies a local file exists");
     let baseline_bytes = baseline_hash.and_then(|h| ctx.state.baseline(&h).ok().flatten());
-    let resolution = resolve_change(path, baseline_bytes.as_deref(), &remote, &local_bytes);
+    let never_synced = created_here(ctx, st.is_none())?;
+    let resolution = resolve_change(path, baseline_bytes.as_deref(), &remote, &local_bytes, never_synced);
     match resolution {
         Resolution::Write { content, .. } => {
             if !ctx.vault.write(path, &content, &pre, &announce)? {
                 changed_underneath(ctx, path);
-                return Ok(());
+                return Ok(PullOutcome::Deferred);
             }
+            ctx.landed(path);
             ctx.state
                 .record_synced(path, entry.rev, &remote, path.is_markdown())?;
             report.merged += 1;
@@ -283,13 +370,14 @@ fn apply_entry(
             content,
             conflict_copy,
         } => {
-            if !ctx.vault.write(path, &content, &pre, &announce)? {
-                changed_underneath(ctx, path);
-                return Ok(());
-            }
             let copy = ctx
                 .vault
                 .write_conflict_copy(path, &conflict_copy, &announce)?;
+            if !ctx.vault.write(path, &content, &pre, &announce)? {
+                changed_underneath(ctx, path);
+                return Ok(PullOutcome::Deferred);
+            }
+            ctx.landed(path);
             (ctx.emit)(SyncEvent::ConflictCopyCreated {
                 original: path.clone(),
                 copy,
@@ -299,7 +387,7 @@ fn apply_entry(
             report.conflicts += 1;
         }
     }
-    Ok(())
+    Ok(PullOutcome::Applied)
 }
 
 // ---- push ----------------------------------------------------------------
@@ -314,10 +402,13 @@ fn push(ctx: &SyncContext, report: &mut CycleReport) -> Result<bool> {
     let _ = ctx.state.prune_scan_cache(&on_disk);
     let mut accepted = false;
 
-    // New and locally-edited files.
+    // New and locally-edited files. A declined path is never uploaded.
     for f in &scanned {
         if ctx.cancelled() {
             return Ok(accepted);
+        }
+        if ctx.config.declines(&f.path) {
+            continue;
         }
         let (base_rev, dirty) = match ctx.state.file_state(&f.path)? {
             None => (0, true),
@@ -328,8 +419,18 @@ fn push(ctx: &SyncContext, report: &mut CycleReport) -> Result<bool> {
         }
     }
 
-    // Files we have synced but that are gone from disk: local deletes.
-    let tracked = ctx.state.all_states()?;
+    // Files we have synced but that are gone from disk: local deletes. A path
+    // this device declines never produces one, even when it was tracked before
+    // the device started declining it: its state row is dropped locally, with
+    // no server call, so the server's copy is left alone.
+    let mut tracked = Vec::new();
+    for (path, st) in ctx.state.all_states()? {
+        if ctx.config.declines(&path) {
+            ctx.state.remove_file_state(&path)?;
+        } else {
+            tracked.push((path, st));
+        }
+    }
     let missing: Vec<_> = tracked
         .iter()
         .filter(|(path, _)| !on_disk.contains(path) && !is_ignored(path))
@@ -374,6 +475,7 @@ fn push_one(
     };
 
     for _ in 0..MAX_PUSH_RETRIES {
+        ctx.vault.validate_root()?;
         if ctx.cancelled() {
             return Ok(false);
         }
@@ -397,12 +499,13 @@ fn push_one(
                     let Some(remote) = fetch_verified(ctx, path, head_rev, &head_hash)? else {
                         return Ok(false);
                     };
-                    let baseline = ctx
-                        .state
-                        .file_state(path)?
+                    let st = ctx.state.file_state(path)?;
+                    let never_synced = created_here(ctx, st.is_none())?;
+                    let baseline = st
                         .and_then(|s| s.baseline_hash)
                         .and_then(|h| ctx.state.baseline(&h).ok().flatten());
-                    let resolution = resolve_change(path, baseline.as_deref(), &remote, &content);
+                    let resolution =
+                        resolve_change(path, baseline.as_deref(), &remote, &content, never_synced);
                     // `content` is what we last read or wrote at this path, so it
                     // is the pre-image the merge above resolved against.
                     let pre = Precondition::Unchanged(hash);
@@ -451,18 +554,20 @@ fn apply_push_resolution(
             if !ctx.vault.write(path, &content, pre, announce)? {
                 return Ok(None);
             }
+            ctx.landed(path);
             content
         }
         Resolution::WriteWithConflict {
             content,
             conflict_copy,
         } => {
-            if !ctx.vault.write(path, &content, pre, announce)? {
-                return Ok(None);
-            }
             let copy = ctx
                 .vault
                 .write_conflict_copy(path, &conflict_copy, announce)?;
+            if !ctx.vault.write(path, &content, pre, announce)? {
+                return Ok(None);
+            }
+            ctx.landed(path);
             (ctx.emit)(SyncEvent::ConflictCopyCreated {
                 original: path.clone(),
                 copy,
@@ -481,6 +586,7 @@ fn push_delete(
     base_rev: Rev,
     report: &mut CycleReport,
 ) -> Result<bool> {
+    ctx.vault.validate_root()?;
     let announce = ctx.announce();
     match ctx.transport.delete(path, base_rev)? {
         PutOutcome::Accepted { .. } => {
@@ -506,6 +612,7 @@ fn push_delete(
                     changed_underneath(ctx, path);
                     return Ok(false);
                 }
+                ctx.landed(path);
                 ctx.state
                     .record_synced(path, head_rev, &remote, path.is_markdown())?;
                 report.pulled += 1;
@@ -533,19 +640,34 @@ fn is_local_clean(local: Option<&[u8]>, baseline_hash: Option<&crate::types::Con
     }
 }
 
+/// Whether a path with no state row is a file this device created itself, as
+/// opposed to one it simply has no record of. Only a device that has finished
+/// a cycle before can tell: on a first sync, or after its state database was
+/// lost or recreated over a vault it kept, every file lacks a row, and merging
+/// those against an empty baseline would push stale local lines back into
+/// notes that have moved on. Such a device keeps the conflict-copy behaviour.
+fn created_here(ctx: &SyncContext, no_state_row: bool) -> Result<bool> {
+    Ok(no_state_row && ctx.state.acked_cursor()?.is_some())
+}
+
 /// Pick markdown three-way merge or binary last-writer-wins, falling back to
 /// binary when a "markdown" file isn't valid UTF-8.
+///
+/// `never_synced` says this device created the file before ever seeing the
+/// server's copy (see [`created_here`]), which lets a markdown file merge
+/// against an empty baseline instead of conflicting outright.
 fn resolve_change(
     path: &VaultPath,
     baseline: Option<&[u8]>,
     remote: &[u8],
     local: &[u8],
+    never_synced: bool,
 ) -> Resolution {
     if path.is_markdown()
         && let (Ok(r), Ok(l)) = (std::str::from_utf8(remote), std::str::from_utf8(local))
     {
         let b = baseline.and_then(|b| std::str::from_utf8(b).ok());
-        return resolve_markdown(b, r, l);
+        return resolve_markdown(b, r, l, never_synced);
     }
     resolve_binary(remote, local)
 }
@@ -772,6 +894,41 @@ mod tests {
         }
     }
 
+    /// Every blob fetch a [`Recording`] transport saw, in order.
+    type FetchLog = Arc<std::sync::Mutex<Vec<(VaultPath, Option<Rev>)>>>;
+
+    /// A transport that records every `get_blob` call in order, so a test can
+    /// see which revisions a pull fetched and in what order.
+    struct Recording {
+        inner: FakeClient,
+        fetched: FetchLog,
+    }
+
+    impl Transport for Recording {
+        fn changes(&self, since: crate::types::Seq, limit: u32) -> TransportResult<ChangesPage> {
+            self.inner.changes(since, limit)
+        }
+        fn get_blob(&self, path: &VaultPath, rev: Option<Rev>) -> TransportResult<Vec<u8>> {
+            self.fetched.lock().unwrap().push((path.clone(), rev));
+            self.inner.get_blob(path, rev)
+        }
+        fn put_blob(
+            &self,
+            path: &VaultPath,
+            base_rev: Rev,
+            hash: &ContentHash,
+            content: &[u8],
+        ) -> TransportResult<PutOutcome> {
+            self.inner.put_blob(path, base_rev, hash, content)
+        }
+        fn delete(&self, path: &VaultPath, base_rev: Rev) -> TransportResult<PutOutcome> {
+            self.inner.delete(path, base_rev)
+        }
+        fn ack(&self, cursor: crate::types::Seq) -> TransportResult<()> {
+            self.inner.ack(cursor)
+        }
+    }
+
     /// One device: its own vault dir, state DB, transport to the shared server,
     /// and a captured event log.
     struct Device {
@@ -786,11 +943,25 @@ mod tests {
         /// cycle announces a vault write, so the file lands on disk and the
         /// state update that records it does not (spec §16, invariant §15.4).
         fail_state_after_write: Cell<bool>,
+        /// Every `Wrote` event, with what the file held at the moment it fired
+        /// (`None` when the path was absent), so a test can prove the event
+        /// came after the bytes landed.
+        landed: RefCell<Vec<(VaultPath, Option<Vec<u8>>)>>,
     }
 
     impl Device {
         fn new(server: &FakeServer, label: &str) -> Self {
             Self::with_transport(server, label, |c| Box::new(c))
+        }
+
+        /// A device whose transport records every blob fetch.
+        fn new_recording(server: &FakeServer, label: &str) -> (Self, FetchLog) {
+            let fetched: FetchLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = fetched.clone();
+            let dev = Self::with_transport(server, label, move |inner| {
+                Box::new(Recording { inner, fetched: log })
+            });
+            (dev, fetched)
         }
 
         /// A device whose transport fails the `fail_at`-th `get_blob` call.
@@ -828,6 +999,7 @@ mod tests {
                 config: RefCell::new(SyncConfig::default()),
                 cancelled: Cell::new(false),
                 fail_state_after_write: Cell::new(false),
+                landed: RefCell::new(Vec::new()),
                 root,
             }
         }
@@ -836,6 +1008,10 @@ mod tests {
             let emit = |e: SyncEvent| {
                 if self.fail_state_after_write.get() && matches!(e, SyncEvent::AboutToWrite(_)) {
                     self.state.set_read_only(true).unwrap();
+                }
+                if let SyncEvent::Wrote(path) = &e {
+                    let now = std::fs::read(self.root.join(&path.0)).ok();
+                    self.landed.borrow_mut().push((path.clone(), now));
                 }
                 self.events.borrow_mut().push(e);
             };
@@ -909,6 +1085,138 @@ mod tests {
     impl Drop for Device {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn directory_migration_retires_only_absent_desktop_folders() {
+        let server = FakeServer::new();
+        let desktop = Device::new(&server, "folders-desktop");
+        let phone = Device::new(&server, "folders-phone");
+        desktop.write("Notes/Removed/Nested/example.md", "old");
+        desktop.write("Notes/Retained/last.md", "last");
+        desktop.sync(); phone.sync();
+        std::fs::remove_dir_all(desktop.root.join("Notes/Removed")).unwrap();
+        desktop.delete("Notes/Retained/last.md");
+        desktop.sync(); phone.sync();
+        // Model a pre-lock legacy client and a newly created intentional folder.
+        std::fs::remove_dir_all(phone.root.join("Notes/Removed")).unwrap();
+        std::fs::create_dir_all(phone.root.join("Notes/Removed/Nested")).unwrap();
+        std::fs::create_dir_all(desktop.root.join("Notes/IntentionalEmpty")).unwrap();
+        desktop.config.borrow_mut().publish_directories = true;
+        desktop.sync(); phone.sync();
+        assert!(!phone.exists("Notes/Removed"));
+        assert!(phone.exists("Notes/Retained"));
+        let catalog: crate::directories::Catalog = serde_json::from_str(&phone.read(crate::directories::CATALOG).unwrap()).unwrap();
+        assert!(catalog.present.contains("Notes/IntentionalEmpty"));
+        assert!(catalog.retired.contains("Notes/Removed/Nested"));
+        // A local edit and explicit empty-folder intent both prevent cleanup.
+        phone.write("Notes/Removed/draft.md", "unsynced");
+        phone.write("Notes/Removed/Nested/.kairn-keep", "");
+        crate::directories::reconcile(&phone.vault).unwrap();
+        assert_eq!(phone.read("Notes/Removed/draft.md").as_deref(), Some("unsynced"));
+        assert!(phone.exists("Notes/Removed/Nested/.kairn-keep"));
+        // Recreated directories stop being retired on the next publication.
+        std::fs::create_dir_all(desktop.root.join("Notes/Removed/Nested")).unwrap();
+        desktop.sync();
+        let catalog: crate::directories::Catalog = serde_json::from_str(&desktop.read(crate::directories::CATALOG).unwrap()).unwrap();
+        assert!(!catalog.retired.contains("Notes/Removed"));
+    }
+
+    #[test]
+    fn retired_directory_cleanup_keeps_lock_sidecars_and_unrelated_empty_folders() {
+        let server = FakeServer::new();
+        let phone = Device::new(&server, "folder-locks");
+        phone.write("Notes/Old/.note.md.kairn-lock", "");
+        std::fs::create_dir_all(phone.root.join("Notes/LocalEmpty")).unwrap();
+        phone.write(crate::directories::CATALOG, r#"{"version":1,"present":[],"retired":["Notes/Old"]}"#);
+        crate::directories::reconcile(&phone.vault).unwrap();
+        assert!(phone.exists("Notes/Old/.note.md.kairn-lock"));
+        assert!(phone.exists("Notes/LocalEmpty"));
+    }
+
+    #[test]
+    fn conflict_copy_failure_leaves_the_original_and_baseline_intact() {
+        for push_side in [false, true] {
+            let server = FakeServer::new();
+            let local = Device::new(&server, "copy-failure");
+            let path = VaultPath::new("Notes/example.md");
+            local.write(&path.0, "local\n");
+            local.state.record_synced(&path, 0, b"base\n", true).unwrap();
+            local.client.put_blob(&path, 0, &hash_bytes(b"remote\n"), b"remote\n").unwrap();
+            let entry = local.client.changes(0, 10).unwrap().entries.remove(0);
+            let blocked = RefCell::new(None);
+            let emit = |event| {
+                if let SyncEvent::AboutToWrite(copy) = event {
+                    assert!(copy.0.contains(".sync-conflict-"));
+                    let dest = local.root.join(copy.0);
+                    std::fs::create_dir(&dest).unwrap();
+                    *blocked.borrow_mut() = Some(dest);
+                }
+            };
+            let config = SyncConfig::default();
+            let ctx = SyncContext {
+                transport: local.client.as_ref(), state: &local.state, vault: &local.vault,
+                emit: &emit, config: &config, cancel: &|| false,
+            };
+            let mut report = CycleReport::default();
+            let result = if push_side {
+                apply_push_resolution(&ctx, &path,
+                    resolve_change(&path, Some(b"base\n"), b"remote\n", b"local\n", false),
+                    b"remote\n", entry.rev, &Precondition::Unchanged(hash_bytes(b"local\n")),
+                    &ctx.announce(), &mut report).map(|_| ())
+            } else {
+                apply_entry(&ctx, &entry, &mut report).map(|_| ())
+            };
+            assert!(result.is_err());
+            assert_eq!(local.read(&path.0).as_deref(), Some("local\n"));
+            assert_eq!(local.state.file_state(&path).unwrap().unwrap().rev, 0);
+            std::fs::remove_dir(blocked.borrow().as_ref().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn conflict_retry_reuses_the_durable_copy_after_original_write_refusal() {
+        for push_side in [false, true] {
+            let server = FakeServer::new();
+            let local = Device::new(&server, "copy-retry");
+            let path = VaultPath::new("Notes/example.md");
+            local.write(&path.0, "local\n");
+            local.state.record_synced(&path, 0, b"base\n", true).unwrap();
+            local.client.put_blob(&path, 0, &hash_bytes(b"remote\n"), b"remote\n").unwrap();
+            let entry = local.client.changes(0, 10).unwrap().entries.remove(0);
+            let held = RefCell::new(None);
+            let emit = |event| {
+                if let SyncEvent::AboutToWrite(copy) = event
+                    && copy.0.contains(".sync-conflict-")
+                {
+                    *held.borrow_mut() = Some(kairn_core::NoteLock::acquire(&local.root.join(&path.0)).unwrap());
+                }
+            };
+            let config = SyncConfig::default();
+            let mut ctx = SyncContext {
+                transport: local.client.as_ref(), state: &local.state, vault: &local.vault,
+                emit: &emit, config: &config, cancel: &|| false,
+            };
+            let apply = |ctx: &SyncContext| {
+                let mut report = CycleReport::default();
+                if push_side {
+                    apply_push_resolution(ctx, &path,
+                        resolve_change(&path, Some(b"base\n"), b"remote\n", b"local\n", false),
+                        b"remote\n", entry.rev, &Precondition::Unchanged(hash_bytes(b"local\n")),
+                        &ctx.announce(), &mut report).map(|_| ())
+                } else {
+                    apply_entry(ctx, &entry, &mut report).map(|_| ())
+                }
+            };
+            assert!(apply(&ctx).is_err());
+            assert_eq!(local.read(&path.0).as_deref(), Some("local\n"));
+            assert_eq!(local.conflict_copies(&path.0), vec!["local\n"]);
+            held.borrow_mut().take();
+            ctx.emit = &|_| {};
+            apply(&ctx).unwrap();
+            assert_eq!(local.read(&path.0).as_deref(), Some("remote\n"));
+            assert_eq!(local.conflict_copies(&path.0), vec!["local\n"]);
         }
     }
 
@@ -1108,7 +1416,10 @@ mod tests {
     #[test]
     fn missing_baseline_conflicts_rather_than_clobbering() {
         // Both devices already hold a file (pre-existing, never synced): first
-        // sync must not silently overwrite the second device's version.
+        // sync must not silently overwrite the second device's version. A
+        // device that has never finished a cycle cannot tell a file it created
+        // from one it has no record of, so nothing is merged: the remote wins
+        // and the local text is kept beside it as a conflict copy.
         let s = FakeServer::new();
         let mac = Device::new(&s, "mac");
         let phone = Device::new(&s, "phone");
@@ -1127,6 +1438,25 @@ mod tests {
             phone.conflict_copies("Notes/a.md"),
             vec!["phone pre-existing\n".to_string()]
         );
+
+        // A tracked file whose baseline is gone (store loss) cannot be merged
+        // and is never guessed at: the remote wins and the local text is kept
+        // beside it as a conflict copy (spec §6).
+        let path = VaultPath::new("Notes/b.md");
+        mac.write(&path.0, "base\n");
+        mac.sync();
+        phone.sync();
+        let rev = phone.state.file_state(&path).unwrap().unwrap().rev;
+        // A baseline hash whose blob is gone: recorded without keeping a blob.
+        phone.state.record_synced(&path, rev, b"base, blob since lost\n", false).unwrap();
+        assert!(phone.state.baseline(&hash_bytes(b"base, blob since lost\n")).unwrap().is_none());
+        mac.write(&path.0, "base\nfrom mac\n");
+        mac.sync();
+        phone.write(&path.0, "base\nfrom phone\n");
+        let r = phone.sync();
+        assert_eq!(r.conflicts, 1);
+        assert_eq!(phone.read(&path.0).as_deref(), Some("base\nfrom mac\n"));
+        assert_eq!(phone.conflict_copies(&path.0), vec!["base\nfrom phone\n".to_string()]);
     }
 
     // ---- invariants (§15) and resilience (§16) ---------------------------
@@ -1183,11 +1513,17 @@ mod tests {
         src.write("Notes/b.md", "BBB\n");
         src.sync();
 
-        // dest crashes on the second blob download (b.md), after a.md landed.
+        // dest crashes on the second blob download. The newer note (b.md)
+        // lands first, so the crash hits a.md: it stays owed, and the applied
+        // cursor stays below it.
         let (dest, ctl) = Device::new_faulty(&s, "dest", 2);
         assert!(dest.try_sync().is_err());
-        assert_eq!(dest.read("Notes/a.md").as_deref(), Some("AAA\n"));
-        assert!(!dest.exists("Notes/b.md"));
+        assert_eq!(dest.read("Notes/b.md").as_deref(), Some("BBB\n"));
+        assert!(!dest.exists("Notes/a.md"));
+        let pending = dest.state.pending_pulls().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].path, VaultPath::new("Notes/a.md"));
+        assert!(dest.state.cursor().unwrap() < pending[0].seq);
 
         // Recover: the next cycle resumes from the cursor and converges.
         ctl.heal();
@@ -1340,17 +1676,40 @@ mod tests {
             mac.write(&format!("Notes/{n}.md"), "keep me\n");
         }
         mac.sync();
+        let remote = s.client("remote");
+        let pending = VaultPath::new("Notes/pending.md");
+        remote.put_blob(&pending, 0, &hash_bytes(b"pending\n"), b"pending\n").unwrap();
         let settled = s.journal_len();
+        let cursor = mac.state.cursor().unwrap();
 
         std::fs::remove_dir_all(&mac.root).unwrap();
         let err = mac.try_sync().unwrap_err().to_string();
         assert!(err.contains("vault root is missing"), "{err}");
+        assert!(!mac.root.exists());
+        assert_eq!(mac.state.cursor().unwrap(), cursor);
 
         // Nothing was tombstoned, so the other devices still have the notes.
         assert_eq!(s.journal_len(), settled);
         let phone = Device::new(&s, "phone");
         phone.sync();
         assert_eq!(phone.read("Notes/1.md").as_deref(), Some("keep me\n"));
+    }
+
+    #[test]
+    fn replacing_the_vault_root_cannot_push_deletions_or_receive_a_pending_pull() {
+        let server = FakeServer::new();
+        let local = Device::new(&server, "replaced-root");
+        local.write("Notes/keep.md", "keep\n");
+        local.sync();
+        let pending = VaultPath::new("Notes/pending.md");
+        server.client("remote").put_blob(&pending, 0, &hash_bytes(b"pending\n"), b"pending\n").unwrap();
+        let settled = server.journal_len();
+        std::fs::remove_dir_all(&local.root).unwrap();
+        std::fs::create_dir(&local.root).unwrap();
+        assert!(local.try_sync().unwrap_err().to_string().contains("vault root changed"));
+        assert_eq!(server.journal_len(), settled);
+        assert_eq!(std::fs::read_dir(&local.root).unwrap().count(), 0);
+        assert!(!server.head(&VaultPath::new("Notes/keep.md")).unwrap().deleted);
     }
 
     #[test]
@@ -1426,7 +1785,8 @@ mod tests {
     fn a_pruned_historical_rev_is_skipped_so_the_cycle_still_progresses() {
         // Retention is finite (spec §11). A journal entry whose blob is gone
         // used to abort the cycle at the same entry every time, wedging the
-        // device forever; it must step over it and keep going.
+        // device forever; it must step over it and keep going. A superseded
+        // revision is never even requested now, so it cannot wedge anything.
         let s = FakeServer::new();
         let src = Device::new(&s, "src");
         src.write("Notes/a.md", "v1\n");
@@ -1447,13 +1807,10 @@ mod tests {
 
         assert_eq!(dest.read("Notes/a.md").as_deref(), Some("v2\n"));
         assert_eq!(dest.read("Notes/b.md").as_deref(), Some("b\n"));
-        let errors = dest.errors();
-        assert!(
-            errors.iter().any(|m| m.contains("no longer keeps")),
-            "{errors:?}"
-        );
+        assert!(dest.errors().is_empty(), "{:?}", dest.errors());
+        assert!(dest.state.pending_pulls().unwrap().is_empty());
         // And the next cycle is quiet: the cursor moved past the pruned entry.
-        dest.events.borrow_mut().clear();
+        assert_eq!(dest.state.cursor().unwrap(), s.journal_len() as u64);
         dest.sync();
         assert!(dest.errors().is_empty());
     }
@@ -1461,9 +1818,8 @@ mod tests {
     #[test]
     fn a_write_landing_during_the_fetch_is_not_clobbered() {
         // The bridge shares its folder with Syncthing (spec §3 Phase B), so a
-        // file can appear between the engine reading a path and renaming remote
-        // content over it. The pre-image check turns that into a conflict, which
-        // the push phase resolves the honest way.
+        // file can appear between reading a path and replacing it. Preserve it
+        // now and resolve the deferred remote change on the next cycle.
         let s = FakeServer::new();
         let seed = Device::new(&s, "seed");
         seed.write("Notes/a.md", "from the server\n");
@@ -1492,9 +1848,10 @@ mod tests {
             d
         };
 
-        dest.sync();
-
-        // The pull refused to land over bytes it had never seen...
+        assert!(dest.try_sync().is_err());
+        assert_eq!(dest.read("Notes/a.md").as_deref(), Some("typed here, mid-cycle\n"));
+        assert_eq!(dest.state.pending_pulls().unwrap().len(), 1);
+        assert_eq!(dest.state.cursor().unwrap(), 0);
         let errors = dest.errors();
         assert!(
             errors
@@ -1502,8 +1859,8 @@ mod tests {
                 .any(|m| m.contains("changed on disk mid-cycle")),
             "{errors:?}"
         );
-        // ...and the remote content wins the file the honest way (spec §8),
-        // with the text that landed mid-cycle kept as a conflict copy.
+        dest.sync();
+        assert!(dest.state.pending_pulls().unwrap().is_empty());
         assert_eq!(
             dest.read("Notes/a.md").as_deref(),
             Some("from the server\n")
@@ -1512,6 +1869,52 @@ mod tests {
             dest.conflict_copies("Notes/a.md"),
             vec!["typed here, mid-cycle\n".to_string()]
         );
+    }
+
+    #[test]
+    fn a_refused_pull_retries_even_when_local_content_returns_to_baseline() {
+        let server = FakeServer::new();
+        let source = Device::new(&server, "source");
+        source.write("Notes/a.md", "base\n");
+        source.sync();
+        let mut dest = Device::new(&server, "dest");
+        dest.sync();
+        dest.write("Notes/a.md", "local\n");
+        source.write("Notes/a.md", "remote\n");
+        source.sync();
+        dest.client = Box::new(WriteDuringFetch {
+            inner: server.client("dest"), path: dest.root.join("Notes/a.md"),
+            content: b"base\n".to_vec(), fired: std::sync::atomic::AtomicBool::new(false),
+        });
+        assert!(dest.try_sync().is_err());
+        assert_eq!(dest.read("Notes/a.md").as_deref(), Some("base\n"));
+        assert_eq!(dest.state.cursor().unwrap(), 1);
+        assert_eq!(dest.state.pull_cursor().unwrap(), 2);
+        assert_eq!(server.ack_of("dest"), 1);
+        dest.sync();
+        assert_eq!(dest.read("Notes/a.md").as_deref(), Some("remote\n"));
+        assert!(dest.state.pending_pulls().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_pruned_latest_revision_remains_pending_until_a_newer_revision_lands() {
+        let server = FakeServer::new();
+        let source = Device::new(&server, "source");
+        source.write("Notes/a.md", "v1\n");
+        source.sync();
+        let dest = Device::with_transport(&server, "dest", |inner| Box::new(PrunedRev {
+            inner, path: VaultPath::new("Notes/a.md"), rev: 1,
+        }));
+        for _ in 0..2 {
+            assert!(dest.try_sync().is_err());
+            assert_eq!(dest.state.pending_pulls().unwrap().len(), 1);
+            assert_eq!(dest.state.cursor().unwrap(), 0);
+        }
+        source.write("Notes/a.md", "v2\n");
+        source.sync();
+        dest.sync();
+        assert_eq!(dest.read("Notes/a.md").as_deref(), Some("v2\n"));
+        assert!(dest.state.pending_pulls().unwrap().is_empty());
     }
 
     #[test]
@@ -1637,5 +2040,284 @@ mod tests {
 
         dev.cancelled.set(false);
         assert_eq!(dev.sync().pushed, 1);
+    }
+
+    // ---- coalesced pull, declined paths, landed writes -------------------
+
+    /// Land `revs` successive versions of one path on the server from a
+    /// writer that is not under test, returning the last version's bytes.
+    fn seed_revisions(server: &FakeServer, path: &str, revs: u64, body: impl Fn(u64) -> Vec<u8>) -> Vec<u8> {
+        let writer = server.client("writer");
+        let path = VaultPath::new(path);
+        let base = server.head(&path).map_or(0, |h| h.rev);
+        let mut last = Vec::new();
+        for n in 0..revs {
+            last = body(n);
+            let outcome = writer.put_blob(&path, base + n, &hash_bytes(&last), &last).unwrap();
+            assert!(matches!(outcome, PutOutcome::Accepted { .. }));
+        }
+        last
+    }
+
+    fn fetched_paths(log: &FetchLog) -> Vec<String> {
+        log.lock().unwrap().iter().map(|(p, _)| p.0.clone()).collect()
+    }
+
+    #[test]
+    fn a_catch_up_fetches_only_the_latest_revision_of_each_path() {
+        let s = FakeServer::new();
+        let note = seed_revisions(&s, "Calendar/20261110.md", 20, |n| {
+            let lines: String = (0..=n).map(|i| format!("- line {i}\n")).collect();
+            format!("### Daily Notes\n{lines}").into_bytes()
+        });
+        let log = seed_revisions(&s, ".kairn/activity.jsonl", 20, |n| {
+            (0..2000).flat_map(|i| format!("{{\"event\":{i},\"round\":{n}}}\n").into_bytes()).collect()
+        });
+        assert_eq!(s.journal_len(), 40);
+
+        let (fresh, fetched) = Device::new_recording(&s, "fresh");
+        fresh.sync();
+
+        let mut paths = fetched_paths(&fetched);
+        paths.sort();
+        assert_eq!(paths, vec![".kairn/activity.jsonl", "Calendar/20261110.md"], "one fetch per path");
+        assert!(fetched.lock().unwrap().iter().all(|(_, rev)| *rev == Some(20)), "only head revisions");
+        assert_eq!(std::fs::read(fresh.root.join("Calendar/20261110.md")).unwrap(), note);
+        assert_eq!(std::fs::read(fresh.root.join(".kairn/activity.jsonl")).unwrap(), log);
+        assert!(fresh.state.pending_pulls().unwrap().is_empty());
+        assert_eq!(fresh.state.cursor().unwrap(), 40);
+        assert_eq!(s.ack_of("fresh"), 40);
+    }
+
+    #[test]
+    fn a_catch_up_lands_daily_notes_first_then_notes_then_other_files() {
+        let s = FakeServer::new();
+        // Seq order is deliberately the reverse of the order the pull should use.
+        seed_revisions(&s, "Notes/pic.png", 2, |n| vec![0x89, n as u8]);
+        seed_revisions(&s, "Notes/older.md", 1, |_| b"older note\n".to_vec());
+        seed_revisions(&s, "Calendar/20261110.md", 2, |n| format!("today {n}\n").into_bytes());
+        seed_revisions(&s, "Notes/newer.md", 1, |_| b"newer note\n".to_vec());
+        seed_revisions(&s, "Calendar/20261109.md", 1, |_| b"yesterday\n".to_vec());
+        seed_revisions(&s, ".kairn/settings.json", 1, |_| b"{}\n".to_vec());
+
+        let (fresh, fetched) = Device::new_recording(&s, "fresh");
+        fresh.sync();
+        assert_eq!(
+            fetched_paths(&fetched),
+            vec![
+                "Calendar/20261110.md",
+                "Calendar/20261109.md",
+                "Notes/newer.md",
+                "Notes/older.md",
+                "Notes/pic.png",
+                ".kairn/settings.json",
+            ]
+        );
+        assert_eq!(fresh.read("Calendar/20261110.md").as_deref(), Some("today 1\n"));
+    }
+
+    #[test]
+    fn a_crash_inside_a_coalesced_pull_never_moves_the_cursor_past_an_unapplied_head() {
+        for fail_at in 1..=3 {
+            let s = FakeServer::new();
+            seed_revisions(&s, "Notes/a.md", 3, |n| format!("a{n}\n").into_bytes());
+            seed_revisions(&s, "Calendar/20261110.md", 3, |n| format!("day{n}\n").into_bytes());
+            seed_revisions(&s, "Notes/b.md", 3, |n| format!("b{n}\n").into_bytes());
+            let last_seq = s.journal_len() as u64;
+
+            let (dest, ctl) = Device::new_faulty(&s, "dest", fail_at);
+            assert!(dest.try_sync().is_err(), "fail_at {fail_at}");
+
+            // Every head not yet applied is still owed, the read position moved
+            // to the end of what was read, and the applied cursor sits below the
+            // oldest head still owed.
+            let pending = dest.state.pending_pulls().unwrap();
+            assert_eq!(pending.len() as u64, 4 - fail_at, "fail_at {fail_at}");
+            let oldest = pending.iter().map(|e| e.seq).min().unwrap();
+            assert!(dest.state.cursor().unwrap() < oldest, "fail_at {fail_at}");
+            assert_eq!(dest.state.pull_cursor().unwrap(), last_seq);
+            for entry in &pending {
+                assert!(!dest.exists(&entry.path.0), "an owed head was written: {}", entry.path);
+            }
+            assert_eq!(s.ack_of("dest"), 0, "nothing acked from a failed cycle");
+
+            ctl.heal();
+            dest.sync();
+            assert_eq!(dest.read("Notes/a.md").as_deref(), Some("a2\n"));
+            assert_eq!(dest.read("Calendar/20261110.md").as_deref(), Some("day2\n"));
+            assert_eq!(dest.read("Notes/b.md").as_deref(), Some("b2\n"));
+            assert!(dest.state.pending_pulls().unwrap().is_empty());
+            assert_eq!(dest.state.cursor().unwrap(), last_seq);
+            assert_eq!(s.ack_of("dest"), last_seq);
+        }
+    }
+
+    #[test]
+    fn a_declined_path_is_never_fetched_uploaded_or_deleted() {
+        let declined = ".kairn/activity.jsonl";
+        let s = FakeServer::new();
+        let desk = Device::new(&s, "desk");
+        desk.write(declined, "{\"event\":1}\n");
+        desk.write("Notes/a.md", "shared\n");
+        desk.sync();
+
+        // A device that tracked the path before it started declining it.
+        let (phone, fetched) = Device::new_recording(&s, "phone");
+        phone.sync();
+        assert_eq!(phone.read(declined).as_deref(), Some("{\"event\":1}\n"));
+        phone.config.borrow_mut().local_ignore = vec![declined.to_owned()];
+        fetched.lock().unwrap().clear();
+
+        // A newer server copy is neither fetched nor written.
+        desk.write(declined, "{\"event\":1}\n{\"event\":2}\n");
+        desk.sync();
+        let head = s.head(&VaultPath::new(declined)).unwrap();
+        phone.sync();
+        assert!(fetched_paths(&fetched).is_empty(), "{:?}", fetched_paths(&fetched));
+        assert_eq!(phone.read(declined).as_deref(), Some("{\"event\":1}\n"));
+        assert!(phone.state.pending_pulls().unwrap().is_empty());
+
+        // A local edit is not uploaded and a local delete is not pushed.
+        phone.write(declined, "edited on the phone\n");
+        phone.sync();
+        assert_eq!(s.head(&VaultPath::new(declined)).unwrap(), head);
+        phone.delete(declined);
+        let journal = s.journal_len();
+        phone.sync();
+        assert_eq!(s.journal_len(), journal, "no tombstone for a declined path");
+        assert_eq!(s.head(&VaultPath::new(declined)).unwrap(), head);
+        assert!(!phone.exists(declined));
+
+        // A device that declines it from the start never creates it, and a file
+        // it already holds there stays exactly as it was.
+        let (fresh, fetched) = Device::new_recording(&s, "fresh");
+        fresh.config.borrow_mut().local_ignore = vec![".kairn/".to_owned()];
+        fresh.write(declined, "local only\n");
+        fresh.sync();
+        assert_eq!(fetched_paths(&fetched), vec!["Notes/a.md"]);
+        assert_eq!(fresh.read(declined).as_deref(), Some("local only\n"));
+        assert_eq!(s.head(&VaultPath::new(declined)).unwrap(), head);
+        assert_eq!(fresh.read("Notes/a.md").as_deref(), Some("shared\n"));
+    }
+
+    #[test]
+    fn wrote_fires_once_per_landed_write_after_the_bytes_land() {
+        let s = FakeServer::new();
+        let mac = Device::new(&s, "mac");
+        let phone = Device::new(&s, "phone");
+        mac.write("Notes/clean.md", "one\n");
+        mac.write("Notes/merge.md", "top\nbottom\n");
+        mac.write("Notes/clash.md", "line\n");
+        mac.write("Notes/gone.md", "bye\n");
+        mac.sync();
+        phone.sync();
+        let landed: Vec<_> = phone.landed.borrow().iter().map(|(p, _)| p.0.clone()).collect();
+        assert_eq!(landed.len(), 4, "{landed:?}");
+
+        mac.write("Notes/clean.md", "one\ntwo\n");
+        mac.write("Notes/merge.md", "top\nbottom\nfrom mac\n");
+        mac.write("Notes/clash.md", "line from mac\n");
+        mac.delete("Notes/gone.md");
+        mac.sync();
+        phone.write("Notes/merge.md", "top edited\nbottom\n");
+        phone.write("Notes/clash.md", "line from phone\n");
+        phone.landed.borrow_mut().clear();
+        phone.events.borrow_mut().clear();
+        phone.sync();
+
+        let landed = phone.landed.borrow().clone();
+        let mut paths: Vec<_> = landed.iter().map(|(p, _)| p.0.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["Notes/clash.md", "Notes/clean.md", "Notes/gone.md", "Notes/merge.md"]);
+        for (path, seen) in &landed {
+            // What the file held when the event fired is what it holds now.
+            assert_eq!(seen, &std::fs::read(phone.root.join(&path.0)).ok(), "{path}");
+            // And the event followed the echo hook for the same path.
+            let events = phone.events.borrow();
+            let about = events.iter().position(|e| e == &SyncEvent::AboutToWrite(path.clone()));
+            let wrote = events.iter().position(|e| e == &SyncEvent::Wrote(path.clone()));
+            assert!(about.is_some() && about < wrote, "{path}");
+        }
+        assert_eq!(phone.read("Notes/clean.md").as_deref(), Some("one\ntwo\n"));
+        assert_eq!(phone.read("Notes/merge.md").as_deref(), Some("top edited\nbottom\nfrom mac\n"));
+        assert!(!phone.exists("Notes/gone.md"));
+
+        // A cycle that writes nothing says nothing.
+        phone.landed.borrow_mut().clear();
+        phone.sync();
+        mac.sync();
+        phone.landed.borrow_mut().clear();
+        phone.sync();
+        assert!(phone.landed.borrow().is_empty());
+    }
+
+    #[test]
+    fn two_devices_appending_to_one_section_converge_with_no_conflict_copy() {
+        let s = FakeServer::new();
+        let mac = Device::new(&s, "mac");
+        let phone = Device::new(&s, "phone");
+        let day = "Calendar/20261110.md";
+        mac.write(day, "### Todays Tasks\n* Water the plants\n\n### Daily Notes\nMorning walk\n\n### Desk\n- Sorted the post\n");
+        mac.sync();
+        phone.sync();
+
+        mac.write(day, "### Todays Tasks\n* Water the plants\n\n### Daily Notes\nMorning walk\nCalled the garage\n\n### Desk\n- Sorted the post\n");
+        phone.write(day, "### Todays Tasks\n* Water the plants\n\n### Daily Notes\nMorning walk\nBought stamps\n\n### Desk\n- Sorted the post\n");
+        mac.sync();
+        phone.sync();
+        mac.sync();
+
+        let expected = "### Todays Tasks\n* Water the plants\n\n### Daily Notes\nMorning walk\nCalled the garage\nBought stamps\n\n### Desk\n- Sorted the post\n";
+        assert_eq!(phone.read(day).as_deref(), Some(expected));
+        assert_eq!(mac.read(day).as_deref(), Some(expected));
+        assert!(phone.conflict_copies(day).is_empty());
+        assert!(mac.conflict_copies(day).is_empty());
+    }
+
+    #[test]
+    fn a_line_both_devices_appended_lands_once() {
+        let s = FakeServer::new();
+        let mac = Device::new(&s, "mac");
+        let phone = Device::new(&s, "phone");
+        let day = "Calendar/20261110.md";
+        mac.write(day, "### Daily Notes\nMorning walk\n\n### Desk\n");
+        mac.sync();
+        phone.sync();
+
+        mac.write(day, "### Daily Notes\nMorning walk\nStand-up at ten\n\n### Desk\n");
+        phone.write(day, "### Daily Notes\nMorning walk\nStand-up at ten\nBought stamps\n\n### Desk\n");
+        mac.sync();
+        phone.sync();
+        mac.sync();
+
+        let expected = "### Daily Notes\nMorning walk\nStand-up at ten\nBought stamps\n\n### Desk\n";
+        assert_eq!(phone.read(day).as_deref(), Some(expected));
+        assert_eq!(mac.read(day).as_deref(), Some(expected));
+        assert!(phone.conflict_copies(day).is_empty());
+    }
+
+    #[test]
+    fn a_note_created_offline_over_an_existing_path_keeps_both_with_no_conflict_copy() {
+        let s = FakeServer::new();
+        let mac = Device::new(&s, "mac");
+        // The phone is an established device: it has finished a cycle before.
+        let phone = Device::new(&s, "phone");
+        phone.sync();
+        let day = "Calendar/20261110.md";
+        mac.write(day, "### Todays Tasks\n* Water the plants\n\n### Daily Notes\n");
+        mac.sync();
+
+        // Never synced: no state row for the path, and its own version on disk.
+        phone.write(day, "### Daily Notes\nPicked up the parcel\n");
+        let r = phone.sync();
+        assert_eq!(r.conflicts, 0);
+
+        let expected = "### Todays Tasks\n* Water the plants\n\n### Daily Notes\nPicked up the parcel\n";
+        assert_eq!(phone.read(day).as_deref(), Some(expected));
+        assert!(phone.conflict_copies(day).is_empty());
+        mac.sync();
+        assert_eq!(mac.read(day).as_deref(), Some(expected));
+        assert!(mac.conflict_copies(day).is_empty());
+        assert_eq!(s.head(&VaultPath::new(day)).unwrap().hash, Some(hash_bytes(expected.as_bytes())));
     }
 }

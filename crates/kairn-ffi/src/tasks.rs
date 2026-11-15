@@ -40,6 +40,14 @@ pub struct FfiDayTaskStats {
 pub struct FfiTaskScan {
     pub open: Vec<FfiTaskRef>,
     pub day_stats: Vec<FfiDayTaskStats>,
+    pub complete: bool,
+    pub errors: Vec<FfiScanError>,
+}
+
+#[derive(uniffi::Record)]
+pub struct FfiScanError {
+    pub path: String,
+    pub message: String,
 }
 
 /// Scan the whole vault for tasks. Mirrors the desktop task views and
@@ -47,11 +55,13 @@ pub struct FfiTaskScan {
 #[uniffi::export]
 pub fn scan_vault_tasks(root: String) -> FfiTaskScan {
     let root = Path::new(&root);
-    let scan = kairn_core::VaultScan::new(root);
-    let dailies = scan.read_dailies();
-    let notes = scan.read_notes_cached(&mut Default::default());
-    let result = kairn_core::scan_tasks(&dailies, &notes);
+    let result = kairn_core::scan_vault_tasks(root);
     FfiTaskScan {
+        complete: result.errors.is_empty(),
+        errors: result.errors.into_iter().map(|error| FfiScanError {
+            path: error.path.to_string_lossy().into_owned(),
+            message: error.message,
+        }).collect(),
         open: result
             .open
             .into_iter()
@@ -136,6 +146,8 @@ mod tests {
         std::fs::write(root.join("Notes/Project.md"), "* dated >2026-08-20\n* undated\n").unwrap();
 
         let scan = scan_vault_tasks(root.to_string_lossy().into_owned());
+        assert!(scan.complete);
+        assert!(scan.errors.is_empty());
         let lines: Vec<&str> = scan.open.iter().map(|t| t.line.as_str()).collect();
         // Newest due first; the undated note task stays out.
         assert_eq!(lines, vec!["* dated >2026-08-20", "* open here"]);
@@ -148,6 +160,14 @@ mod tests {
             .find(|s| s.date.day == 5)
             .expect("stats for the 5th");
         assert_eq!((day5.open, day5.done), (1, 1));
+        let broken = root.join("Notes/Broken.md");
+        std::fs::write(&broken, [0xff]).unwrap();
+        let partial = scan_vault_tasks(root.to_string_lossy().into_owned());
+        assert!(!partial.complete);
+        assert_eq!(partial.open.len(), 2);
+        assert_eq!(partial.errors.len(), 1);
+        assert_eq!(partial.errors[0].path, broken.to_string_lossy());
+        assert!(!partial.errors[0].message.is_empty());
         std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -16,6 +16,7 @@ use kairn_core::{
 use serde_json::json;
 
 mod carry;
+mod carry_transfer;
 
 /// Exit codes are part of the interface: scripts and agents branch on them.
 const EXIT_FAILED: u8 = 1;
@@ -61,6 +62,8 @@ Examples:
   kairn append today \"decided: ship it\" --section Log
   kairn edit today --find \"email sam\" --append \"(done by phone)\"
   kairn edit 2026-08-07 --find \"old reminder\" --delete
+  kairn section today \"### Status\" --replace - --create < status.md
+                                       keep one block of a note up to date
   kairn carry --dry-run                what would move into today
   kairn recent --days 2                notes touched since yesterday"
 )]
@@ -224,11 +227,54 @@ command fails so it can be rerun.")]
         delete: bool,
     },
 
+    /// Replace, create, or delete one heading's block in a note
+    #[command(long_about = "\
+Rewrite one section of a note as a unit: the heading line through the
+line before the next heading of the same or higher level (or the end of
+the note). Made for a block that a script or agent keeps up to date, such
+as a status block in a daily note, without touching anything around it.
+
+HEADING is matched like --section elsewhere: `#` marks, `==` highlights,
+and case are ignored, so \"seat\" finds `### ==Seat==`. The change is one of:
+
+  --replace TEXT   the body under the heading becomes TEXT (`-` reads it
+                   from stdin); the heading line stays as written in the
+                   note. Nothing is written when the body is already TEXT,
+                   so a caller can run this as often as it likes.
+  --delete         the heading and its body are removed.
+
+With --create, a missing heading is added: HEADING verbatim when it brings
+its own `#` marks, as a `## ` heading otherwise, placed --before or --after
+a named heading, else at the end of the note. Exit 3 when the heading is
+missing without --create, or when the --before/--after heading is missing.
+Blank lines and rules after the block belong to the boundary and are kept.")]
+    Section {
+        /// Note title, ISO date, period, or today/tomorrow/yesterday
+        note: String,
+        /// The heading whose block to change (e.g. \"### Seat\")
+        heading: String,
+        /// The new body, or - to read it from stdin
+        #[arg(long, value_name = "TEXT", conflicts_with = "delete", allow_hyphen_values = true)]
+        replace: Option<String>,
+        /// Add the section when the heading is missing
+        #[arg(long, action = ArgAction::SetTrue, conflicts_with = "delete")]
+        create: bool,
+        /// With --create: put the new section above this heading
+        #[arg(long, value_name = "HEADING", requires = "create", conflicts_with = "after")]
+        before: Option<String>,
+        /// With --create: put the new section after this heading's block
+        #[arg(long, value_name = "HEADING", requires = "create")]
+        after: Option<String>,
+        /// Remove the heading and its body
+        #[arg(long, action = ArgAction::SetTrue)]
+        delete: bool,
+    },
+
     /// Move overdue tasks from past days into today
     #[command(long_about = "\
 Move every overdue open task off past daily notes and into one day
 (today, or --to). Each task line is appended to the destination and
-deleted from its old day — never duplicated — with its stale `>date`
+deleted from its old day, with its stale `>date`
 token stripped, since the day it lands on dates it. A `**group**` header
 travels with its tasks: written once at the destination, deleted from
 the old day when nothing is left under it.
@@ -242,7 +288,11 @@ success: a clean morning prints one line and exits 0.
 Carry looks back 14 days by default, so a vault carrying years of old
 open tasks (an import, a long break) never floods today by accident;
 anything older is counted and reported, never silently dropped. --from
-moves the window: `--from 2025-01-01` carries the lot, deliberately.")]
+moves the window: `--from 2025-01-01` carries the lot, deliberately.
+
+An interrupted carry resumes with the same --to and --section. Its saved
+transfer plan prevents duplicate appends. If a file changed meanwhile,
+carry stops for review and keeps the plan in .kairn/local/carry.json.")]
     Carry {
         /// Day the tasks land on: today, tomorrow, or 2026-08-12
         #[arg(long, value_name = "WHEN", default_value = "today")]
@@ -374,6 +424,23 @@ fn run(cli: Cli) -> Result<(), Failure> {
                     .hint("one of --replace TEXT, --append TEXT, or --delete"));
             };
             cmd_edit(&root, &note, &find, op, &actor, cli.json)
+        }
+        Command::Section { note, heading, replace, create, before, after, delete } => {
+            let edit = if delete {
+                write::SectionEdit::Delete
+            } else if let Some(body) = replace {
+                let body = if body == "-" { read_stdin()? } else { body };
+                let place = match (before, after) {
+                    (Some(h), _) => Some(write::SectionPlace::Before(h)),
+                    (_, Some(h)) => Some(write::SectionPlace::After(h)),
+                    _ => create.then_some(write::SectionPlace::End),
+                };
+                write::SectionEdit::Replace { body, create: place }
+            } else {
+                return Err(Failure::new(2, "say what to change")
+                    .hint("one of --replace TEXT (or --replace - for stdin), or --delete"));
+            };
+            cmd_section(&root, &note, &heading, &edit, &actor, cli.json)
         }
         Command::Carry { to, from, section, dry_run } => {
             let dest = parse_when(&to)?;
@@ -565,7 +632,8 @@ fn cmd_tasks(
     json: bool,
 ) -> Result<(), Failure> {
     let today = Local::now().date_naive();
-    let source = if done { done_tasks_in_vault(root) } else { open_tasks_in_vault(root) };
+    let source = if done { done_tasks_in_vault(root) } else { open_tasks_in_vault(root) }
+        .require_complete().map_err(|error| Failure::new(EXIT_FAILED, error.to_string()))?;
     let tasks: Vec<TaskRef> = source
         .into_iter()
         .filter(|t| query.matches(t.due, today))
@@ -778,6 +846,102 @@ fn cmd_edit(
     Ok(())
 }
 
+fn read_stdin() -> Result<String, Failure> {
+    use std::io::Read as _;
+    let mut body = String::new();
+    std::io::stdin()
+        .read_to_string(&mut body)
+        .map_err(|e| Failure::new(EXIT_FAILED, format!("could not read stdin: {e}")))?;
+    Ok(body)
+}
+
+fn cmd_section(
+    root: &Path,
+    note: &str,
+    heading: &str,
+    edit: &write::SectionEdit,
+    actor: &str,
+    json: bool,
+) -> Result<(), Failure> {
+    if heading.trim().trim_start_matches('#').trim().is_empty() {
+        return Err(Failure::new(2, "give the heading whose block to change"));
+    }
+    let creating = matches!(edit, write::SectionEdit::Replace { create: Some(_), .. });
+    let path = match resolve_target(root, note)? {
+        Target::Day(date) if creating => {
+            let rule = Settings::load().daily_template_rule;
+            write::ensure_day_note(root, date, &rule).map_err(|e| {
+                Failure::new(EXIT_FAILED, format!("could not write the daily note: {e}"))
+            })?
+        }
+        Target::Day(date) => existing_daily(root, date)?,
+        Target::Note(path) => path,
+    };
+    let outcome = write::edit_section_on_disk(&path, heading, edit).map_err(|e| {
+        Failure::new(EXIT_FAILED, format!("could not update {}: {e}", path.display()))
+    })?;
+    let change = match outcome {
+        Ok(change) => change,
+        Err(write::SectionMiss::Heading) => {
+            let failure = Failure::new(
+                EXIT_NOT_FOUND,
+                format!("no heading matches {heading:?} in {}", rel(root, &path)),
+            );
+            return Err(match edit {
+                write::SectionEdit::Delete => failure,
+                _ => failure.hint("add --create to add the section"),
+            });
+        }
+        Err(write::SectionMiss::Anchor(anchor)) => {
+            return Err(Failure::new(
+                EXIT_NOT_FOUND,
+                format!("no heading matches {anchor:?} in {} to place the section by", rel(root, &path)),
+            )
+            .hint("drop --before/--after to add it at the end"));
+        }
+    };
+    use write::SectionAction;
+    let (action, changed) = match change.action {
+        SectionAction::Unchanged => ("unchanged", false),
+        SectionAction::Replaced => ("replaced", true),
+        SectionAction::Created => ("created", true),
+        SectionAction::Deleted => ("deleted", true),
+    };
+    let block_lines = change.text[change.start..change.end].trim_matches(['\n', '\r']).lines().count();
+    if changed {
+        let detail = match change.action {
+            SectionAction::Deleted => format!("{action} {}", change.heading),
+            _ => format!("{action} {} ({block_lines} lines)", change.heading),
+        };
+        log_write(root, actor, "section", &path, &detail);
+    }
+    if json {
+        let body = json!({
+            "file": rel(root, &path),
+            "heading": change.heading,
+            "action": action,
+            "changed": changed,
+            "line": change.line + 1,
+            "lines": block_lines,
+            "start": change.start,
+            "end": change.end,
+        });
+        println!("{body}");
+    } else {
+        match change.action {
+            SectionAction::Unchanged => println!("unchanged: {} in {}", change.heading, rel(root, &path)),
+            SectionAction::Deleted => println!("deleted: {} from {}", change.heading, rel(root, &path)),
+            _ => println!(
+                "{action}: {} in {} (line {}, {block_lines} lines)",
+                change.heading,
+                rel(root, &path),
+                change.line + 1
+            ),
+        }
+    }
+    Ok(())
+}
+
 fn cmd_carry(
     root: &Path,
     dest: NaiveDate,
@@ -787,6 +951,21 @@ fn cmd_carry(
     actor: &str,
     json: bool,
 ) -> Result<(), Failure> {
+    let failure = |error: std::io::Error| Failure::new(EXIT_FAILED, error.to_string());
+    let tasks = open_tasks_in_vault(root).require_complete()
+        .map_err(|error| Failure::new(EXIT_FAILED, error.to_string()))?;
+    if let Some(transfer) = carry_transfer::Transfer::pending(root).map_err(failure)? {
+        if !transfer.matches(dest, section) {
+            return Err(Failure::new(EXIT_FAILED, transfer.resume_hint()));
+        }
+        if dry_run {
+            print_carry_report(transfer.report(), true, true, json);
+        } else {
+            let report = transfer.apply().map_err(failure)?;
+            print_carry_report(&report, false, true, json);
+        }
+        return Ok(());
+    }
     let today = Local::now().date_naive();
     if dest < today {
         return Err(Failure::new(2, "carry moves tasks forward: --to must be today or later"));
@@ -794,7 +973,7 @@ fn cmd_carry(
     // The window guards against flooding today from an imported or long-idle
     // vault; what falls outside it is reported, never silently dropped.
     let cutoff = from.unwrap_or(today - Duration::days(14));
-    let overdue: Vec<TaskRef> = open_tasks_in_vault(root)
+    let overdue: Vec<TaskRef> = tasks
         .into_iter()
         .filter(|t| t.file_date.is_some_and(|d| d < today) && t.due < dest)
         .collect();
@@ -873,103 +1052,40 @@ fn cmd_carry(
         }
         return Ok(());
     }
-    // The destination gains the block first, then the source lines go: a
-    // line that changes underneath the delete ends up duplicated, never
-    // lost, and the failure is reported.
-    let rule = Settings::load().daily_template_rule;
-    let dest_path = write::ensure_day_note(root, dest, &rule).map_err(|e| {
-        Failure::new(EXIT_FAILED, format!("could not write the daily note: {e}"))
-    })?;
-    let block = carry::destination_block(&moves);
-    match section {
-        Some(heading) => {
-            write::append_to_section(&dest_path, heading, &block).map(|_| ())
-        }
-        None => write::append_line(&dest_path, &block).map(|_| ()),
-    }
-    .map_err(|e| {
-        Failure::new(EXIT_FAILED, format!("could not write {}: {e}", dest_path.display()))
-    })?;
-    let mut by_file: HashMap<&PathBuf, Vec<&carry::Move>> = HashMap::new();
-    for m in &moves {
-        by_file.entry(&m.task.path).or_default().push(m);
-    }
-    let mut leftovers: Vec<String> = Vec::new();
-    for (path, mut file_moves) in by_file {
-        // Bottom-up so earlier removals never shift a later line's index.
-        file_moves.sort_by_key(|m| std::cmp::Reverse(m.task.line_idx));
-        for m in &file_moves {
-            match write::remove_line_on_disk(path, m.task.line_idx, &m.task.line) {
-                Ok(Some(_)) => {}
-                Ok(None) => leftovers
-                    .push(format!("{}: {}", rel(root, path), task_text(&m.task.line))),
-                Err(e) => {
-                    return Err(Failure::new(
-                        EXIT_FAILED,
-                        format!("could not update {}: {e}", path.display()),
-                    ));
-                }
-            }
-        }
-        let headers: Vec<&str> = {
-            let mut seen = Vec::new();
-            for m in &file_moves {
-                if let Some(h) = m.header.as_deref()
-                    && !seen.contains(&h)
-                {
-                    seen.push(h);
-                }
-            }
-            seen
-        };
-        if headers.is_empty() {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(path) else { continue };
-        let lines: Vec<&str> = text.lines().collect();
-        let emptied: Vec<usize> = lines
-            .iter()
-            .enumerate()
-            .filter(|(i, line)| {
-                headers.contains(line) && carry::header_now_empty(&lines, *i)
-            })
-            .map(|(i, _)| i)
-            .collect();
-        for i in emptied.iter().rev() {
-            if let Err(e) = write::remove_line_on_disk(path, *i, lines[*i]) {
-                eprintln!("kairn: could not remove an emptied group header: {e}");
-            }
-        }
-    }
-    for m in &moves {
-        log_write(root, actor, "carry", &dest_path, task_text(&m.carried_line));
-    }
-    for line in &leftovers {
-        eprintln!(
-            "kairn: carried but not removed (the line changed underneath): {line} — now in both notes, remove the old one by hand"
-        );
-    }
-    if json {
-        let body = json!({
-            "count": moves.len(),
-            "to": dest.format("%Y-%m-%d").to_string(),
-            "file": rel(root, &dest_path),
-            "dry_run": false,
-            "tasks": tasks_json,
-            "left_in_place": leftovers,
-            "older_than_window": older,
-        });
-        println!("{body}");
-    } else {
-        println!("carried {} tasks to {}", moves.len(), dest.format("%Y-%m-%d"));
-        for m in &moves {
-            let from = m.task.file_date.map_or_else(String::new, |d| {
-                d.format("%Y-%m-%d").to_string()
-            });
-            println!("  {from}  {}", task_text(&m.carried_line));
-        }
-    }
+    let dest_path = vault::daily_file(root, dest).unwrap_or_else(|| vault::daily_path(root, dest));
+    let report = carry_transfer::Report {
+        to: dest.format("%Y-%m-%d").to_string(),
+        file: dest_path.strip_prefix(root).map_err(|error| Failure::new(EXIT_FAILED, error.to_string()))?.to_owned(),
+        tasks: tasks_json,
+        older_than_window: older,
+    };
+    let transfer = carry_transfer::Transfer::prepare(
+        root, section, actor, &Settings::load().daily_template_rule, &moves, &texts, report,
+    ).map_err(failure)?;
+    let report = transfer.apply().map_err(failure)?;
+    print_carry_report(&report, false, false, json);
     Ok(())
+}
+
+fn print_carry_report(report: &carry_transfer::Report, dry_run: bool, resumed: bool, json: bool) {
+    if json {
+        println!("{}", json!({
+            "count": report.tasks.len(),
+            "to": report.to,
+            "file": report.file,
+            "dry_run": dry_run,
+            "resumed": resumed,
+            "tasks": report.tasks,
+            "left_in_place": [],
+            "older_than_window": report.older_than_window,
+        }));
+    } else {
+        let action = if dry_run { "would resume carrying" } else { "carried" };
+        println!("{action} {} tasks to {}", report.tasks.len(), report.to);
+        for task in &report.tasks {
+            println!("  {}  {}", task["from"].as_str().unwrap_or_default(), task["text"].as_str().unwrap_or_default());
+        }
+    }
 }
 
 fn cmd_recent(root: &Path, days: u64, json: bool) -> Result<(), Failure> {
@@ -1028,7 +1144,8 @@ fn cmd_done(root: &Path, needle: &str, actor: &str, json: bool) -> Result<(), Fa
     if needle_trim.is_empty() {
         return Err(Failure::new(2, "give some words from the task's text"));
     }
-    let tasks = open_tasks_in_vault(root);
+    let tasks = open_tasks_in_vault(root).require_complete()
+        .map_err(|error| Failure::new(EXIT_FAILED, error.to_string()))?;
     let lower = needle_trim.to_lowercase();
     let matches: Vec<&TaskRef> = tasks
         .iter()
@@ -1192,6 +1309,113 @@ mod tests {
         // Trailing whitespace is content (markdown hard breaks): the suffix
         // lands before it.
         assert_eq!(append_suffix("* call Sam  ", "→ GDL-42"), "* call Sam → GDL-42  ");
+    }
+
+    /// A throwaway notes folder with the Kairn layout, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!("kairn-cli-test-{tag}-{nanos}"));
+            vault::ensure_layout(&root);
+            Self(root)
+        }
+
+        fn write(&self, rel: &str, content: &str) -> PathBuf {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, content).expect("write");
+            path
+        }
+
+        fn read(&self, rel: &str) -> String {
+            std::fs::read_to_string(self.0.join(rel)).expect("read")
+        }
+
+        fn activity(&self) -> Vec<ActivityEntry> {
+            kairn_core::recent_activity(&self.0, 20)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn replace(body: &str, create: Option<write::SectionPlace>) -> write::SectionEdit {
+        write::SectionEdit::Replace { body: body.to_string(), create }
+    }
+
+    #[test]
+    fn section_replaces_creates_and_deletes_one_block() {
+        let root = Scratch::new("section");
+        root.write("Notes/Status.md", "# Status\n\n### Tasks\n* one\n\n### Local Agent\n- theirs\n");
+        // Missing without --create: exit 3, nothing written, nothing logged.
+        let err = cmd_section(&root.0, "Status", "### Seat", &replace("- a", None), "seat", false)
+            .expect_err("missing heading");
+        assert_eq!(err.code, EXIT_NOT_FOUND);
+        assert!(root.activity().is_empty());
+        // --create --before places it above the anchor.
+        let before = Some(write::SectionPlace::Before("local agent".into()));
+        cmd_section(&root.0, "Status", "### Seat", &replace("- a\n- b\n", before.clone()), "seat", true)
+            .expect("created");
+        assert_eq!(
+            root.read("Notes/Status.md"),
+            "# Status\n\n### Tasks\n* one\n\n### Seat\n- a\n- b\n\n### Local Agent\n- theirs\n"
+        );
+        let log = root.activity();
+        assert_eq!(log.len(), 1);
+        assert_eq!((log[0].actor.as_str(), log[0].action.as_str()), ("seat", "section"));
+        assert_eq!(log[0].detail, "created ### Seat (3 lines)");
+        // The same body again is a no-op: no write, no log entry.
+        cmd_section(&root.0, "Status", "seat", &replace("- a\n- b", before.clone()), "seat", true)
+            .expect("unchanged");
+        assert_eq!(root.activity().len(), 1);
+        // A new body replaces only the block; the heading line and the gap stay.
+        cmd_section(&root.0, "Status", "Seat", &replace("- c", None), "seat", false).expect("replaced");
+        assert_eq!(
+            root.read("Notes/Status.md"),
+            "# Status\n\n### Tasks\n* one\n\n### Seat\n- c\n\n### Local Agent\n- theirs\n"
+        );
+        assert_eq!(root.activity()[0].detail, "replaced ### Seat (2 lines)");
+        // A missing anchor is exit 3 too.
+        let err = cmd_section(
+            &root.0,
+            "Status",
+            "### Other",
+            &replace("x", Some(write::SectionPlace::Before("Nope".into()))),
+            "seat",
+            false,
+        )
+        .expect_err("missing anchor");
+        assert_eq!(err.code, EXIT_NOT_FOUND);
+        // --delete takes the heading, its body, and its trailing gap.
+        cmd_section(&root.0, "Status", "seat", &write::SectionEdit::Delete, "seat", false).expect("deleted");
+        assert_eq!(root.read("Notes/Status.md"), "# Status\n\n### Tasks\n* one\n\n### Local Agent\n- theirs\n");
+        assert_eq!(root.activity()[0].detail, "deleted ### Seat");
+        let err = cmd_section(&root.0, "Status", "seat", &write::SectionEdit::Delete, "seat", false)
+            .expect_err("already gone");
+        assert_eq!(err.code, EXIT_NOT_FOUND);
+        // An unknown note is exit 3 as everywhere else.
+        let err = cmd_section(&root.0, "Nope", "seat", &replace("x", None), "seat", false).expect_err("no note");
+        assert_eq!(err.code, EXIT_NOT_FOUND);
+    }
+
+    #[test]
+    fn section_on_a_day_creates_the_note_only_with_create() {
+        let root = Scratch::new("section-day");
+        let err = cmd_section(&root.0, "2026-09-21", "### Seat", &replace("- a", None), "seat", false)
+            .expect_err("no note yet");
+        assert_eq!(err.code, EXIT_NOT_FOUND);
+        assert!(!root.0.join("Calendar/20260921.md").exists());
+        cmd_section(&root.0, "2026-09-21", "### Seat", &replace("- a", Some(write::SectionPlace::End)), "seat", false)
+            .expect("created");
+        assert_eq!(root.read("Calendar/20260921.md"), "### Seat\n- a\n");
     }
 
     #[test]

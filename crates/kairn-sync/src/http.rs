@@ -10,12 +10,13 @@
 //! issued at enrollment (spec §10).
 
 use std::io::Read;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::transport::{Transport, TransportError, TransportResult};
 use crate::types::{ChangesPage, ContentHash, PutOutcome, Rev, Seq, VaultPath};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// A hard ceiling on the whole call (connect + send + receive). The per-phase
 /// timeouts above don't cover every stall — a connection pooled from a since-
@@ -24,11 +25,16 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// next cycle retries on a fresh connection, which matters most for the always-
 /// on bridge. Generous enough for a 25 MB blob (spec §4) on a slow link.
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// The whole-call ceiling for the small control requests (`changes`, `ack`):
+/// their bodies are journal rows, so a call still running after this is stuck,
+/// and failing it fast lets the cycle retry instead of leaving the screen empty.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// An HTTP client bound to one server, one vault, and one device token. Cheap to
-/// construct; the underlying `ureq::Agent` pools connections across cycles.
+/// construct; the underlying `ureq::Agent` pools connections across cycles
+/// until [`Transport::reset_connections`] swaps it for a fresh one.
 pub struct HttpTransport {
-    agent: ureq::Agent,
+    agent: Mutex<ureq::Agent>,
     /// The server origin with no trailing slash, e.g. `http://100.121.119.52:8787`.
     base: String,
     vault: String,
@@ -43,21 +49,22 @@ impl HttpTransport {
         vault: impl Into<String>,
         token: impl Into<String>,
     ) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(CONNECT_TIMEOUT)
-            .timeout_read(READ_TIMEOUT)
-            .timeout(OVERALL_TIMEOUT)
-            .build();
         let mut base = server_url.into();
         while base.ends_with('/') {
             base.pop();
         }
         Self {
-            agent,
+            agent: Mutex::new(new_agent()),
             base,
             vault: vault.into(),
             token: token.into(),
         }
+    }
+
+    /// The current agent. `ureq::Agent` is a shared handle, so a request keeps
+    /// the agent it started on even if a reset swaps in a new one meanwhile.
+    fn agent(&self) -> ureq::Agent {
+        self.agent.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn vault_base(&self) -> String {
@@ -77,7 +84,10 @@ impl HttpTransport {
 impl Transport for HttpTransport {
     fn changes(&self, since: Seq, limit: u32) -> TransportResult<ChangesPage> {
         let url = format!("{}/changes?since={since}&limit={limit}", self.vault_base());
-        let resp = self.authed(self.agent.get(&url)).call().map_err(map_err)?;
+        let resp = self
+            .authed(self.agent().get(&url).timeout(CONTROL_TIMEOUT))
+            .call()
+            .map_err(map_err)?;
         read_json(resp)
     }
 
@@ -86,7 +96,7 @@ impl Transport for HttpTransport {
         if let Some(rev) = rev {
             url.push_str(&format!("?rev={rev}"));
         }
-        let resp = self.authed(self.agent.get(&url)).call().map_err(map_err)?;
+        let resp = self.authed(self.agent().get(&url)).call().map_err(map_err)?;
         let mut buf = Vec::new();
         resp.into_reader()
             .read_to_end(&mut buf)
@@ -103,7 +113,7 @@ impl Transport for HttpTransport {
     ) -> TransportResult<PutOutcome> {
         let url = self.file_url(path);
         let resp = self
-            .authed(self.agent.put(&url))
+            .authed(self.agent().put(&url))
             .set("base-rev", &base_rev.to_string())
             .set("hash", &hash.0)
             .set("Content-Type", "application/octet-stream")
@@ -115,7 +125,7 @@ impl Transport for HttpTransport {
     fn delete(&self, path: &VaultPath, base_rev: Rev) -> TransportResult<PutOutcome> {
         let url = self.file_url(path);
         let resp = self
-            .authed(self.agent.delete(&url))
+            .authed(self.agent().delete(&url))
             .set("base-rev", &base_rev.to_string())
             .call()
             .map_err(map_err)?;
@@ -125,12 +135,28 @@ impl Transport for HttpTransport {
     fn ack(&self, cursor: Seq) -> TransportResult<()> {
         let url = format!("{}/ack", self.vault_base());
         let body = serde_json::json!({ "cursor": cursor }).to_string();
-        self.authed(self.agent.post(&url))
+        self.authed(self.agent().post(&url).timeout(CONTROL_TIMEOUT))
             .set("Content-Type", "application/json")
             .send_string(&body)
             .map_err(map_err)?;
         Ok(())
     }
+
+    /// Swap in a new agent built the same way, so no socket pooled before a
+    /// suspension is reused.
+    fn reset_connections(&self) {
+        *self.agent.lock().unwrap_or_else(|e| e.into_inner()) = new_agent();
+    }
+}
+
+/// The agent every request runs on: blob requests keep these limits, and the
+/// control requests tighten the overall ceiling per call.
+fn new_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(CONNECT_TIMEOUT)
+        .timeout_read(READ_TIMEOUT)
+        .timeout(OVERALL_TIMEOUT)
+        .build()
 }
 
 /// Read a JSON response body into a protocol type. The server and engine share

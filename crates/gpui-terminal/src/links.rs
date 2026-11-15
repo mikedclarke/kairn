@@ -11,6 +11,14 @@ use alacritty_terminal::term::search::{RegexIter, RegexSearch};
 /// that is not whitespace, a control character, or a common URL delimiter.
 pub(crate) const URL_REGEX: &str = "(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\\x{00}-\\x{1F}\\x{7F}-\\x{9F}<>\"\\s{-}\\^⟨⟩`]+";
 
+pub(crate) fn is_web_link(uri: &str) -> bool {
+    !uri.chars().any(char::is_control)
+        && uri.split_once(':').is_some_and(|(scheme, rest)| {
+            (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+                && rest.starts_with("//")
+        })
+}
+
 /// The link at buffer-coordinate `point` in `term`, if any: an OSC 8
 /// hyperlink carried by the cell, or else a plain URL in the visible text
 /// matched by `url_regex`. Returns the URI and the inclusive

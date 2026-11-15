@@ -1,7 +1,5 @@
-//! Disk writes, all never-clobber: every path re-reads the file it is about
-//! to change and verifies (or safely relocates) what it expects to find
-//! there, so an edit rendered from a stale snapshot can't destroy content
-//! written meanwhile. All writes are atomic (temp file + rename).
+//! Note edits lock across reading and atomic replacement. Line edits verify
+//! or relocate their expected text; buffer saves reconcile their baseline.
 
 use std::fs;
 use std::io;
@@ -10,6 +8,7 @@ use std::path::{Path, PathBuf};
 use chrono::{Local, NaiveDate};
 
 use crate::blocks::section_end_line as section_end_insert_idx;
+use crate::file_lock::NoteLock;
 use crate::tasks::toggle_task_line;
 use crate::vault::{daily_file, daily_path};
 
@@ -74,11 +73,23 @@ pub fn capture(
 /// newline and line-ending conventions are preserved. Returns the index the
 /// appended text starts at.
 pub fn append_line(path: &Path, line: &str) -> io::Result<usize> {
-    let mut text = match fs::read_to_string(path) {
+    let _lock = lock_for_create(path)?;
+    append_line_locked(path, line)
+}
+
+fn append_line_locked(path: &Path, line: &str) -> io::Result<usize> {
+    let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
     };
+    let (text, idx) = append_line_in_text(&text, line);
+    atomic_write(path, &text)?;
+    Ok(idx)
+}
+
+pub fn append_line_in_text(existing: &str, line: &str) -> (String, usize) {
+    let mut text = existing.to_owned();
     let idx = text.lines().count();
     let crlf = text.contains("\r\n");
     let ending = if crlf { "\r\n" } else { "\n" };
@@ -95,37 +106,81 @@ pub fn append_line(path: &Path, line: &str) -> io::Result<usize> {
     if trailing_newline {
         text.push_str(ending);
     }
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    atomic_write(path, &text)?;
-    Ok(idx)
+    (text, idx)
 }
 
 /// Create a note only if nothing exists at `path`; an existing file is left
 /// untouched (a wiki link in a synced note must never overwrite a real
 /// note). Returns whether the file was created.
 pub fn create_note_if_absent(path: &Path, content: &str) -> io::Result<bool> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+    let _lock = lock_for_create(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error),
     }
-    match fs::OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(mut file) => {
-            use std::io::Write as _;
-            file.write_all(content.as_bytes())?;
-            Ok(true)
-        }
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-        Err(e) => Err(e),
-    }
+    crate::atomic_file::publish(path, false, |file| {
+        use std::io::Write;
+        file.write_all(content.as_bytes())
+    })
 }
 
-/// Write a note's full content atomically (temp file + rename, permissions
-/// preserved). The whole-buffer save path: callers own staleness protection
-/// via `NoteBuffer::reconcile`, which is the only sanctioned route here for
-/// content that was edited from a snapshot.
+/// Replace a note under the shared lock. For snapshot-based edits, use
+/// [`save_text`] or hold a [`NoteLock`] across reconciliation and replacement.
 pub fn write_note(path: &Path, content: &str) -> io::Result<()> {
-    atomic_write(path, content)
+    NoteLock::acquire(path)?.write_text(content)
+}
+
+pub struct TextSave {
+    pub text: String,
+    pub conflict_copy: Option<PathBuf>,
+}
+
+pub fn save_text(path: &Path, baseline: &str, local: &str) -> io::Result<TextSave> {
+    save_text_impl(path, baseline, local, false, crate::merge3)
+}
+
+/// Save a local-first note, allowing an explicitly edited missing note to be created.
+/// Lines both sides inserted at one point are both kept ([`crate::merge3_keep_both`]):
+/// this is the phone's save path, where another device appending to the same
+/// note while it is open is the everyday case rather than a conflict.
+pub fn save_note_text(path: &Path, baseline: &str, local: &str) -> io::Result<TextSave> {
+    save_text_impl(path, baseline, local, true, crate::merge3_keep_both)
+}
+
+fn save_text_impl(
+    path: &Path,
+    baseline: &str,
+    local: &str,
+    create: bool,
+    merge: fn(&str, &str, &str) -> crate::Merged,
+) -> io::Result<TextSave> {
+    if create && let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+    let _lock = NoteLock::acquire(path)?;
+    let disk = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if create && e.kind() == io::ErrorKind::NotFound => baseline.to_owned(),
+        Err(e) => return Err(e),
+    };
+    let merged = merge(
+        &baseline.replace("\r\n", "\n"),
+        &disk.replace("\r\n", "\n"),
+        &local.replace("\r\n", "\n"),
+    );
+    let conflict_copy = if merged.conflicts.is_empty() {
+        None
+    } else {
+        Some(crate::write_conflict_copy(path, local)?)
+    };
+    let text = if disk.contains("\r\n") {
+        merged.text.replace('\n', "\r\n")
+    } else {
+        merged.text
+    };
+    if text != disk || (create && !path.exists()) {
+        atomic_write(path, &text)?;
+    }
+    Ok(TextSave { text, conflict_copy })
 }
 
 /// Resolve a sync conflict by adopting the conflict copy: the current note
@@ -133,8 +188,10 @@ pub fn write_note(path: &Path, content: &str) -> io::Result<()> {
 /// `Notes/@Trash/`) and the copy is renamed into its place. A note that
 /// vanished, leaving only the copy, is simply recreated by the rename.
 pub fn adopt_conflict_copy(root: &Path, note: &Path, copy: &Path) -> io::Result<()> {
+    let _note_lock = NoteLock::acquire(note)?;
+    let _copy_lock = NoteLock::acquire(copy)?;
     if note.exists() {
-        trash_note(root, note)?;
+        trash_note_locked(root, note)?;
     }
     fs::rename(copy, note)
 }
@@ -161,6 +218,11 @@ fn checked_stem(stem: &str) -> io::Result<&str> {
 /// soft-delete convention; nothing here ever hard-deletes. A name collision
 /// in the trash gets a numbered suffix. Returns where the note ended up.
 pub fn trash_note(root: &Path, path: &Path) -> io::Result<PathBuf> {
+    let _lock = NoteLock::acquire(path)?;
+    trash_note_locked(root, path)
+}
+
+fn trash_note_locked(root: &Path, path: &Path) -> io::Result<PathBuf> {
     let trash = root.join("Notes").join("@Trash");
     if path.starts_with(&trash) {
         return Err(io::Error::new(
@@ -176,15 +238,18 @@ pub fn trash_note(root: &Path, path: &Path) -> io::Result<PathBuf> {
     let ext = path.extension().map(|e| e.to_string_lossy().into_owned());
     let mut dest = trash.join(name);
     let mut n = 2;
+    let mut dest_lock = NoteLock::acquire(&dest)?;
     while dest.exists() {
         let candidate = match &ext {
             Some(ext) => format!("{stem} {n}.{ext}"),
             None => format!("{stem} {n}"),
         };
         dest = trash.join(candidate);
+        dest_lock = NoteLock::acquire(&dest)?;
         n += 1;
     }
     fs::rename(path, &dest)?;
+    drop(dest_lock);
     Ok(dest)
 }
 
@@ -198,6 +263,8 @@ pub fn rename_note(path: &Path, new_stem: &str) -> io::Result<PathBuf> {
     if dest == path {
         return Ok(dest);
     }
+    let _source_lock = NoteLock::acquire(path)?;
+    let _dest_lock = NoteLock::acquire(&dest)?;
     if dest.exists() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -228,6 +295,8 @@ pub fn move_note(path: &Path, dest_dir: &Path) -> io::Result<PathBuf> {
             "can't move a folder into itself",
         ));
     }
+    let _source_lock = NoteLock::acquire(path)?;
+    let _dest_lock = NoteLock::acquire(&dest)?;
     if dest.exists() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -236,6 +305,18 @@ pub fn move_note(path: &Path, dest_dir: &Path) -> io::Result<PathBuf> {
     }
     fs::rename(path, &dest)?;
     Ok(dest)
+}
+
+pub fn rename_path(path: &Path, dest: &Path) -> io::Result<()> {
+    if path == dest {
+        return Ok(());
+    }
+    let _source_lock = NoteLock::acquire(path)?;
+    let _dest_lock = NoteLock::acquire(dest)?;
+    if dest.exists() {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "destination already exists"));
+    }
+    fs::rename(path, dest)
 }
 
 /// Create a note named by the user inside `dir`, seeded with a title
@@ -329,49 +410,18 @@ fn sanitize_title_stem(title: &str) -> Option<String> {
     (!cleaned.is_empty()).then(|| cleaned.to_string())
 }
 
-fn atomic_write(path: &Path, content: &str) -> io::Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let name = path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
-    // The temp name carries pid + counter so two running instances (or two
-    // quick writes) never collide on it.
-    let tmp = path.with_file_name(format!(
-        ".{}.kairn-tmp.{}.{}",
-        name.to_string_lossy(),
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed),
-    ));
-    let write = (|| {
-        {
-            use std::io::Write as _;
-            let mut file = fs::File::create(&tmp)?;
-            file.write_all(content.as_bytes())?;
-            // Rename is atomic for the *name*, not for the data behind it: with
-            // no fsync here a power cut can leave the renamed file holding
-            // stale or empty blocks, which is a silently lost edit rather than
-            // a half-written note.
-            file.sync_all()?;
-        }
-        // Rename replaces the inode; carry the original's permissions over
-        // so a private note (0600) doesn't silently become world-readable.
-        if let Ok(meta) = fs::metadata(path) {
-            fs::set_permissions(&tmp, meta.permissions())?;
-        }
-        fs::rename(&tmp, path)?;
-        // The new directory entry is durable only once the directory itself is
-        // synced. Not every platform allows opening a directory for that, so a
-        // failure here is not fatal.
-        if let Some(dir) = path.parent() {
-            let _ = fs::File::open(dir).and_then(|d| d.sync_all());
-        }
-        Ok(())
-    })();
-    if write.is_err() {
-        let _ = fs::remove_file(&tmp);
+fn lock_for_create(path: &Path) -> io::Result<NoteLock> {
+    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        fs::create_dir_all(dir)?;
     }
-    write
+    NoteLock::acquire(path)
+}
+
+pub(crate) fn atomic_write(path: &Path, content: &str) -> io::Result<()> {
+    crate::atomic_file::publish(path, true, |file| {
+        use std::io::Write;
+        file.write_all(content.as_bytes())
+    }).map(|_| ())
 }
 
 /// Rewrite one line of a note's full text. `expected` is the line as it read
@@ -447,6 +497,7 @@ pub fn replace_line_on_disk(
     expected: &str,
     new_line: &str,
 ) -> io::Result<Option<usize>> {
+    let _lock = NoteLock::acquire(path)?;
     let text = fs::read_to_string(path)?;
     let Some((new_text, idx)) =
         edit_line_in_text(&text, line_idx, expected, |_| Some(new_line.to_string()))
@@ -511,6 +562,7 @@ pub fn remove_line_on_disk(
     line_idx: usize,
     expected: &str,
 ) -> io::Result<Option<usize>> {
+    let _lock = NoteLock::acquire(path)?;
     let text = fs::read_to_string(path)?;
     let Some((new_text, idx)) = remove_line_in_text(&text, line_idx, expected) else {
         return Ok(None);
@@ -525,6 +577,7 @@ pub fn remove_line_on_disk(
 /// Line-ending and trailing-newline conventions are preserved. Returns the
 /// line index the block landed at.
 pub fn insert_block_at_line(path: &Path, line_idx: usize, block: &str) -> io::Result<usize> {
+    let _lock = lock_for_create(path)?;
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
@@ -567,14 +620,15 @@ pub fn insert_block_at_line(path: &Path, line_idx: usize, block: &str) -> io::Re
 /// index the block was removed from; `Ok(None)` when the block is gone or
 /// ambiguous and nothing was written.
 pub fn remove_block_lines(path: &Path, block: &str) -> io::Result<Option<usize>> {
+    let _lock = NoteLock::acquire(path)?;
     let text = fs::read_to_string(path)?;
     let lines: Vec<&str> = text.lines().collect();
     let block_lines: Vec<&str> = block.lines().collect();
     if block_lines.is_empty() {
         return Ok(None);
     }
-    let mut starts = (0..=lines.len().saturating_sub(block_lines.len()))
-        .filter(|&i| lines[i..i + block_lines.len()] == block_lines[..]);
+    let mut starts = lines.windows(block_lines.len()).enumerate()
+        .filter_map(|(i, window)| (window == block_lines).then_some(i));
     let Some(idx) = starts.next() else {
         return Ok(None);
     };
@@ -643,11 +697,18 @@ fn section_insert_idx(lines: &[&str], section: &str) -> Option<usize> {
 /// marks, as a `## ` heading otherwise — and the text follows it. A missing
 /// file is created. Returns the index the text starts at.
 pub fn append_to_section(path: &Path, section: &str, text: &str) -> io::Result<usize> {
+    let _lock = lock_for_create(path)?;
     let existing = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
     };
+    let (out, idx) = append_to_section_in_text(&existing, section, text);
+    atomic_write(path, &out)?;
+    Ok(idx)
+}
+
+pub fn append_to_section_in_text(existing: &str, section: &str, text: &str) -> (String, usize) {
     let lines: Vec<&str> = existing.lines().collect();
     let Some(idx) = section_insert_idx(&lines, section) else {
         let heading = if section.trim_start().starts_with('#') {
@@ -660,7 +721,8 @@ pub fn append_to_section(path: &Path, section: &str, text: &str) -> io::Result<u
         } else {
             format!("\n{heading}\n{text}")
         };
-        return append_line(path, &block).map(|idx| idx + block.lines().count() - text.lines().count());
+        let (out, idx) = append_line_in_text(existing, &block);
+        return (out, idx + block.lines().count() - text.lines().count());
     };
     let crlf = existing.contains("\r\n");
     let ending = if crlf { "\r\n" } else { "\n" };
@@ -683,11 +745,262 @@ pub fn append_to_section(path: &Path, section: &str, text: &str) -> io::Result<u
             out.pop();
         }
     }
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+    (out, idx)
+}
+
+/// Where a section created by [`edit_section_in_text`] goes when the note
+/// has no heading for it yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SectionPlace {
+    /// After the last line of the note.
+    End,
+    /// Directly above the named heading.
+    Before(String),
+    /// After the last content line of the named heading's section.
+    After(String),
+}
+
+/// What [`edit_section_in_text`] should do to the section.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SectionEdit {
+    /// The body under the heading becomes `body`; the heading line itself
+    /// stays as written. With `create`, a missing section is added there.
+    Replace { body: String, create: Option<SectionPlace> },
+    /// The heading and its body go.
+    Delete,
+}
+
+/// What happened to the section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SectionAction {
+    /// The block already read exactly as requested; nothing to write.
+    Unchanged,
+    Replaced,
+    Created,
+    Deleted,
+}
+
+/// The result of a section edit: the new text and where the block sits in
+/// it (`start..end` bytes, `line` the heading's 0-based line index). After a
+/// delete, `start == end` marks where the block was.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SectionChange {
+    pub text: String,
+    pub action: SectionAction,
+    pub heading: String,
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Why a section edit could not be applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SectionMiss {
+    /// No heading matches, and the edit did not ask to create one.
+    Heading,
+    /// The heading named by `Before`/`After` is not in the note.
+    Anchor(String),
+}
+
+fn find_heading(lines: &[&str], heading: &str) -> Option<(usize, u8)> {
+    let key = section_key(heading);
+    if key.is_empty() {
+        return None;
     }
-    atomic_write(path, &out)?;
-    Ok(idx)
+    lines.iter().enumerate().find_map(|(i, l)| match crate::parse::parse_line(l) {
+        crate::parse::Line::Heading { level, .. } if section_key(l) == key => Some((i, level)),
+        _ => None,
+    })
+}
+
+/// Rewrite one heading's block in `text` as a unit: the heading line through
+/// the last content line before the next heading of the same or higher
+/// level (or the end of the note). Trailing blank lines and rules belong to
+/// the boundary and survive a replace; a delete takes them too, so no double
+/// gap is left behind. The section is the first heading matching `heading`
+/// (hashes, `==` highlights, and case ignored, like [`append_to_section`]).
+/// A created heading is `heading` verbatim when it brings its own `#` marks,
+/// `## heading` otherwise, set off by one blank line from its neighbours.
+/// Line endings and the file's trailing-newline convention are preserved.
+pub fn edit_section_in_text(
+    text: &str,
+    heading: &str,
+    edit: &SectionEdit,
+) -> Result<SectionChange, SectionMiss> {
+    let lines: Vec<&str> = text.lines().collect();
+    let crlf = text.contains("\r\n");
+    let ending = if crlf { "\r\n" } else { "\n" };
+    let found = find_heading(&lines, heading);
+    let body_lines = |body: &str| -> Vec<String> {
+        body.trim_matches(['\n', '\r'])
+            .lines()
+            .map(|l| l.trim_end_matches('\r').to_string())
+            .collect()
+    };
+    // The block to write, the line it starts at, and how many lines it replaces.
+    let (block, at, removed): (Vec<String>, usize, usize) = match (found, edit) {
+        (Some((idx, level)), SectionEdit::Replace { body, .. }) => {
+            let end = section_end_insert_idx(&lines, idx, level);
+            let mut block = vec![lines[idx].to_string()];
+            block.extend(body_lines(body));
+            (block, idx, end - idx)
+        }
+        (Some((idx, level)), SectionEdit::Delete) => {
+            let end = lines
+                .iter()
+                .enumerate()
+                .skip(idx + 1)
+                .find_map(|(i, l)| match crate::parse::parse_line(l) {
+                    crate::parse::Line::Heading { level: lv, .. } if lv <= level => Some(i),
+                    _ => None,
+                })
+                .unwrap_or(lines.len());
+            (Vec::new(), idx, end - idx)
+        }
+        (None, SectionEdit::Delete) | (None, SectionEdit::Replace { create: None, .. }) => {
+            return Err(SectionMiss::Heading);
+        }
+        (None, SectionEdit::Replace { body, create: Some(place) }) => {
+            let heading_line = if heading.trim_start().starts_with('#') {
+                heading.trim().to_string()
+            } else {
+                format!("## {}", heading.trim())
+            };
+            let at = match place {
+                SectionPlace::End => lines.len(),
+                SectionPlace::Before(anchor) => {
+                    find_heading(&lines, anchor)
+                        .ok_or_else(|| SectionMiss::Anchor(anchor.clone()))?
+                        .0
+                }
+                SectionPlace::After(anchor) => {
+                    let (i, lv) = find_heading(&lines, anchor)
+                        .ok_or_else(|| SectionMiss::Anchor(anchor.clone()))?;
+                    section_end_insert_idx(&lines, i, lv)
+                }
+            };
+            let is_blank = |i: usize| lines.get(i).is_none_or(|l| l.trim().is_empty());
+            let mut block = Vec::new();
+            if at > 0 && !is_blank(at - 1) {
+                block.push(String::new());
+            }
+            block.push(heading_line);
+            block.extend(body_lines(body));
+            if at < lines.len() && !is_blank(at) {
+                block.push(String::new());
+            }
+            (block, at, 0)
+        }
+    };
+    let creating = found.is_none();
+    let unchanged = !creating
+        && matches!(edit, SectionEdit::Replace { .. })
+        && lines[at..at + removed].iter().copied().eq(block.iter().map(String::as_str));
+    if unchanged {
+        let start: usize = lines[..at].iter().map(|l| l.len() + ending.len()).sum();
+        let end = start + block.iter().map(|l| l.len() + ending.len()).sum::<usize>();
+        return Ok(SectionChange {
+            text: text.to_string(),
+            action: SectionAction::Unchanged,
+            heading: lines[at].to_string(),
+            line: at,
+            start,
+            end: end.min(text.len()),
+        });
+    }
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut start = 0;
+    let mut end = 0;
+    let push_block = |out: &mut String, start: &mut usize, end: &mut usize| {
+        *start = out.len();
+        for b in &block {
+            out.push_str(b);
+            out.push_str(ending);
+        }
+        *end = out.len();
+    };
+    for (i, line) in lines.iter().enumerate() {
+        if i == at {
+            push_block(&mut out, &mut start, &mut end);
+        }
+        if i >= at && i < at + removed {
+            continue;
+        }
+        out.push_str(line);
+        out.push_str(ending);
+    }
+    if at >= lines.len() {
+        push_block(&mut out, &mut start, &mut end);
+    }
+    if !text.ends_with('\n') && !text.is_empty() {
+        while out.ends_with('\n') || out.ends_with('\r') {
+            out.pop();
+        }
+        end = end.min(out.len());
+    }
+    let mut heading_line_idx = at;
+    // A created block may be set off by spacer lines; the range reported is
+    // the heading and body only, so it means the same thing as after a replace.
+    if creating && block.first().is_some_and(|b| b.is_empty()) {
+        heading_line_idx += 1;
+        start += ending.len();
+    }
+    if creating && block.len() > 1 && block.last().is_some_and(|b| b.is_empty()) {
+        end -= ending.len();
+    }
+    let action = if creating {
+        SectionAction::Created
+    } else if matches!(edit, SectionEdit::Delete) {
+        SectionAction::Deleted
+    } else {
+        SectionAction::Replaced
+    };
+    let heading_text = match action {
+        SectionAction::Deleted => lines[at].to_string(),
+        _ => block.iter().find(|b| !b.is_empty()).cloned().unwrap_or_default(),
+    };
+    Ok(SectionChange {
+        text: out,
+        action,
+        heading: heading_text,
+        line: heading_line_idx,
+        start,
+        end: if action == SectionAction::Deleted { start } else { end },
+    })
+}
+
+/// Apply [`edit_section_in_text`] to a note on disk: read, compute, and
+/// write atomically only when something changes, so an unchanged block is
+/// never rewritten (no sync churn, nothing to log). A missing file counts as
+/// empty when the edit creates the section. The outer error is I/O; the
+/// inner one is the section miss.
+pub fn edit_section_on_disk(
+    path: &Path,
+    heading: &str,
+    edit: &SectionEdit,
+) -> io::Result<Result<SectionChange, SectionMiss>> {
+    let _lock = lock_for_create(path)?;
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e)
+            if e.kind() == io::ErrorKind::NotFound
+                && matches!(edit, SectionEdit::Replace { create: Some(_), .. }) =>
+        {
+            String::new()
+        }
+        Err(e) => return Err(e),
+    };
+    let change = match edit_section_in_text(&text, heading, edit) {
+        Ok(change) => change,
+        Err(miss) => return Ok(Err(miss)),
+    };
+    if change.action != SectionAction::Unchanged {
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        atomic_write(path, &change.text)?;
+    }
+    Ok(Ok(change))
 }
 
 /// Insert `block` (which may span lines) at the very top of `date`'s daily
@@ -703,6 +1016,7 @@ pub fn insert_block_at_top(
     template_rule: &str,
 ) -> io::Result<PathBuf> {
     let path = ensure_day_note(root, date, template_rule)?;
+    let _lock = lock_for_create(&path)?;
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
@@ -735,6 +1049,7 @@ pub fn insert_block_under_heading(
     expected: &str,
     block: &str,
 ) -> io::Result<Option<usize>> {
+    let _lock = NoteLock::acquire(path)?;
     let text = fs::read_to_string(path)?;
     let lines: Vec<&str> = text.lines().collect();
     let idx = if lines.get(heading_line_idx).is_some_and(|l| *l == expected) {
@@ -836,6 +1151,7 @@ pub fn join_lines_on_disk(
     expected_second: &str,
     replacement: &str,
 ) -> io::Result<Option<usize>> {
+    let _lock = NoteLock::acquire(path)?;
     let text = fs::read_to_string(path)?;
     let Some((new_text, idx)) =
         join_lines_in_text(&text, first_idx, expected_first, expected_second, replacement)
@@ -857,6 +1173,7 @@ pub fn move_line_on_disk(
     expected: &str,
     before_idx: usize,
 ) -> io::Result<Option<usize>> {
+    let _lock = NoteLock::acquire(path)?;
     let text = fs::read_to_string(path)?;
     let lines: Vec<&str> = text.lines().collect();
     let from = if lines.get(from_idx).is_some_and(|l| *l == expected) {
@@ -904,6 +1221,7 @@ pub fn reschedule_task_on_disk(
     expected: &str,
     due: NaiveDate,
 ) -> io::Result<bool> {
+    let _lock = NoteLock::acquire(path)?;
     let text = fs::read_to_string(path)?;
     let Some((new_text, _)) = edit_line_in_text(&text, line_idx, expected, |line| {
         crate::tasks::reschedule_task_line(line, due)
@@ -920,6 +1238,7 @@ pub fn reschedule_task_on_disk(
 /// written. The write is atomic (temp file + rename). Returns whether a
 /// change was applied.
 pub fn toggle_task_on_disk(path: &Path, line_idx: usize, expected: &str) -> io::Result<bool> {
+    let _lock = NoteLock::acquire(path)?;
     let text = fs::read_to_string(path)?;
     let Some(new_text) = toggle_task_in_text(&text, line_idx, expected) else {
         return Ok(false);
@@ -932,6 +1251,49 @@ pub fn toggle_task_on_disk(path: &Path, line_idx: usize, expected: &str) -> io::
 mod tests {
     use super::*;
     use crate::ScratchRoot;
+
+    #[test]
+    fn text_save_merges_external_edits_and_preserves_conflicts() {
+        let root = ScratchRoot::new("text-save");
+        let base = "first = 1;\n\nsecond = 1;\n";
+        let path = root.write("Notes/example.rs", "first = 2;\n\nsecond = 1;\n");
+        let saved = save_text(&path, base, "first = 1;\n\nsecond = 2;\n").unwrap();
+        assert_eq!(saved.text, "first = 2;\n\nsecond = 2;\n");
+        assert!(saved.conflict_copy.is_none());
+        assert_eq!(fs::read_to_string(&path).unwrap(), saved.text);
+        let local = "first = 3;\n\nsecond = 1;\n";
+        let saved = save_text(&path, base, local).unwrap();
+        assert_eq!(fs::read_to_string(saved.conflict_copy.unwrap()).unwrap(), local);
+        assert_eq!(fs::read_to_string(path).unwrap(), "first = 2;\n\nsecond = 2;\n");
+    }
+
+    #[test]
+    fn text_save_keeps_crlf_and_refuses_an_unreadable_original() {
+        let root = ScratchRoot::new("text-save-crlf");
+        let path = root.write("Notes/example.txt", "first\r\nremote\r\n");
+        let saved = save_text(&path, "first\r\n", "first\r\nlocal").unwrap();
+        assert_eq!(saved.text, "first\r\nremote\r\nlocal");
+        fs::write(&path, [0xff]).unwrap();
+        assert!(save_text(&path, "first", "local").is_err());
+        assert_eq!(fs::read(path).unwrap(), [0xff]);
+    }
+
+    #[test]
+    fn the_phone_save_keeps_both_insertions_and_the_desktop_save_is_unchanged() {
+        let root = ScratchRoot::new("text-save-keep-both");
+        let base = "### Daily Notes\nMorning walk\n";
+        let disk = "### Daily Notes\nMorning walk\nFrom the desk\nStand-up at ten\n";
+        let local = "### Daily Notes\nMorning walk\nStand-up at ten\nBought stamps\n";
+        let path = root.write("Calendar/20261110.md", disk);
+        let saved = save_note_text(&path, base, local).unwrap();
+        assert_eq!(saved.text, "### Daily Notes\nMorning walk\nFrom the desk\nStand-up at ten\nBought stamps\n");
+        assert!(saved.conflict_copy.is_none());
+        assert_eq!(fs::read_to_string(&path).unwrap(), saved.text);
+
+        let path = root.write("Calendar/20261111.md", disk);
+        let saved = save_text(&path, base, local).unwrap();
+        assert_eq!(saved.text, crate::merge3(base, disk, local).text);
+    }
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).expect("valid date")
@@ -1024,6 +1386,105 @@ mod tests {
         // An empty section inserts directly after its heading.
         let empty: Vec<&str> = vec!["## A", "## B", "text"];
         assert_eq!(section_insert_idx(&empty, "A"), Some(1));
+    }
+
+    #[test]
+    fn section_edit_replaces_one_block_and_keeps_the_gap() {
+        let text = "### Tasks\n* one\n\n### ==Seat==\n- old a\n- old b\n\n### Local Agent\n- theirs\n";
+        let edit = SectionEdit::Replace { body: "- new a\n".into(), create: None };
+        let change = edit_section_in_text(text, "seat", &edit).expect("found");
+        assert_eq!(change.action, SectionAction::Replaced);
+        assert_eq!(change.text, "### Tasks\n* one\n\n### ==Seat==\n- new a\n\n### Local Agent\n- theirs\n");
+        assert_eq!(change.heading, "### ==Seat==");
+        assert_eq!(change.line, 3);
+        assert_eq!(&change.text[change.start..change.end], "### ==Seat==\n- new a\n");
+        // Same body again: nothing to write.
+        let again = edit_section_in_text(&change.text, "### Seat", &SectionEdit::Replace { body: "- new a".into(), create: None })
+            .expect("found");
+        assert_eq!(again.action, SectionAction::Unchanged);
+        assert_eq!(again.text, change.text);
+        assert_eq!(&again.text[again.start..again.end], "### ==Seat==\n- new a\n");
+        // A deeper heading is part of the block; the last section runs to the end.
+        let nested = "## A\n#### Sub\nx\n## B\ny";
+        let c = edit_section_in_text(nested, "A", &SectionEdit::Replace { body: "z".into(), create: None }).expect("found");
+        assert_eq!(c.text, "## A\nz\n## B\ny");
+        let c = edit_section_in_text(nested, "B", &SectionEdit::Replace { body: "".into(), create: None }).expect("found");
+        assert_eq!(c.text, "## A\n#### Sub\nx\n## B");
+    }
+
+    #[test]
+    fn section_edit_creates_before_after_or_at_end() {
+        let text = "### Tasks\n* one\n\n### Local Agent\n- theirs\n";
+        let before = SectionEdit::Replace {
+            body: "- a".into(),
+            create: Some(SectionPlace::Before("local agent".into())),
+        };
+        let c = edit_section_in_text(text, "### Seat", &before).expect("placed");
+        assert_eq!(c.action, SectionAction::Created);
+        assert_eq!(c.text, "### Tasks\n* one\n\n### Seat\n- a\n\n### Local Agent\n- theirs\n");
+        assert_eq!(c.line, 3);
+        assert_eq!(&c.text[c.start..c.end], "### Seat\n- a\n");
+        let after = SectionEdit::Replace { body: "- a".into(), create: Some(SectionPlace::After("Tasks".into())) };
+        let c = edit_section_in_text(text, "Seat", &after).expect("placed");
+        assert_eq!(c.text, "### Tasks\n* one\n\n## Seat\n- a\n\n### Local Agent\n- theirs\n");
+        assert_eq!(c.line, 3);
+        let at_end = SectionEdit::Replace { body: "- a".into(), create: Some(SectionPlace::End) };
+        let c = edit_section_in_text(text, "### Seat", &at_end).expect("placed");
+        assert_eq!(c.text, "### Tasks\n* one\n\n### Local Agent\n- theirs\n\n### Seat\n- a\n");
+        assert_eq!(c.line, 6);
+        assert_eq!(&c.text[c.start..c.end], "### Seat\n- a\n");
+        // An empty note gets just the block.
+        let c = edit_section_in_text("", "### Seat", &at_end).expect("placed");
+        assert_eq!(c.text, "### Seat\n- a\n");
+        // A missing anchor or a missing heading without create is a miss.
+        let missing = SectionEdit::Replace { body: "x".into(), create: Some(SectionPlace::Before("Nope".into())) };
+        assert_eq!(edit_section_in_text(text, "Seat", &missing), Err(SectionMiss::Anchor("Nope".into())));
+        let plain = SectionEdit::Replace { body: "x".into(), create: None };
+        assert_eq!(edit_section_in_text(text, "Seat", &plain), Err(SectionMiss::Heading));
+    }
+
+    #[test]
+    fn section_edit_deletes_the_block_with_its_gap() {
+        let text = "### Tasks\n* one\n\n### Seat\n- a\n\n### Local Agent\n- theirs\n";
+        let c = edit_section_in_text(text, "seat", &SectionEdit::Delete).expect("found");
+        assert_eq!(c.action, SectionAction::Deleted);
+        assert_eq!(c.text, "### Tasks\n* one\n\n### Local Agent\n- theirs\n");
+        assert_eq!(c.heading, "### Seat");
+        assert_eq!((c.line, c.start, c.end), (3, 17, 17));
+        let c = edit_section_in_text(text, "Local Agent", &SectionEdit::Delete).expect("found");
+        assert_eq!(c.text, "### Tasks\n* one\n\n### Seat\n- a\n\n");
+        assert_eq!(edit_section_in_text(text, "Nope", &SectionEdit::Delete), Err(SectionMiss::Heading));
+        // CRLF files stay CRLF.
+        let crlf = "## A\r\nx\r\n\r\n## B\r\ny\r\n";
+        let c = edit_section_in_text(crlf, "A", &SectionEdit::Replace { body: "p\nq".into(), create: None }).expect("found");
+        assert_eq!(c.text, "## A\r\np\r\nq\r\n\r\n## B\r\ny\r\n");
+    }
+
+    #[test]
+    fn section_edit_on_disk_writes_only_when_changed() {
+        let root = ScratchRoot::new("section-disk");
+        let path = root.write("Calendar/20260921.md", "### Tasks\n* one\n\n### Local Agent\n- theirs\n");
+        let edit = SectionEdit::Replace {
+            body: "- Working on: x".into(),
+            create: Some(SectionPlace::Before("Local Agent".into())),
+        };
+        let c = edit_section_on_disk(&path, "### Seat", &edit).expect("io").expect("placed");
+        assert_eq!(c.action, SectionAction::Created);
+        let written = fs::read_to_string(&path).expect("read");
+        assert_eq!(written, "### Tasks\n* one\n\n### Seat\n- Working on: x\n\n### Local Agent\n- theirs\n");
+        let before = fs::metadata(&path).expect("meta").modified().expect("mtime");
+        let c = edit_section_on_disk(&path, "Seat", &edit).expect("io").expect("found");
+        assert_eq!(c.action, SectionAction::Unchanged);
+        assert_eq!(fs::metadata(&path).expect("meta").modified().expect("mtime"), before);
+        // A missing file is created when the edit creates the section.
+        let fresh = root.0.join("Notes/Fresh.md");
+        let c = edit_section_on_disk(&fresh, "Log", &SectionEdit::Replace { body: "first".into(), create: Some(SectionPlace::End) })
+            .expect("io")
+            .expect("placed");
+        assert_eq!(c.action, SectionAction::Created);
+        assert_eq!(fs::read_to_string(&fresh).expect("read"), "## Log\nfirst\n");
+        // A missing file without create is an I/O error, not a silent miss.
+        assert!(edit_section_on_disk(&root.0.join("Notes/None.md"), "Log", &SectionEdit::Delete).is_err());
     }
 
     #[test]
@@ -1428,6 +1889,11 @@ mod tests {
         let bare = root.write("Calendar/20260807.md", "* a\n* b");
         assert_eq!(remove_block_lines(&bare, "* b").expect("io"), Some(1));
         assert_eq!(fs::read_to_string(&bare).expect("read"), "* a");
+        for text in ["", "* moved\n", "unrelated"] {
+            fs::write(&path, text).unwrap();
+            assert_eq!(remove_block_lines(&path, "* moved\n\tsub").unwrap(), None);
+            assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        }
     }
 
     #[test]

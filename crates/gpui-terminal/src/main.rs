@@ -162,7 +162,7 @@ fn main() -> Result<()> {
                 |window, cx| {
                     // Create the terminal view
                     let terminal = cx.new(|cx| {
-                        TerminalView::new(writer, reader, config, cx)
+                        TerminalView::new(writer, reader, config, window, cx)
                             .with_resize_callback(resize_callback)
                             .with_exit_callback(|_window, cx| {
                                 cx.quit();

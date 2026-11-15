@@ -42,6 +42,7 @@ pub fn log_activity(root: &Path, entry: &ActivityEntry) -> io::Result<()> {
     let mut line = serde_json::to_string(entry)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     line.push('\n');
+    let _lock = crate::NoteLock::acquire(&path)?;
     let mut file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
     file.write_all(line.as_bytes())
 }

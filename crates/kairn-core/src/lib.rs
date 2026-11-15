@@ -16,12 +16,16 @@
 //! bracketed.
 
 pub mod activity;
+mod atomic_file;
 pub mod blocks;
 pub mod buffer;
+pub mod document;
+pub mod file_lock;
 pub mod library;
 pub mod links;
 pub mod merge;
 pub mod parse;
+pub mod recovery;
 pub mod settings;
 pub mod tasks;
 pub mod template;
@@ -33,10 +37,13 @@ pub mod write;
 pub use activity::*;
 pub use blocks::*;
 pub use buffer::*;
+pub use document::*;
+pub use file_lock::*;
 pub use library::*;
 pub use links::*;
 pub use merge::*;
 pub use parse::*;
+pub use recovery::*;
 pub use tasks::*;
 pub use template::*;
 pub use themes::*;

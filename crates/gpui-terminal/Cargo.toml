@@ -19,3 +19,7 @@ flume = "0.12"
 [dependencies.arboard]
 version = "3"
 features = ["wayland-data-control"]
+
+[dev-dependencies]
+gpui = { version = "0.2.2", features = ["test-support"] }
+tempfile = "3"

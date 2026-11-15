@@ -43,12 +43,17 @@ pub fn daily_template_body(root: &Path) -> String {
 /// destroy it.
 pub fn save_daily_template(root: &Path, body: &str) -> std::io::Result<()> {
     let path = daily_template_path(root);
-    let existing = fs::read_to_string(&path).unwrap_or_default();
-    let frontmatter = &existing[..existing.len() - strip_frontmatter(&existing).len()];
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    fs::write(&path, format!("{frontmatter}{body}"))
+    let lock = crate::NoteLock::acquire(&path)?;
+    let existing = match lock.read_text() {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    let frontmatter = &existing[..existing.len() - strip_frontmatter(&existing).len()];
+    lock.write_text(&format!("{frontmatter}{body}"))
 }
 
 /// The daily-note template body to seed a new day with: the same read and
@@ -167,6 +172,16 @@ mod tests {
             std::fs::read_to_string(root.0.join("Notes/@Templates/Daily.txt")).expect("read"),
             "new\n"
         );
+    }
+
+    #[test]
+    fn saving_an_unreadable_template_preserves_the_original_bytes() {
+        let root = ScratchRoot::new("template-unreadable");
+        let path = root.write("Notes/@Templates/Daily.md", "");
+        let original = b"---\ntitle: Daily\n---\n\xff";
+        fs::write(&path, original).unwrap();
+        assert!(save_daily_template(&root.0, "replacement\n").is_err());
+        assert_eq!(fs::read(path).unwrap(), original);
     }
 
     #[test]

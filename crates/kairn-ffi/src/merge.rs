@@ -24,9 +24,31 @@ pub fn merge3(base: String, disk: String, ours: String) -> MergeResult {
     }
 }
 
+/// Slot the lines a user typed over a placeholder note (`seed`, a blank day's
+/// template, edited into `edited`) into the real note that has since arrived
+/// (`disk`), each under its heading, instead of merging two unrelated versions.
+/// An untouched or empty `edited` returns `disk` unchanged. See
+/// [`kairn_core::adopt_seeded`].
+#[uniffi::export]
+pub fn adopt_seeded_text(seed: String, edited: String, disk: String) -> String {
+    kairn_core::adopt_seeded(&seed, &edited, &disk)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adopt_seeded_text_places_typed_lines_under_their_heading() {
+        let seed = "### Todays Tasks\n\n### Daily Notes\n\n";
+        let edited = "### Todays Tasks\n\n### Daily Notes\n* Buy stamps\n\n";
+        let disk = "### Daily Notes\nMorning walk\n\n### Desk\n- Sorted the post\n";
+        assert_eq!(
+            adopt_seeded_text(seed.into(), edited.into(), disk.into()),
+            "### Daily Notes\nMorning walk\n* Buy stamps\n\n### Desk\n- Sorted the post\n"
+        );
+        assert_eq!(adopt_seeded_text(seed.into(), seed.into(), disk.into()), disk);
+    }
 
     #[test]
     fn non_conflicting_edits_combine() {
@@ -40,5 +62,24 @@ mod tests {
         let r = merge3("x\n".into(), "disk\n".into(), "ours\n".into());
         assert_eq!(r.text, "disk\n");
         assert_eq!(r.conflicts, vec!["ours".to_string()]);
+    }
+}
+
+
+#[derive(uniffi::Record)]
+pub struct NoteSaveResult {
+    pub saved: bool,
+    pub text: String,
+    pub conflict_copy: Option<String>,
+    pub error: Option<String>,
+}
+
+/// The shared lock, conflict preservation and durable write are one operation.
+#[uniffi::export]
+pub fn save_note_text(path: String, baseline: String, text: String) -> NoteSaveResult {
+    match kairn_core::write::save_note_text(std::path::Path::new(&path), &baseline, &text) {
+        Ok(saved) => NoteSaveResult { saved: true, text: saved.text,
+            conflict_copy: saved.conflict_copy.map(|p| p.to_string_lossy().into_owned()), error: None },
+        Err(e) => NoteSaveResult { saved: false, text, conflict_copy: None, error: Some(e.to_string()) },
     }
 }

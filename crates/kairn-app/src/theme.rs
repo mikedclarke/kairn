@@ -219,7 +219,8 @@ impl KairnTheme {
 
 /// Built-in themes offered in the picker, in display order. Menlo (the
 /// fresh-install default) is a full embedded theme spec, fonts and
-/// terminal ramp included. Sage and Sage Light are the original sage/amber
+/// terminal ramp included; Menlo Black is the same spec on a true-black
+/// page for OLED screens. Sage and Sage Light are the original sage/amber
 /// base palettes; they keep the historical "dark"/"light" ids so stored
 /// settings keep resolving. The rest are the dark base with a different
 /// accent family, Ocean additionally swapping the base's olive-tinted
@@ -227,6 +228,7 @@ impl KairnTheme {
 /// Ids are stable (settings store them); names are shown.
 pub const BUILTIN_THEMES: &[(&str, &str)] = &[
     ("menlo", "Menlo"),
+    ("menlo-black", "Menlo Black"),
     ("ocean", "Ocean"),
     ("dark", "Sage"),
     ("light", "Sage Light"),
@@ -238,12 +240,21 @@ pub const BUILTIN_THEMES: &[(&str, &str)] = &[
 /// files; a preset lookup shadows any vault theme with the same id.
 const MENLO_SPEC: &str = include_str!("themes/menlo.json");
 
+/// Menlo Black's full spec: Menlo's colours and fonts with a #000000 page,
+/// near-black panels, a lifted `faint` and a black `on_amber`.
+const MENLO_BLACK_SPEC: &str = include_str!("themes/menlo-black.json");
+
 /// Resolve a built-in preset id to its theme, or `None` for anything that
 /// isn't one (a base mode or a `.kairn/themes` file id).
 fn preset(id: &str) -> Option<KairnTheme> {
     if id == "menlo" {
         let spec: ThemeSpec =
             serde_json::from_str(MENLO_SPEC).expect("embedded menlo theme parses");
+        return Some(KairnTheme::from_spec(&spec));
+    }
+    if id == "menlo-black" {
+        let spec: ThemeSpec =
+            serde_json::from_str(MENLO_BLACK_SPEC).expect("embedded menlo black theme parses");
         return Some(KairnTheme::from_spec(&spec));
     }
     let (accent, amber) = match id {
@@ -542,6 +553,21 @@ mod tests {
         assert_eq!(t.mode, Mode::Dark);
         assert_eq!(t.editor_font.as_ref().map(|f| f.as_ref()), Some("Menlo"));
         assert_eq!(t.mono_font.as_ref(), "Menlo");
+    }
+
+    #[test]
+    fn menlo_black_follows_menlo_and_parses_on_black() {
+        assert_eq!(BUILTIN_THEMES[1], ("menlo-black", "Menlo Black"));
+        let spec: ThemeSpec =
+            serde_json::from_str(MENLO_BLACK_SPEC).expect("embedded menlo black theme parses");
+        assert_eq!(spec.name, "Menlo Black");
+        let t = KairnTheme::from_spec(&spec);
+        assert_eq!(t.mode, Mode::Dark);
+        assert_eq!(t.bg, c(0x000000));
+        assert_eq!(t.term_bg, c(0x000000));
+        assert_eq!(t.on_amber, c(0x000000));
+        assert_eq!(t.editor_font.as_ref().map(|f| f.as_ref()), Some("Menlo"));
+        assert!(preset("menlo-black").is_some_and(|p| p.bg == c(0x000000)));
     }
 
     #[test]

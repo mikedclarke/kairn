@@ -65,4 +65,10 @@ pub trait Transport: Send + Sync {
     /// `POST /ack {cursor}`: report the last seq fully applied, so the server can
     /// tell whether this device is behind (push, pruning safety — spec §7, §11).
     fn ack(&self, cursor: Seq) -> TransportResult<()>;
+
+    /// Drop any pooled connections so the next request opens a fresh one. The
+    /// engine calls this when its worker starts, because a socket pooled before
+    /// the host was suspended (an iOS app sent to the background) can sit dead
+    /// until a timeout. Transports without a pool keep the default no-op.
+    fn reset_connections(&self) {}
 }

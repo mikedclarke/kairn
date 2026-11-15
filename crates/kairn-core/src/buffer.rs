@@ -530,8 +530,20 @@ impl NoteBuffer {
     /// Returns the (clamped) cursor and any conflicting local hunks the
     /// caller must surface.
     pub fn reconcile(&mut self, disk: &str, cursor: usize) -> (usize, Vec<String>) {
+        self.try_reconcile(disk, cursor, |_| Ok::<_, std::convert::Infallible>(()))
+            .unwrap_or_else(|never| match never {})
+    }
+
+    /// Preserve the full local text before applying a conflicting merge.
+    /// If preservation fails, text, baseline, and undo history stay unchanged.
+    pub fn try_reconcile<E>(
+        &mut self,
+        disk: &str,
+        cursor: usize,
+        preserve: impl FnOnce(&str) -> Result<(), E>,
+    ) -> Result<(usize, Vec<String>), E> {
         if disk == self.baseline {
-            return (floor_boundary(&self.text, cursor), Vec::new());
+            return Ok((floor_boundary(&self.text, cursor), Vec::new()));
         }
         if self.seeded {
             // The file changed under an untouched seed. Still blank: keep
@@ -546,9 +558,12 @@ impl NoteBuffer {
                 self.undo.clear();
                 self.redo.clear();
             }
-            return (floor_boundary(&self.text, cursor), Vec::new());
+            return Ok((floor_boundary(&self.text, cursor), Vec::new()));
         }
         let merged = merge3(&self.baseline, disk, &self.text);
+        if !merged.conflicts.is_empty() {
+            preserve(&self.text)?;
+        }
         if merged.text != self.text {
             let old = std::mem::replace(&mut self.text, merged.text);
             self.revision += 1;
@@ -562,7 +577,7 @@ impl NoteBuffer {
             });
         }
         self.baseline = disk.to_string();
-        (floor_boundary(&self.text, cursor), merged.conflicts)
+        Ok((floor_boundary(&self.text, cursor), merged.conflicts))
     }
 }
 
@@ -969,15 +984,13 @@ mod tests {
     }
 
     #[test]
-    fn typing_on_the_last_line_during_an_append_conflicts_honestly() {
-        // Both sides changed the end of the file: line-granular merge calls
-        // this a collision, keeps the agent's append, and hands the typed
-        // text back rather than guessing an interleave.
+    fn typing_on_the_last_line_during_an_append_keeps_both() {
         let mut b = NoteBuffer::new("a\n");
         b.edit(2..2, "typed", 2, 1000);
         let (_, conflicts) = b.reconcile("a\nagent\n", 7);
-        assert_eq!(b.text(), "a\nagent\n");
-        assert_eq!(conflicts, vec!["typed".to_string()]);
+        assert_eq!(b.text(), "a\nagent\ntyped");
+        assert!(conflicts.is_empty());
+        assert!(b.is_dirty());
     }
 
     #[test]

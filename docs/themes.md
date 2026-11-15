@@ -1,8 +1,10 @@
 # Theme files
 
-Kairn ships two built-in themes, Dark and Light. Custom themes are JSON
-files in `.kairn/themes/` inside the notes folder, so they sync with the
-vault. Pick them in Settings → Theme; the file stem is the theme's id.
+Kairn ships seven built-in themes: Menlo, Menlo Black (Menlo on a
+true-black page for OLED screens), Ocean, Sage, Sage Light, Rose and
+Forest. Custom themes are JSON files in `.kairn/themes/` inside the notes
+folder, so they sync with the vault. Pick them in Settings → Theme; the
+file stem is the theme's id.
 
 A theme names a `mode` ("dark" or "light") and overrides any subset of the
 palette, fonts, and terminal colors. Everything left out falls back to the
@@ -57,7 +59,7 @@ Field notes:
 - `colors.highlight` is the `==highlight==` background, alpha respected;
   when unset it derives from `amber` at 28% over whatever the file set.
 - `colors.heading` colors markdown headings and the note masthead;
-  unset follows `text`.
+  unset follows `accent`.
 - `fonts` mirror the Settings → Theme pickers; a font set directly in
   settings wins over the theme file's choice. `editor_size` is the body
   size in px (clamped 9–32); headings scale with it.

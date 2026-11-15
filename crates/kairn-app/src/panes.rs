@@ -50,9 +50,19 @@ impl Workspace {
     }
 
     fn render_terminal_pane(&self, t: &KairnTheme, cx: &mut Context<Self>) -> impl IntoElement {
-        let pane = div().size_full().min_w(px(0.)).min_h(px(0.)).bg(t.term_bg);
+        let pane = div().id("terminal-pane").size_full().min_w(px(0.)).min_h(px(0.)).bg(t.term_bg);
         match self.sessions.get(self.active_session) {
-            Some(session) => pane.child(session.view.clone()),
+            Some(session) => {
+                let uri = session.view.read(cx).hovered_link().map(str::to_owned);
+                let diagnostics = session.view.read(cx).diagnostics_status();
+                pane.when_some(uri, |pane, uri| pane.tooltip(crate::ui::hover_hint(uri, None)))
+                    .flex().flex_col()
+                    .child(div().flex_1().min_h(px(0.)).child(session.view.clone()))
+                    .when_some(diagnostics, |pane, status| pane.child(
+                        div().px(px(8.)).py(px(4.)).text_size(t.ui_px(11.))
+                            .text_color(t.amber).child(status)
+                    ))
+            }
             None => pane.child(self.render_start_page(t, cx)),
         }
     }
@@ -517,7 +527,7 @@ impl Workspace {
         } else {
             note_frame(t, writing, masthead, badge, subline)
         };
-        if let Some(banner) = self.render_orphan_banner(t, cx) {
+        if let Some(banner) = self.render_save_error(t, cx) {
             note = note.child(banner);
         }
         for banner in self.render_conflict_banners(t, cx) {
@@ -666,7 +676,13 @@ impl Workspace {
                 // the open one ringed. This is the "pick image 1, 2 or 3"
                 // flow — click through, compare, tell the agent.
                 if self.library_siblings.len() > 1 {
-                    let mut strip = div().flex().flex_wrap().gap(px(8.));
+                    let mut strip = gpui::image_cache(crate::library_images::Thumbnails(
+                        (
+                            ElementId::from("library-thumbnails"),
+                            SharedString::from(path.parent().unwrap_or(&path).to_string_lossy().into_owned()),
+                        ).into(),
+                    ))
+                    .flex().flex_wrap().gap(px(8.));
                     for (i, sib) in self.library_siblings.iter().enumerate() {
                         let current = *sib == path;
                         let target = sib.clone();
@@ -703,6 +719,12 @@ impl Workspace {
                         );
                 }
                 body = body.child(facts_line).child(actions);
+                return gpui::image_cache(gpui::retain_all((
+                    ElementId::from("library-preview"),
+                    SharedString::from(path.to_string_lossy().into_owned()),
+                )))
+                .child(body)
+                .into_any_element();
             }
             FileKind::Text
                 if self
@@ -729,24 +751,13 @@ impl Workspace {
         body.into_any_element()
     }
 
-    /// A line edit whose target line vanished from the file before saving:
-    /// the typed text is shown until the user restores or dismisses it,
-    /// never silently dropped.
-    fn render_orphan_banner(
+    fn render_save_error(
         &self,
         t: &KairnTheme,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
-        let (_, text) = self.orphaned.as_ref()?;
-        let action = |label: &'static str, id: &'static str| {
-            let hover = t.text;
-            div()
-                .id(id)
-                .text_color(t.dim)
-                .cursor_pointer()
-                .hover(move |s| s.text_color(hover))
-                .child(label)
-        };
+        let error = self.note_editor.as_ref().and_then(|ed| ed.read(cx).lifecycle.error())
+            .or_else(|| self.library_text.as_ref().and_then(|ed| ed.lifecycle.error()))?;
         Some(
             div()
                 .mb(px(10.))
@@ -757,41 +768,21 @@ impl Workspace {
                 .border_color(t.amber.opacity(0.5))
                 .bg(t.amber.opacity(0.08))
                 .text_size(t.ui_px(12.))
+                .text_color(t.text)
+                .child(error.to_owned())
                 .child(
-                    div()
-                        .text_color(t.dim)
-                        .child("This line changed on disk before your edit could be saved:"),
-                )
-                .child(div().my(px(4.)).text_color(t.text).child(text.clone()))
-                .child(
-                    div()
-                        .flex()
-                        .gap(px(14.))
-                        .text_size(t.ui_px(11.5))
-                        .child(action("Put it back at the end of its note", "orphan-append").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.resolve_orphan(true, cx);
-                            }),
-                        ))
-                        .child(action("Discard", "orphan-discard").on_click(cx.listener(
-                            |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.resolve_orphan(false, cx);
-                            },
-                        ))),
+                    div().mt(px(4.))
+                        .child("Your edits are still open. Save again before leaving this note."),
                 ),
         )
     }
 
-    /// One banner per Syncthing conflict copy of the current note: without
-    /// this the conflicted version of a day is unreachable from every
-    /// surface, which is silent data loss after a sync clash.
     fn render_conflict_banners(
         &self,
         t: &KairnTheme,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
+        let library = matches!(self.view, PaneView::Library(_));
         self.conflicts
             .iter()
             .enumerate()
@@ -823,9 +814,11 @@ impl Workspace {
                     .border_color(t.amber.opacity(0.5))
                     .bg(t.amber.opacity(0.08))
                     .text_size(t.ui_px(12.))
-                    .child(div().text_color(t.dim).child(
-                        "A sync conflict copy of this note exists; it may hold changes this version is missing. Resolving moves the losing file to the vault trash.",
-                    ))
+                    .child(div().text_color(t.dim).child(if library {
+                        "A conflict copy preserves another version of this file."
+                    } else {
+                        "A conflict copy preserves another version of this note. Resolving moves the losing file to the vault trash."
+                    }))
                     .child(div().mt(px(2.)).text_color(t.faint).child(name.clone()))
                     .child(
                         h_flex()
@@ -833,25 +826,31 @@ impl Workspace {
                             .gap(px(14.))
                             .text_size(t.ui_px(11.5))
                             .child(action("Open the copy", ("conflict-open", i)).on_click(
-                                cx.listener(move |this, _, _, cx| {
+                                cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
-                                    this.open_note(open.clone(), cx);
+                                    if library {
+                                        this.open_library_file(open.clone(), window, cx);
+                                    } else {
+                                        this.open_note(open.clone(), cx);
+                                    }
                                 }),
                             ))
-                            .child(
-                                action("Keep this version", ("conflict-keep-mine", i))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.resolve_conflict(&keep_mine, false, cx);
-                                    })),
-                            )
-                            .child(
-                                action("Use the copy instead", ("conflict-keep-copy", i))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.resolve_conflict(&keep_copy, true, cx);
-                                    })),
-                            )
+                            .when(!library, |row| {
+                                row.child(
+                                    action("Keep this version", ("conflict-keep-mine", i))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.resolve_conflict(&keep_mine, false, cx);
+                                        })),
+                                )
+                                .child(
+                                    action("Use the copy instead", ("conflict-keep-copy", i))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.resolve_conflict(&keep_copy, true, cx);
+                                        })),
+                                )
+                            })
                             .child(action("Copy path", ("conflict-copy-path", i)).on_click(
                                 cx.listener(move |_, _, _, cx| {
                                     cx.stop_propagation();
@@ -1154,5 +1153,3 @@ fn spans_text(t: &KairnTheme, spans: &[Span]) -> StyledText {
 fn spans_el(t: &KairnTheme, spans: &[Span], base_color: gpui::Hsla) -> gpui::Div {
     div().text_color(base_color).child(spans_text(t, spans))
 }
-
-

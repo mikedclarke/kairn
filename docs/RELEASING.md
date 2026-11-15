@@ -4,6 +4,11 @@ The release unit is the whole workspace: the app, the `kairn` CLI, and kairn-cor
 one version, set once in the root `Cargo.toml` under `[workspace.package]`. The vendored
 gpui-terminal fork is versioned independently and is not released on its own.
 
+## Branches
+
+`main` is always the latest release. Work happens on the long-lived `dev` branch; a
+release merges `dev` into `main` and tags the `release: <version>` commit.
+
 ## During development
 
 User-facing changes are drafted in `release-notes/UNRELEASED.md` as they land, following
@@ -19,12 +24,13 @@ is the curated one.
    its empty template.
 4. Prepend the same notes to `CHANGELOG.md` under a `## <version> (YYYY-MM-DD)` heading.
 5. Build the artifacts (see Packaging below).
-6. Commit as `release: <version>`, tag `v<version>`, push with `--tags`.
+6. Commit as `release: <version>` on `dev`, merge `dev` into `main`, tag that commit
+   `v<version>`, and push `main`, `dev`, and the tag.
 7. Create a GitHub release from the tag with the notes as the body, attaching the
    `.dmg`, `.AppImage`, and `.deb`.
 
-Versions are semver-shaped but pre-1.0: minor bumps for feature releases, patch bumps
-for fix-only releases.
+Versions are semver-shaped but pre-1.0: each release normally bumps the patch digit by
+one; the minor digit moves only for a deliberate milestone.
 
 ## Packaging
 

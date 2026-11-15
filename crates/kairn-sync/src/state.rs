@@ -1,5 +1,5 @@
 //! The device's sync state (spec §6), kept in SQLite outside the vault so it
-//! never syncs and never pollutes the notes tree. Three tables:
+//! never syncs and never pollutes the notes tree.
 //!
 //! - `state(path, rev, baseline_hash)` — what this device last synced per file.
 //!   The `baseline_hash` is recorded for *every* file so local edits are
@@ -10,6 +10,7 @@
 //! - `scan_cache(path, size, mtime_ns, hash)` — a memo so the push scan only
 //!   re-hashes files whose metadata moved (spec §7: the steady state is cheap).
 //! - `meta(k, v)` — cursor, device id, server url, vault id.
+//! - `pending_pulls(path, seq, entry)` — the latest deferred change per path.
 //!
 //! Crash-safety (invariant §15.4): the baseline blob and the state row for one
 //! file move together in a single transaction, so a crash can never leave a
@@ -28,7 +29,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::hash::hash_bytes;
-use crate::types::{ContentHash, DeviceId, Rev, Seq, VaultPath};
+use crate::types::{ContentHash, DeviceId, JournalEntry, Rev, Seq, VaultPath};
 use crate::vaultio::HashCache;
 
 /// What this device last synced for one file.
@@ -57,6 +58,11 @@ CREATE TABLE IF NOT EXISTS scan_cache (
 CREATE TABLE IF NOT EXISTS meta (
     k TEXT PRIMARY KEY,
     v TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pending_pulls (
+    path  TEXT PRIMARY KEY,
+    seq   INTEGER NOT NULL,
+    entry TEXT NOT NULL
 );
 ";
 
@@ -133,6 +139,76 @@ impl StateStore {
     /// changes have landed on disk and been acked (invariant §15.4).
     pub fn set_cursor(&self, cursor: Seq) -> Result<()> {
         self.meta_set("cursor", &cursor.to_string())
+    }
+
+    pub fn pull_cursor(&self) -> Result<Seq> {
+        Ok(self.meta_get("pull_cursor")?.and_then(|s| s.parse().ok())
+            .unwrap_or(self.cursor()?))
+    }
+
+    pub fn pending_pulls(&self) -> Result<Vec<JournalEntry>> {
+        let mut stmt = self.conn.prepare("SELECT entry FROM pending_pulls ORDER BY seq")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    /// Commit delivery progress and its retry together. The recovery cursor
+    /// stays behind the oldest unresolved entry, even while later pages land.
+    pub fn record_pull(&self, entry: &JournalEntry, deferred: bool) -> Result<()> {
+        let read_cursor = self.pull_cursor()?.max(entry.seq);
+        let tx = self.conn.unchecked_transaction()?;
+        if deferred {
+            tx.execute(
+                "INSERT INTO pending_pulls (path, seq, entry) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(path) DO UPDATE SET seq = excluded.seq, entry = excluded.entry
+                 WHERE excluded.seq >= pending_pulls.seq",
+                params![entry.path.0, entry.seq, serde_json::to_string(entry)?],
+            )?;
+        } else {
+            tx.execute("DELETE FROM pending_pulls WHERE path = ?1 AND seq <= ?2",
+                params![entry.path.0, entry.seq])?;
+        }
+        let oldest: Option<Seq> = tx.query_row("SELECT MIN(seq) FROM pending_pulls", [], |row| row.get(0))?;
+        let cursor = oldest.map_or(read_cursor, |seq| read_cursor.min(seq.saturating_sub(1)));
+        for (key, value) in [("pull_cursor", read_cursor), ("cursor", cursor)] {
+            tx.execute(
+                "INSERT INTO meta (k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                params![key, value.to_string()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Record a whole batch of journal entries as still owed, in one
+    /// transaction: the same bookkeeping as [`Self::record_pull`] with
+    /// `deferred` set, for each entry. The read position moves to the highest
+    /// seq in the batch while the applied cursor stays below the oldest entry
+    /// still owed, so a crash before any of them is applied loses nothing.
+    pub fn record_pending_pulls(&self, entries: &[JournalEntry]) -> Result<()> {
+        let Some(highest) = entries.iter().map(|e| e.seq).max() else {
+            return Ok(());
+        };
+        let read_cursor = self.pull_cursor()?.max(highest);
+        let tx = self.conn.unchecked_transaction()?;
+        for entry in entries {
+            tx.execute(
+                "INSERT INTO pending_pulls (path, seq, entry) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(path) DO UPDATE SET seq = excluded.seq, entry = excluded.entry
+                 WHERE excluded.seq >= pending_pulls.seq",
+                params![entry.path.0, entry.seq, serde_json::to_string(entry)?],
+            )?;
+        }
+        let oldest: Option<Seq> = tx.query_row("SELECT MIN(seq) FROM pending_pulls", [], |row| row.get(0))?;
+        let cursor = oldest.map_or(read_cursor, |seq| read_cursor.min(seq.saturating_sub(1)));
+        for (key, value) in [("pull_cursor", read_cursor), ("cursor", cursor)] {
+            tx.execute(
+                "INSERT INTO meta (k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                params![key, value.to_string()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// The cursor last reported to the server, so a cycle that changed nothing
@@ -327,6 +403,11 @@ impl StateStore {
 
     // ---- scan memo -------------------------------------------------------
 
+    pub fn clear_scan_cache(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM scan_cache", [])?;
+        Ok(())
+    }
+
     /// Drop memo rows for paths no longer in the vault, so the memo can't grow
     /// without bound across a vault's lifetime of renames and deletes.
     pub fn prune_scan_cache(&self, keep: &HashSet<VaultPath>) -> Result<usize> {
@@ -432,6 +513,61 @@ mod tests {
         assert_eq!(s.cursor().unwrap(), 0);
         s.set_cursor(42).unwrap();
         assert_eq!(s.cursor().unwrap(), 42);
+        assert_eq!(s.pull_cursor().unwrap(), 42);
+    }
+
+    #[test]
+    fn retry_progress_is_atomic_and_only_newer_entries_supersede_a_retry() {
+        let s = StateStore::open_in_memory().unwrap();
+        let entry = JournalEntry {
+            seq: 1, path: vp("Notes/a.md"), rev: 1, hash: Some(hash_bytes(b"a")),
+            deleted: false, device_id: DeviceId("test".into()),
+        };
+        s.set_read_only(true).unwrap();
+        assert!(s.record_pull(&entry, true).is_err());
+        assert_eq!(s.pull_cursor().unwrap(), 0);
+        assert!(s.pending_pulls().unwrap().is_empty());
+        s.set_read_only(false).unwrap();
+        s.record_pull(&entry, true).unwrap();
+        let newer = JournalEntry { seq: 3, rev: 2, ..entry.clone() };
+        s.record_pull(&newer, true).unwrap();
+        s.record_pull(&entry, false).unwrap();
+        assert_eq!(s.pending_pulls().unwrap(), vec![newer.clone()]);
+        assert_eq!(s.pull_cursor().unwrap(), 3);
+        assert_eq!(s.cursor().unwrap(), 2);
+        s.record_pull(&newer, false).unwrap();
+        assert!(s.pending_pulls().unwrap().is_empty());
+        assert_eq!(s.cursor().unwrap(), 3);
+    }
+
+    #[test]
+    fn a_pending_batch_commits_atomically_and_holds_the_cursor_below_its_oldest_entry() {
+        let s = StateStore::open_in_memory().unwrap();
+        let entry = |seq, path: &str| JournalEntry {
+            seq, path: vp(path), rev: 1, hash: Some(hash_bytes(path.as_bytes())),
+            deleted: false, device_id: DeviceId("test".into()),
+        };
+        let batch = vec![entry(4, "Notes/a.md"), entry(9, "Notes/b.md"), entry(7, "Notes/c.md")];
+        s.set_read_only(true).unwrap();
+        assert!(s.record_pending_pulls(&batch).is_err());
+        assert!(s.pending_pulls().unwrap().is_empty());
+        assert_eq!(s.pull_cursor().unwrap(), 0);
+        s.set_read_only(false).unwrap();
+
+        s.record_pending_pulls(&batch).unwrap();
+        assert_eq!(s.pending_pulls().unwrap().len(), 3);
+        assert_eq!(s.pull_cursor().unwrap(), 9);
+        assert_eq!(s.cursor().unwrap(), 3);
+        // Applying the oldest lets the cursor move up to the next one owed.
+        s.record_pull(&batch[0], false).unwrap();
+        assert_eq!(s.cursor().unwrap(), 6);
+        s.record_pull(&batch[2], false).unwrap();
+        s.record_pull(&batch[1], false).unwrap();
+        assert_eq!(s.cursor().unwrap(), 9);
+        assert!(s.pending_pulls().unwrap().is_empty());
+        // An empty batch writes nothing.
+        s.record_pending_pulls(&[]).unwrap();
+        assert_eq!(s.cursor().unwrap(), 9);
     }
 
     /// A scratch directory that cleans itself up.

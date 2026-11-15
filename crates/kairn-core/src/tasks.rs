@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use chrono::NaiveDate;
 
 use crate::parse::{Line, Span, SpanKind, TaskState, bracket_state, parse_line};
-use crate::vault::{DayText, NoteText, VaultScan};
+use crate::vault::{DayText, NoteText, ScanError, ScanReport, VaultScan};
 
 /// One task found in a note, addressable for toggling.
 #[derive(Clone, Debug)]
@@ -38,11 +38,20 @@ pub fn due_token(spans: &[Span]) -> Option<NaiveDate> {
 
 /// Every open task across the whole vault: the daily notes, plus dated
 /// (`>date`) tasks from period and regular notes. Newest due date first.
-pub fn open_tasks_in_vault(root: &Path) -> Vec<TaskRef> {
+pub fn open_tasks_in_vault(root: &Path) -> ScanReport<TaskRef> {
+    let scan = scan_vault_tasks(root);
+    ScanReport { items: scan.open, errors: scan.errors }
+}
+
+pub fn scan_vault_tasks(root: &Path) -> TaskScan {
     let scan = VaultScan::new(root);
     let dailies = scan.read_dailies();
     let notes = scan.read_notes_cached(&mut Default::default());
-    open_tasks_in(&dailies, &notes)
+    let mut result = scan_tasks(&dailies.items, &notes.items);
+    result.errors = scan.errors;
+    result.errors.extend(dailies.errors);
+    result.errors.extend(notes.errors);
+    result
 }
 
 /// [`open_tasks_in_vault`] over files already read into memory, so one read
@@ -58,12 +67,12 @@ pub fn open_tasks_in(dailies: &[DayText], notes: &[NoteText]) -> Vec<TaskRef> {
 /// same population [`open_tasks_in_vault`] draws from — the daily notes,
 /// plus dated (`>date`) tasks from period and regular notes. Cancelled
 /// tasks are not done tasks and stay out.
-pub fn done_tasks_in_vault(root: &Path) -> Vec<TaskRef> {
+pub fn done_tasks_in_vault(root: &Path) -> ScanReport<TaskRef> {
     let scan = VaultScan::new(root);
     let dailies = scan.read_dailies();
     let notes = scan.read_notes_cached(&mut Default::default());
     let mut tasks = Vec::new();
-    for day in dailies.iter() {
+    for day in &dailies.items {
         for (line_idx, raw) in day.text.lines().enumerate() {
             let Line::Task { state: TaskState::Done, spans } = parse_line(raw) else {
                 continue;
@@ -79,7 +88,7 @@ pub fn done_tasks_in_vault(root: &Path) -> Vec<TaskRef> {
             });
         }
     }
-    for note in notes.iter() {
+    for note in &notes.items {
         for (line_idx, raw) in note.text.lines().enumerate() {
             let Line::Task { state: TaskState::Done, spans } = parse_line(raw) else {
                 continue;
@@ -96,7 +105,10 @@ pub fn done_tasks_in_vault(root: &Path) -> Vec<TaskRef> {
         }
     }
     tasks.sort_by(|a, b| b.due.cmp(&a.due).then_with(|| a.path.cmp(&b.path)));
-    tasks
+    let mut errors = scan.errors;
+    errors.extend(dailies.errors);
+    errors.extend(notes.errors);
+    ScanReport { items: tasks, errors }
 }
 
 /// Per-day task tallies for calendar indicators, by due date.
@@ -112,6 +124,7 @@ pub struct DayTaskStats {
 pub struct TaskScan {
     pub open: Vec<TaskRef>,
     pub day_stats: std::collections::HashMap<NaiveDate, DayTaskStats>,
+    pub errors: Vec<ScanError>,
 }
 
 /// One parse of every daily and note line, producing both the open-task
@@ -167,7 +180,7 @@ pub fn scan_tasks(dailies: &[DayText], notes: &[NoteText]) -> TaskScan {
         }
     }
     tasks.sort_by(|a, b| b.due.cmp(&a.due).then_with(|| a.path.cmp(&b.path)));
-    TaskScan { open: tasks, day_stats }
+    TaskScan { open: tasks, day_stats, errors: Vec::new() }
 }
 
 /// The filters the task views (and the CLI's `task list`) run over the open
@@ -299,6 +312,35 @@ mod tests {
     }
 
     #[test]
+    fn task_scan_reports_invalid_text_and_keeps_readable_results() {
+        let root = ScratchRoot::new("partial-tasks");
+        root.write("Calendar/20260805.md", "* visible\n* [x] completed\n");
+        let bad = root.write("Notes/Broken.md", "");
+        std::fs::write(&bad, [0xff]).unwrap();
+        let scan = scan_vault_tasks(&root.0);
+        assert_eq!(scan.open.len(), 1);
+        assert_eq!(scan.errors.len(), 1);
+        assert_eq!(scan.errors[0].path, bad);
+        assert!(!scan.errors[0].message.is_empty());
+        assert!(open_tasks_in_vault(&root.0).require_complete().is_err());
+        assert!(done_tasks_in_vault(&root.0).require_complete().is_err());
+    }
+
+    #[test]
+    fn missing_root_and_failed_directory_walk_are_not_empty_successes() {
+        let root = ScratchRoot::new("failed-discovery");
+        let calendar = root.0.join("Calendar");
+        std::fs::remove_dir(&calendar).unwrap();
+        std::fs::write(&calendar, "not a directory").unwrap();
+        let scan = scan_vault_tasks(&root.0);
+        assert!(scan.open.is_empty());
+        assert_eq!(scan.errors.len(), 1);
+        assert_eq!(scan.errors[0].path, calendar);
+        let missing = root.0.join("missing");
+        assert_eq!(scan_vault_tasks(&missing).errors[0].path, missing);
+    }
+
+    #[test]
     fn due_dates_from_tokens_and_file_dates() {
         let root = ScratchRoot::new("due");
         root.write(
@@ -310,7 +352,7 @@ mod tests {
             "* dated in note >2026-08-19\n* undated in note\n+ [ ] checklist >2026-08-18\n",
         );
 
-        let tasks = open_tasks_in_vault(&root.0);
+        let tasks = open_tasks_in_vault(&root.0).require_complete().unwrap();
         let due_of = |needle: &str| {
             tasks
                 .iter()
@@ -348,7 +390,7 @@ mod tests {
         let scan = VaultScan::new(&root.0);
         let dailies = scan.read_dailies();
         let notes = scan.read_notes_cached(&mut Default::default());
-        let result = scan_tasks(&dailies, &notes);
+        let result = scan_tasks(&dailies.items, &notes.items);
 
         // Open list unchanged by the tallies.
         assert_eq!(result.open.len(), 2);
@@ -383,7 +425,7 @@ mod tests {
             "* [x] dated done >2026-08-06\n* [x] undated done stays out\n",
         );
 
-        let done = done_tasks_in_vault(&root.0);
+        let done = done_tasks_in_vault(&root.0).require_complete().unwrap();
         let lines: Vec<&str> = done.iter().map(|t| t.line.as_str()).collect();
         // Daily done tasks with and without tokens, dated note tasks; open,
         // cancelled, and undated note tasks all stay out. Newest due first.

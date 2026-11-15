@@ -133,7 +133,7 @@ impl Workspace {
                 sechead(
                     t,
                     "sec-conflicts",
-                    "Sync conflicts",
+                    "Conflicts",
                     Some(owners.len().to_string()),
                     collapsed,
                 )

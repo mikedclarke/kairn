@@ -80,7 +80,7 @@ fn read_until_title(mut reader: impl std::io::Read) -> Option<Vec<u8>> {
 /// The `<title>` element's text, entity-decoded, whitespace-collapsed, and
 /// sanitised for use as markdown link text.
 fn extract_title(html: &str) -> Option<String> {
-    let lower = html.to_lowercase();
+    let lower = html.to_ascii_lowercase();
     let open = lower.find("<title")?;
     let start = open + html[open..].find('>')? + 1;
     let end = start + lower[start..].find("</title")?;
@@ -196,5 +196,12 @@ mod tests {
         );
         assert_eq!(extract_title("<title></title>"), None);
         assert_eq!(extract_title("no title here"), None);
+    }
+
+    #[test]
+    fn unicode_case_changes_do_not_move_title_offsets() {
+        for page in ["<title>Kİ</title>", "Kİ<TiTlE lang=\"İ\">Kİ</tItLe>"] {
+            assert_eq!(extract_title(page), Some("Kİ".into()));
+        }
     }
 }

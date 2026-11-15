@@ -127,7 +127,7 @@ pub struct Mention {
 pub fn mentions_of(root: &Path, title: &str, exclude: Option<&Path>) -> Vec<Mention> {
     let scan = VaultScan::new(root);
     let dailies = scan.read_dailies();
-    mentions_in(&scan, &dailies, title, exclude)
+    mentions_in(&scan, &dailies.items, title, exclude)
 }
 
 /// [`mentions_of`] over an existing scan and already-read dailies, so a

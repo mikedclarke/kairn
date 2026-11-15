@@ -15,6 +15,7 @@
 //! WebSocket transport lands with the server.
 
 pub mod cycle;
+pub mod directories;
 pub mod engine;
 pub mod hash;
 #[cfg(feature = "http")]
@@ -25,6 +26,7 @@ pub mod state;
 pub mod transport;
 pub mod types;
 pub mod vaultio;
+mod vault_fs;
 #[cfg(feature = "http")]
 mod wake;
 

@@ -73,6 +73,13 @@ server's version as the file and preserves the local one as a
 
 ### Sharing the folder with Syncthing
 
+Use `--publish-directories` on exactly one authoritative desktop bridge to
+retire Notes folders removed there. The bridge publishes a versioned directory
+catalog through normal sync, including a migration from retained file history.
+Clients remove only empty retired directories; files, intentional empty folders
+and persistent write locks are preserved. Mobile hides retired trees containing
+only lock files. This does not replicate every empty folder between devices.
+
 Add the engine's atomic-write temp files to the folder's `.stignore` so
 Syncthing never picks one up mid-rename and shuttles a half-written note to
 another machine:

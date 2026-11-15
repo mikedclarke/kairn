@@ -8,7 +8,7 @@ use gpui::{
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Task, Window, div,
     prelude::FluentBuilder as _, px,
 };
-use gpui_component::Root;
+use gpui_component::{Root, WindowExt as _};
 use kairn_core as notes;
 
 use crate::overlays::Overlay;
@@ -139,15 +139,12 @@ pub struct Workspace {
     /// (task views, unreadable notes, missing root).
     pub(crate) note_editor: Option<gpui::Entity<crate::note_editor::NoteEditor>>,
     pub(crate) _note_editor_sub: Option<gpui::Subscription>,
-    /// Editor text whose merge target vanished or conflicted before it could
-    /// be saved: (file it was bound for, the user's text). Rendered as a
-    /// banner so typed text is never silently dropped.
-    pub orphaned: Option<(PathBuf, String)>,
     pub sessions: Vec<Session>,
     pub active_session: usize,
     next_session_id: u64,
     pub cal_offset: i32,
     pub notes_root: PathBuf,
+    pub(crate) notes_root_override: Option<PathBuf>,
     pub selected_day: NaiveDate,
     pub view: PaneView,
     /// The pane's document as read from disk (or the daily template for a
@@ -168,7 +165,7 @@ pub struct Workspace {
     /// there is no note.
     pub doc_error: Option<String>,
     /// Daily notes that exist but couldn't be read this reload.
-    pub dailies_skipped: usize,
+    pub notes_scan_errors: usize,
     /// The configured notes folder doesn't exist (unmounted drive, moved
     /// path): the note pane blocks instead of showing a convincing empty
     /// vault, and nothing writes into the void.
@@ -295,21 +292,28 @@ impl Workspace {
         // KAIRN_ROOT overrides the configured notes folder for this process
         // only (dev, testing, screenshots); it is never written to settings.
         // The CLI honours the same variable via --root.
-        let env_root = std::env::var("KAIRN_ROOT").ok().filter(|r| !r.is_empty());
-        let notes_root = env_root
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| settings.notes_root());
+        let notes_root_override = std::env::var_os("KAIRN_ROOT")
+            .filter(|r| !r.is_empty()).map(PathBuf::from);
+        let notes_root = settings.effective_notes_root(notes_root_override.as_deref());
         // A configured folder that isn't there means an unmounted drive or
         // a moved path: creating a fresh empty vault at that spot would be
         // worse than stopping. The default ~/kairn is always created.
-        let root_missing = (env_root.is_some()
+        let root_missing = (notes_root_override.is_some()
             || settings.notes_root.as_deref().is_some_and(|r| !r.is_empty()))
-            && !notes_root.exists();
+            && !notes_root.is_dir();
         if !root_missing {
             notes::ensure_layout(&notes_root);
         }
         let self_writes = crate::vault_state::SelfWrites::default();
+        let recovery = notes::recovery_directory();
+        if !notes::recovery_files(&recovery).is_empty() {
+            let window = window.window_handle();
+            cx.defer(move |cx| {
+                let _ = window.update(cx, |_, window, cx| {
+                    window.push_notification(format!("Unsaved edits have recovery copies in {}", recovery.display()), cx);
+                });
+            });
+        }
         let (notes_watcher, notes_watch_task) =
             Self::watch_notes(notes_root.clone(), self_writes.clone(), cx);
         let (library_watchers, library_watch_task) =
@@ -318,9 +322,12 @@ impl Workspace {
         // Closing the window must not drop a pending edit.
         let flush = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
-            flush
+            if !flush
                 .update(cx, |ws, cx| ws.flush_note_editor(cx))
-                .ok();
+                .unwrap_or(true)
+            {
+                return false;
+            }
             if cfg!(target_os = "macos") {
                 // Minimize instead of destroying the window: the workspace
                 // (and its live terminal sessions) survives, and a Dock
@@ -358,12 +365,12 @@ impl Workspace {
             settings_view: None,
             note_editor: None,
             _note_editor_sub: None,
-            orphaned: None,
             sessions: Vec::new(),
             active_session: 0,
             next_session_id: 1,
             cal_offset: 0,
             notes_root,
+            notes_root_override,
             selected_day: Local::now().date_naive(),
             view: PaneView::Day,
             doc_text: None,
@@ -372,7 +379,7 @@ impl Workspace {
             conflicts: Vec::new(),
             vault_conflicts: Vec::new(),
             doc_error: None,
-            dailies_skipped: 0,
+            notes_scan_errors: 0,
             root_missing,
             note_days: HashMap::new(),
             day_stats: HashMap::new(),
@@ -429,7 +436,7 @@ impl Workspace {
         let id = self.next_session_id;
         self.next_session_id += 1;
         let weak = cx.weak_entity();
-        match spawn(id, kind, weak, cx) {
+        match spawn(id, kind, weak, window, cx) {
             Ok(session) => {
                 self.sessions.push(session);
                 self.activate_session(self.sessions.len() - 1, window, cx);
@@ -459,10 +466,9 @@ impl Workspace {
         }
     }
 
-    /// Close a session from the sidebar menu: kill its process and let the
-    /// exit callback (the same path `exit` takes) remove it and fix focus.
+    /// Signal the process; the child wait task removes the session on exit.
     pub fn close_session(&mut self, idx: usize) {
-        if let Some(session) = self.sessions.get(idx) {
+        if let Some(session) = self.sessions.get_mut(idx) {
             session.terminate();
         }
     }
@@ -475,12 +481,26 @@ impl Workspace {
             }
     }
 
+    pub(crate) fn session_visible(&self, id: u64) -> bool {
+        self.settings.sessions_enabled
+            && self.layout.shows_terminal()
+            && self.settings_view.is_none()
+            && self.overlay.is_none()
+            && self.sessions.get(self.active_session).is_some_and(|session| session.id == id)
+    }
+
     pub fn handle_session_exit(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        self.sessions.retain(|s| s.id != id);
-        if self.active_session >= self.sessions.len() {
-            self.active_session = self.sessions.len().saturating_sub(1);
+        let active_id = self.sessions.get(self.active_session).map(|session| session.id);
+        let focus_next = active_id == Some(id)
+            && self.session_visible(id)
+            && self.sessions[self.active_session].view.read(cx).focus_handle().is_focused(window);
+        self.sessions.retain(|session| session.id != id);
+        self.active_session = active_id
+            .and_then(|active| self.sessions.iter().position(|session| session.id == active))
+            .unwrap_or_else(|| self.active_session.min(self.sessions.len().saturating_sub(1)));
+        if focus_next {
+            self.focus_active_terminal(window, cx);
         }
-        self.focus_active_terminal(window, cx);
         cx.notify();
     }
 
@@ -702,6 +722,9 @@ impl Workspace {
     /// collected in the editor's context and applied here, so neither
     /// entity re-enters the other.
     pub(crate) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.flush_note_editor(cx) {
+            return;
+        }
         if let Some(editor) = self.settings_view.take() {
             let patch = editor.update(cx, |editor, cx| editor.collect_patch(cx));
             self.apply_settings(patch, window, cx);
@@ -723,8 +746,9 @@ impl Workspace {
     }
 
     fn on_quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
-        self.flush_note_editor(cx);
-        cx.quit();
+        if self.flush_note_editor(cx) {
+            cx.quit();
+        }
     }
 
     /// The undo chord, owned here rather than by the editor: whichever

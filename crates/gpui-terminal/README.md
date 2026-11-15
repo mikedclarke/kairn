@@ -9,6 +9,17 @@ top of upstream:
   screen, local scrollback otherwise; typing snaps back to the live view.
 - The renderer honours `display_offset`, so scrollback is actually visible
   while scrolled, and the cursor shifts/hides with the scrolled viewport.
+- Output and lifecycle events are processed even while the terminal is hidden;
+  construction takes its owning window. Pending output is bounded to 32 chunks.
+- PTY input and query replies use a worker with a 1 MiB / 128-operation queue.
+  Overflow rejects the whole operation and reports through `with_input_error_callback`.
+  Bracketed pastes strip ESC characters and enqueue both guards with the payload.
+- Non-web links require confirmation; `hovered_link()` exposes the target for
+  the embedding app's tooltip.
+- `KAIRN_PTY_LOG=<directory>` enables output diagnostics. Input capture requires
+  `KAIRN_PTY_LOG_INPUT=1` and includes unechoed passwords. Logs use private
+  permissions, stop at 4 MiB each, and retain ten files without removing active
+  logs. `diagnostics_status()` exposes the logging state for the app's UI.
 
 Worth offering upstream once battle-tested.
 
@@ -36,7 +47,7 @@ use gpui_terminal::{TerminalConfig, TerminalView, ColorPalette};
 
 // Create terminal with PTY reader/writer
 let terminal = cx.new(|cx| {
-    TerminalView::new(pty_writer, pty_reader, config, cx)
+    TerminalView::new(pty_writer, pty_reader, config, window, cx)
         .with_resize_callback(|cols, rows| {
             // Notify PTY of size change
         })
