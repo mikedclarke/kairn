@@ -35,7 +35,7 @@ No cloud, no accounts, no database. Just a folder of markdown.
 - Linked mentions under every note: each line elsewhere that links to it
 - Full editing: selection, clipboard, undo/redo, IME, list continuation, drag handles to reorder lines
 - Organise the sidebar by dragging: drop a note or folder onto another folder to move it, with the target highlighted as you hover and undo on the move
-- Autosave merges against the file on disk and preserves conflicting text in visible recovery copies. Kairn writers lock from read through replacement; other editors do not take this lock, so avoid simultaneous saves from external tools.
+- Autosave merges against the file on disk and preserves conflicting text in visible recovery copies. Kairn writers lock from read through replacement; other editors do not take this lock, so avoid simultaneous saves from external tools. The lock is a hidden `.<name>.kairn-lock` file beside each note, and a save that fails keeps its text in a recovery folder next to the app's settings.
 - A watched notes folder: changes from outside the app appear live
 - Honest failure states: an unmounted notes folder blocks the pane rather than showing a convincing empty vault; sync conflict copies get a banner with one-click open
 
@@ -56,7 +56,7 @@ No cloud, no accounts, no database. Just a folder of markdown.
 ### Terminal
 
 - Real PTY terminals beside your notes: resizable split, full-screen toggle, multiple sessions with live busy indicators, saved SSH hosts
-- Full-fidelity emulation on the alacritty engine: true colour, scrollback, application cursor mode, OSC 52 clipboard, bracketed paste, SGR mouse reporting (click, drag, and all three buttons, so TUI apps are fully clickable), focus reporting
+- Full-fidelity emulation on the alacritty engine: true colour, scrollback, application cursor mode, OSC 52 clipboard (each session asks once before a program can replace the clipboard), bracketed paste, SGR mouse reporting (click, drag, and all three buttons, so TUI apps are fully clickable), focus reporting
 - Per-theme terminal palettes and font, live font-size zoom
 - Optional: turn sessions off in Settings for a notes-only Kairn, with no terminal pane, split or terminal layouts, and no session controls; your notes are untouched and turning it back on restores everything
 
@@ -80,7 +80,7 @@ No cloud, no accounts, no database. Just a folder of markdown.
 
 ### Theming and settings
 
-- Built-in themes (Menlo, Ocean, Sage, Sage Light, Rose, Forest) picked from a searchable dropdown, plus custom themes as JSON files in the vault (`.kairn/themes/*.json`), overriding any subset of palette, fonts, and terminal colours; see [docs/themes.md](docs/themes.md)
+- Built-in themes (Menlo, Menlo Black, Ocean, Sage, Sage Light, Rose, Forest) picked from a searchable dropdown, plus custom themes as JSON files in the vault (`.kairn/themes/*.json`), overriding any subset of palette, fonts, and terminal colours; see [docs/themes.md](docs/themes.md)
 - A full-page Settings screen: sections in a left rail, one scrolling column, changes applied on close
 - Searchable font pickers for interface, editor, and terminal; editor text size setting
 - Settings survive corruption: a malformed settings file is backed up and can never silently wipe your configuration
